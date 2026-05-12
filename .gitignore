@@ -1,0 +1,7 @@
+# Per-run artifacts: prompts, agent stdout/stderr, fetched threads, verdicts.
+# These contain content from the reviewed PRs (potentially private code) and
+# are regenerated on every run.
+state/
+
+# Managed local clones of target repos. Created on demand by run.sh.
+checkouts/
