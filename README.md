@@ -1,114 +1,164 @@
 # AI PR loop
 
-Two-agent autonomous PR review loop. Codex reviews; Claude responds (fix code
-or push back); they iterate until Codex approves or the iteration cap is hit.
+Two-agent autonomous PR review loop, designed to be driven by an AI agent.
+Codex reviews; Claude responds (fix code or push back); they iterate until
+Codex approves or the loop converges on NIT-only findings.
 
-## Quick start
+The primary interface is a **Claude Code skill** (`ai-pr-review`) shipped
+in this repo. Ask an AI agent to review a PR, the skill takes care of the
+orchestration. The underlying `run.sh` is also runnable directly for
+scripted use.
+
+## Install
 
 ```bash
-# Minimal: PR number + repo slug. The loop manages its own clone at
-# ~/ai-pr-loop/checkouts/<owner>__<name>/, fetching the PR branch on each run.
-~/ai-pr-loop/run.sh 20 --repo OWNER/NAME
+# 1. Clone somewhere stable.
+git clone https://github.com/jshentu-nv/ai-pr-loop.git ~/ai-pr-loop
 
-# Uncapped, with convergence on 3 consecutive NIT-only iters:
-~/ai-pr-loop/run.sh 20 --repo OWNER/NAME --max 0 --converge 3
+# 2. Expose the skill to Claude Code globally (so it's available from any
+#    working directory, not just inside this clone).
+mkdir -p ~/.claude/skills
+ln -s ~/ai-pr-loop/.claude/skills/ai-pr-review ~/.claude/skills/ai-pr-review
 
-# Point at an existing local clone instead of letting the loop manage one:
-~/ai-pr-loop/run.sh 20 --repo OWNER/NAME --dir ~/src/some-checkout
+# 3. Make the orchestrator findable. The skill checks $AI_PR_LOOP_HOME
+#    first, then ~/ai-pr-loop. Either is fine.
+echo 'export AI_PR_LOOP_HOME=$HOME/ai-pr-loop' >> ~/.bashrc
 ```
 
-It runs unattended end-to-end. Works on any GitHub repo the authenticated
-`gh` user can access. Logs and per-iteration artifacts go to
-`~/ai-pr-loop/state/<owner>__<name>/pr-<N>/iter-NN/`.
+Requirements on the host:
+
+- `gh` CLI authenticated (`gh auth login` or `GH_TOKEN`/`GITHUB_TOKEN`
+  with `repo` scope on the target repo).
+- `codex` CLI installed and logged in.
+- `claude` CLI installed and logged in.
+- `git`, `jq` available on `$PATH`.
+
+No NVIDIA / org-specific config — works on any GitHub repo the
+authenticated user can comment on and push to.
+
+## Use it (the intended way)
+
+In Claude Code, just ask:
+
+> Review https://github.com/owner/repo/pull/42
+
+> Run the AI review on PR 17 of owner/repo, don't stop until they agree.
+
+> Kick off the review bots on this PR, max 4 iterations.
+
+The `ai-pr-review` skill kicks in, parses the PR, preflights auth,
+confirms before posting, launches the loop in the background, and streams
+per-iteration progress (verdicts, issue counts, errors) back into the
+conversation. When the loop terminates it reports the final verdict, the
+per-iter wall time, and a link to the PR.
+
+The agent will only act under your gh-authed identity, only on the PR you
+named, and will ask you to confirm the first time it's about to post.
+
+## What the agents do
+
+**Codex Reviewer**
+
+- Reads the PR's full discussion (issue comments, inline review comments,
+  description, linked issues) plus the local diff and any callers/callees
+  of changed code.
+- Posts **inline review comments** at the exact `path:line` for
+  line-specific findings via `POST /pulls/N/reviews` (one atomic review
+  per turn).
+- Posts a **summary issue-comment** with cross-cutting concerns + verdict.
+- Marks fully-addressed prior threads with a one-line `Resolved.` reply
+  (does *not* flip GitHub's resolved-thread state — that's left to humans).
+- Emits `[CODEX_VERDICT: APPROVED|CHANGES_REQUESTED]` so the orchestrator
+  can terminate.
+
+**Claude Implementer**
+
+- Reads Codex's inline + summary review.
+- For each finding: either edits the code and commits under a bot git
+  identity (`claude-implementer (ai-bot)
+  <claude-implementer+bot@users.noreply.github.com>`) and pushes, or
+  pushes back inline with reasoning.
+- Replies inline to every finding via `in_reply_to`, posts a summary
+  issue-comment, never force-pushes / amends / rebases.
+
+Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
+Codex `exec resume`), so internal memory persists across iterations on top
+of the publicly auditable PR thread.
 
 ## How agents are distinguished
 
-Both bots authenticate to GitHub using the same human PAT (whichever user
-the local `gh` CLI is logged in as — the loop resolves the @handle at
-startup via `gh api user`), so the loop tags every artifact in two ways:
+Both bots post under the same human PAT (whichever account the local `gh`
+is logged in as — resolved at startup via `gh api user`). The loop tags
+every artifact three ways:
 
 | Signal | Codex Reviewer | Claude Implementer |
 |---|---|---|
-| Hidden HTML marker (orchestrator parses this) | `<!-- ai-loop:codex-reviewer iter=N -->` | `<!-- ai-loop:claude-implementer iter=N -->` |
-| Visible label (humans read this) | `**[AI · Codex Reviewer · iteration N]**` | `**[AI · Claude Implementer · iteration N]**` |
+| Hidden HTML marker (orchestrator parses) | `<!-- ai-loop:codex-reviewer iter=N -->` | `<!-- ai-loop:claude-implementer iter=N -->` |
+| Visible banner | `**[AI · Codex Reviewer · iter N]**` | `**[AI · Claude Implementer · iter N]**` |
 | Git commit author (Claude only) | — | `claude-implementer (ai-bot) <claude-implementer+bot@users.noreply.github.com>` |
 
-The HTML marker is always the first line of every comment — across both
-surfaces the loop uses:
-
-- **Summary issue-comments** (one per turn): high-level read, cross-cutting
-  concerns, Codex's verdict line.
-- **Inline review comments** (line-specific): Codex attaches each
-  line-specific finding to the exact `path:line` via the `pulls/N/reviews`
-  API, and Claude replies inline via `in_reply_to`.
-
-`fetch_ai_thread` (in `lib/common.sh`) pulls both surfaces and emits NDJSON
-tagged with `surface=issue|inline` plus `id`/`path`/`line`/`in_reply_to_id`.
-Comments are never edited or resolved — humans do the final audit.
+`fetch_ai_thread` (in `lib/common.sh`) pulls both surfaces
+(`/issues/N/comments` + `/pulls/N/comments`) and emits NDJSON tagged with
+`surface=issue|inline` plus `id`, `path`, `line`, `in_reply_to_id`.
+Comments are never edited or deleted by the bots.
 
 ## Termination
 
 The loop exits when one of:
 
-- Codex prints `[CODEX_VERDICT: APPROVED]` → exit 0 (success).
-- Iteration cap is hit (`--max`, default 6) → exit 1.
-- Either agent's turn errors out → exit 1.
+- Codex emits `[CODEX_VERDICT: APPROVED]` → exit 0.
+- Codex reports `BLOCKER=0 MAJOR=0` for `--converge` consecutive iters
+  (NIT-only, "converged_no_major") → exit 0.
+- The iteration cap (`--max`) is hit → exit 1.
+- Either agent's turn errors → exit 1.
 
-## Resume
+## Resumability
 
-`--max` counts iterations *this invocation*, so if you hit the cap without
-agreement, **just re-run the same command**. On startup the orchestrator
-inspects the PR's existing AI comments and continues from the high-water
-mark:
+`--max` counts iterations *this invocation*, so if you hit the cap
+without agreement, **just re-run the same command** (or re-invoke the
+skill). On startup the orchestrator inspects the PR's existing AI
+comments and continues from the high-water mark:
 
 | State on PR | Resume behavior |
 |---|---|
 | No AI comments | Fresh start — iter 1, codex first. |
 | Both bots through iter K | Next round is iter K+1, codex first. |
-| Codex iter K but no Claude reply (prior run died or hit max mid-round) | Run claude at iter K first, then continue from K+1. |
+| Codex iter K but no Claude reply | Run claude at iter K first, then continue from K+1. |
 
-If codex's last verdict in local state was already `APPROVED`, the loop
-exits 0 immediately rather than re-reviewing.
+Per-PR session ids for both agents are stored under
+`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`,
+so resumed runs also restore the agents' internal memory.
 
-## What each turn does
+## Direct CLI (advanced)
 
-**Codex turn (`codex_turn.sh`)**
-1. Fetches the prior AI thread from GitHub (both surfaces).
-2. Pulls the latest PR branch.
-3. Runs `codex exec --dangerously-bypass-approvals-and-sandbox` with the
-   prompt at `prompts/codex.md` (resumes the per-PR codex session if one
-   exists, so Codex retains its own internal review memory across iters).
-4. Codex reads the diff + thread, posts (a) inline review comments via
-   `POST /pulls/N/reviews` for line-specific findings and (b) a tagged
-   summary issue-comment with cross-cutting concerns + verdict, then
-   prints a final `[CODEX_VERDICT: …]` line that the wrapper greps.
+The skill is just a wrapper around `run.sh`. You can drive it directly:
 
-**Claude turn (`claude_turn.sh`)**
-1. Fetches the AI thread; splits Codex's iteration N output into a summary
-   file (`codex-review.md`) and an NDJSON of inline findings
-   (`codex-inline.ndjson`).
-2. Runs `claude -p --dangerously-skip-permissions` with the prompt at
-   `prompts/claude.md` (resumes the per-PR claude session if one exists).
-3. Claude either edits & commits with the bot identity (`git push origin
-   <branch>`), or pushes back in writing — per issue.
-4. Claude replies inline to each line-specific finding via `in_reply_to`,
-   posts a tagged summary issue-comment indexing the round's response,
-   then prints `[CLAUDE_TURN: COMPLETE]`.
+```bash
+# Minimal: PR number + repo slug. The loop manages its own clone at
+# ~/ai-pr-loop/checkouts/<owner>__<name>/ (created on first use).
+~/ai-pr-loop/run.sh 42 --repo owner/repo
+
+# Uncapped, with convergence on 3 consecutive NIT-only iters:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --max 0 --converge 3
+
+# Point at an existing local clone instead of letting the loop manage one:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --dir ~/src/some-checkout
+```
+
+Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex
+verdict, per-iter session captures) are kept under
+`state/<owner>__<name>/pr-<N>/iter-NN/` so you can replay any decision
+after the fact.
 
 ## Notes
 
-- Auth: requires `GH_TOKEN` (or `GITHUB_TOKEN`) with `repo` scope on the
-  target repo, plus `codex login` and `claude` already authenticated.
-- The `gh`-authenticated user's PAT is used for all GitHub mutations
-  (comments + pushes). Don't run this on PRs you don't intend the bots to
-  comment on or push to under that identity.
+- The gh-authed user's PAT is used for all GitHub mutations (comments +
+  pushes). Don't run on PRs you don't intend the bots to act on under
+  that identity.
+- Claude never force-pushes, amends, or rebases — only adds new commits
+  to the PR head ref.
 - Managed checkouts live at `~/ai-pr-loop/checkouts/<owner>__<name>/`
   (one clone per repo, shared across PRs). For concurrent loops on the
   same repo, pass `--dir` to point each loop at its own clone.
-- Claude never force-pushes, amends, or rebases — only adds new commits to
-  the PR head ref.
-- All AI comments are preserved on the PR for human audit; nothing is
-  resolved or deleted.
-- Iteration artifacts (prompt, full stdout/stderr, fetched thread, codex
-  review markdown) are kept under `state/.../iter-NN/` so you can replay
-  any decision after the fact.
+- All AI comments are preserved on the PR for human audit; the bots do
+  not delete or flip resolved state.
