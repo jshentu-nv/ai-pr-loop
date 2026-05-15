@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -43,6 +43,12 @@ Optional flags worth surfacing if the user mentions a constraint:
   Default 3. Pass `0` to disable convergence-based termination.
 - `--dir DIR` — use an existing local clone. Omit to let the loop manage
   its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/`.
+- `--restart` — force a new review round even if codex previously
+  APPROVED. Use after new commits land past a prior approval ("pull
+  latest and review again", "new commits were pushed, run another round").
+  Starts at `max(last_codex,last_claude)+1`, codex first. Without it,
+  the orchestrator short-circuits on the prior APPROVED verdict and
+  exits immediately.
 
 ## Steps
 
@@ -130,6 +136,12 @@ orchestrator inspects the PR's existing AI comments and continues from
 the high-water mark. Per-PR session ids for both agents are persisted in
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`, so
 agents keep their internal memory across re-runs too.
+
+**Re-reviewing after approval.** If codex previously APPROVED and new
+commits then land on the PR, a plain re-run short-circuits ("codex
+already APPROVED at iter K — nothing to do"). Pass `--restart` to force
+a new round on the new HEAD; the agents' sessions are still reused, so
+they remember the prior discussion.
 
 ## Do not
 
