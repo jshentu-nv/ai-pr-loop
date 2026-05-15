@@ -23,6 +23,9 @@
 #              first use via `gh repo clone` and reusing it thereafter.
 #   --max      6 iterations this invocation; pass 0 for uncapped (ceiling 50).
 #   --converge 3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
+#   --restart  Force a new review round even if codex previously APPROVED.
+#              Use after new commits land past a prior approval. Starts at
+#              max(last_codex,last_claude)+1, codex first.
 #
 # The only credential needed is GH_TOKEN/GITHUB_TOKEN (the gh CLI must be
 # logged in to the repo's host). Works on any GitHub repo the authenticated
@@ -45,6 +48,7 @@ REPO_DIR=""
 MAX_ITER="$MAX_ITER_DEFAULT"
 CONVERGE_N="$CONVERGE_DEFAULT"
 PR_NUMBER=""
+RESTART=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --dir)      REPO_DIR="$2";  shift 2 ;;
     --max)      MAX_ITER="$2";  shift 2 ;;
     --converge) CONVERGE_N="$2"; shift 2 ;;
+    --restart)  RESTART=1; shift ;;
     -h|--help)
       sed -n '2,30p' "$0"; exit 0 ;;
     *)
@@ -144,7 +149,11 @@ LAST_CODEX="${LAST_CODEX:-0}"
 LAST_CLAUDE="${LAST_CLAUDE:-0}"
 
 RESUME_CLAUDE_FIRST=0
-if (( LAST_CODEX == 0 && LAST_CLAUDE == 0 )); then
+if (( RESTART == 1 )) && (( LAST_CODEX > 0 || LAST_CLAUDE > 0 )); then
+  HIGH=$(( LAST_CODEX > LAST_CLAUDE ? LAST_CODEX : LAST_CLAUDE ))
+  ITER=$(( HIGH + 1 ))
+  log "--restart: bypassing prior APPROVED state — starting fresh at iter $ITER (codex first)"
+elif (( LAST_CODEX == 0 && LAST_CLAUDE == 0 )); then
   ITER=1
   log "no prior AI thread on this PR — starting fresh at iter 1"
 elif (( LAST_CODEX > LAST_CLAUDE )); then

@@ -124,6 +124,7 @@ comments and continues from the high-water mark:
 | No AI comments | Fresh start — iter 1, codex first. |
 | Both bots through iter K | Next round is iter K+1, codex first. |
 | Codex iter K but no Claude reply | Run claude at iter K first, then continue from K+1. |
+| Codex APPROVED at iter K, new commits since | Plain re-run is a no-op. Pass `--restart` to start a new round at iter K+1, codex first. |
 
 Per-PR session ids for both agents are stored under
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`,
@@ -143,6 +144,9 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 
 # Point at an existing local clone instead of letting the loop manage one:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --dir ~/src/some-checkout
+
+# New commits landed after a prior APPROVED verdict — re-review them:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --restart
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex
