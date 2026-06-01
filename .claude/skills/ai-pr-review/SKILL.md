@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -49,6 +49,20 @@ Optional flags worth surfacing if the user mentions a constraint:
   Starts at `max(last_codex,last_claude)+1`, codex first. Without it,
   the orchestrator short-circuits on the prior APPROVED verdict and
   exits immediately.
+- `--review-only` — run a single codex review turn and exit; do *not*
+  run the claude implementer. Use when the user wants AI feedback posted
+  on the PR but no auto-fixups ("just review it, don't touch the code",
+  "review only", "review without fixing"). Implies `--max 1`, disables
+  `--converge`. Both APPROVED and CHANGES_REQUESTED exit 0 (the goal is
+  to post a review, not converge). Final status will be `approved` or
+  `review_posted`.
+
+  **Re-review after human fixes.** A natural workflow is: user runs
+  `--review-only`, pushes fixes themselves, re-runs `--review-only`.
+  This is fully supported — codex resumes its session, sees the prior
+  thread, marks resolved findings with `Resolved.`, and re-reviews the
+  new HEAD at `last_codex+1`. If codex previously APPROVED, add
+  `--restart` to force a fresh round.
 
 ## Steps
 
@@ -118,8 +132,9 @@ finishes.
 
 When the background `run.sh` completes, summarize:
 
-- Final status: `approved`, `converged_no_major`, `max_iterations_reached`,
-  `codex_error`, or `claude_error`.
+- Final status: `approved`, `converged_no_major`, `review_posted` (only
+  with `--review-only`), `max_iterations_reached`, `codex_error`, or
+  `claude_error`.
 - Iter count + last codex `BLOCKER=… MAJOR=… NIT=…` counts.
 - Wall time per iter (read from the timestamps in the log).
 - PR URL so the user can audit.

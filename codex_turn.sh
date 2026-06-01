@@ -18,6 +18,16 @@ fetch_ai_thread > "$THREAD_FILE" || true
 PREV_ITER=$(( ITER - 1 ))
 [[ $PREV_ITER -lt 0 ]] && PREV_ITER=0
 
+# Mode-specific note injected near the top of the prompt. Review-only loops
+# have no Claude implementer, so any "fixes since last review" come from
+# humans pushing commits, and the prompt section about Claude's pushback is
+# inapplicable.
+if [[ "${REVIEW_ONLY:-0}" == "1" ]]; then
+  MODE_NOTE="**Mode: review-only.** There is no Claude implementer in this loop -- humans address findings by pushing commits directly. The \"Response to Claude pushback\" section in step 7 is therefore inapplicable; rename it to \"Response to changes since iter ${PREV_ITER}\" and use it to note which prior findings the new commits resolved, accepted, or left open. If there is no prior iteration on this PR (ITER=1), omit that section entirely."
+else
+  MODE_NOTE=''
+fi
+
 # Render the prompt template.
 PROMPT_FILE="$ID/codex.prompt.md"
 sed \
@@ -32,6 +42,7 @@ sed \
   -e "s|{{MAX_ITER}}|${MAX_ITER}|g" \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
+  -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   "$HERE/prompts/codex.md" > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"

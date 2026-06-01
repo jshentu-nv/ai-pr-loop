@@ -109,8 +109,43 @@ The loop exits when one of:
 - Codex emits `[CODEX_VERDICT: APPROVED]` → exit 0.
 - Codex reports `BLOCKER=0 MAJOR=0` for `--converge` consecutive iters
   (NIT-only, "converged_no_major") → exit 0.
+- A single codex turn completed under `--review-only` (status
+  `review_posted` for CHANGES_REQUESTED, `approved` for APPROVED) → exit 0.
 - The iteration cap (`--max`) is hit → exit 1.
 - Either agent's turn errors → exit 1.
+
+## Review-only mode
+
+Pass `--review-only` to run a single Codex review turn and stop, without
+ever running the Claude implementer. Useful when you want an AI review
+posted on the PR but don't want auto-fixup commits.
+
+- Implies `--max 1` and disables `--converge`.
+- Both `APPROVED` and `CHANGES_REQUESTED` exit 0 — the goal is to post a
+  review, not to converge.
+
+### Codex review → human fix → codex re-review
+
+The natural workflow for `--review-only` is:
+
+1. Run `--review-only` once. Codex posts findings, exits 0 with status
+   `review_posted`.
+2. You push commits addressing the findings (no bot author).
+3. Re-run the same `--review-only` command. Codex resumes its session,
+   re-reads the prior thread, marks resolved findings with `Resolved.`,
+   and either approves or re-raises what's still open. Iter increments
+   to `last_codex+1` automatically.
+
+A prior `APPROVED` still short-circuits a plain re-run; pass `--restart`
+if you want a re-review on top of new commits after an approval. Codex's
+per-PR session is reused across all re-runs, so it remembers the prior
+discussion even though Claude is never invoked.
+
+```bash
+~/ai-pr-loop/run.sh 42 --repo owner/repo --review-only
+# ... push fixes ...
+~/ai-pr-loop/run.sh 42 --repo owner/repo --review-only   # codex iter 2
+```
 
 ## Resumability
 
@@ -147,6 +182,9 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 
 # New commits landed after a prior APPROVED verdict — re-review them:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --restart
+
+# Just post a review, don't auto-fix anything:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --review-only
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex

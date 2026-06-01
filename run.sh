@@ -14,18 +14,22 @@
 #
 # Usage:
 #   run.sh <pr-number> --repo OWNER/NAME [--dir REPO_DIR]
-#                      [--max N] [--converge N]
+#                      [--max N] [--converge N] [--review-only]
 #
 # Arguments:
-#   --repo     OWNER/NAME of the GitHub repo (required).
-#   --dir      Local checkout to use. If omitted, the loop manages its own
-#              clone at $LOOP_HOME/checkouts/<owner>__<name>, cloning on
-#              first use via `gh repo clone` and reusing it thereafter.
-#   --max      6 iterations this invocation; pass 0 for uncapped (ceiling 50).
-#   --converge 3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
-#   --restart  Force a new review round even if codex previously APPROVED.
-#              Use after new commits land past a prior approval. Starts at
-#              max(last_codex,last_claude)+1, codex first.
+#   --repo        OWNER/NAME of the GitHub repo (required).
+#   --dir         Local checkout to use. If omitted, the loop manages its own
+#                 clone at $LOOP_HOME/checkouts/<owner>__<name>, cloning on
+#                 first use via `gh repo clone` and reusing it thereafter.
+#   --max         6 iterations this invocation; pass 0 for uncapped (ceiling 50).
+#   --converge    3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
+#   --restart     Force a new review round even if codex previously APPROVED.
+#                 Use after new commits land past a prior approval. Starts at
+#                 max(last_codex,last_claude)+1, codex first.
+#   --review-only Run a single codex review turn and exit; do not run the
+#                 claude implementer. Useful when you want feedback without
+#                 auto-fixups. Implies --max 1, disables --converge. Both
+#                 APPROVED and CHANGES_REQUESTED exit 0 (review posted).
 #
 # The only credential needed is GH_TOKEN/GITHUB_TOKEN (the gh CLI must be
 # logged in to the repo's host). Works on any GitHub repo the authenticated
@@ -49,16 +53,18 @@ MAX_ITER="$MAX_ITER_DEFAULT"
 CONVERGE_N="$CONVERGE_DEFAULT"
 PR_NUMBER=""
 RESTART=0
+REVIEW_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)     REPO_SLUG="$2"; shift 2 ;;
-    --dir)      REPO_DIR="$2";  shift 2 ;;
-    --max)      MAX_ITER="$2";  shift 2 ;;
-    --converge) CONVERGE_N="$2"; shift 2 ;;
-    --restart)  RESTART=1; shift ;;
+    --repo)        REPO_SLUG="$2"; shift 2 ;;
+    --dir)         REPO_DIR="$2";  shift 2 ;;
+    --max)         MAX_ITER="$2";  shift 2 ;;
+    --converge)    CONVERGE_N="$2"; shift 2 ;;
+    --restart)     RESTART=1; shift ;;
+    --review-only) REVIEW_ONLY=1; shift ;;
     -h|--help)
-      sed -n '2,30p' "$0"; exit 0 ;;
+      sed -n '2,34p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -74,6 +80,13 @@ if [[ "$MAX_ITER" -eq 0 ]] 2>/dev/null; then
   MAX_ITER="$HARD_CEILING"
 fi
 
+# --review-only: single codex turn, no claude turn, no convergence check.
+if (( REVIEW_ONLY == 1 )); then
+  MAX_ITER=1
+  CONVERGE_N=0
+  log "review-only: running a single codex review turn (no claude implementer)"
+fi
+
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
 
@@ -87,7 +100,7 @@ if [[ -z "$REPO_DIR" ]]; then
   REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME
+export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY
 
 preflight
 ensure_repo_clone
@@ -116,6 +129,7 @@ log "  base:  $BASE_REF"
 log "  head:  $HEAD_REF"
 log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
+log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 
@@ -165,9 +179,16 @@ elif (( LAST_CODEX > LAST_CLAUDE )); then
     log "PR: $PR_URL"
     exit 0
   fi
-  ITER="$LAST_CODEX"
-  RESUME_CLAUDE_FIRST=1
-  log "resuming: codex iter=$LAST_CODEX exists, claude iter=$LAST_CLAUDE — claude will run next at iter $ITER"
+  if (( REVIEW_ONLY == 1 )); then
+    # Review-only: claude won't ever respond to the half-step. Treat it as
+    # closed and re-review on top of current HEAD at iter LAST_CODEX+1.
+    ITER=$(( LAST_CODEX + 1 ))
+    log "review-only: prior codex iter=$LAST_CODEX has no claude reply — skipping it, codex re-reviews at iter $ITER"
+  else
+    ITER="$LAST_CODEX"
+    RESUME_CLAUDE_FIRST=1
+    log "resuming: codex iter=$LAST_CODEX exists, claude iter=$LAST_CLAUDE — claude will run next at iter $ITER"
+  fi
 else
   ITER=$(( LAST_CODEX + 1 ))
   log "resuming: completed through iter $LAST_CODEX — next round is iter $ITER"
@@ -198,7 +219,11 @@ while (( RUNS < MAX_ITER )); do
       0)  log "codex APPROVED on iter $ITER"
           FINAL_STATUS="approved"
           break ;;
-      2)  log "codex requested changes on iter $ITER" ;;
+      2)  log "codex requested changes on iter $ITER"
+          if (( REVIEW_ONLY == 1 )); then
+            FINAL_STATUS="review_posted"
+            break
+          fi ;;
       *)  log "codex turn failed on iter $ITER (rc=$CODEX_RC)"
           FINAL_STATUS="codex_error"
           break ;;
@@ -268,6 +293,6 @@ log "  Logs:  $STATE_DIR"
 log "============================================================"
 
 case "$FINAL_STATUS" in
-  approved|converged_no_major) exit 0 ;;
-  *)                            exit 1 ;;
+  approved|converged_no_major|review_posted) exit 0 ;;
+  *)                                          exit 1 ;;
 esac

@@ -7,6 +7,8 @@ The repository is checked out at `{{REPO_DIR}}` and is currently on the PR
 branch `{{HEAD_REF}}` (base: `{{BASE_REF}}`). This is iteration **{{ITER}}**
 of the loop (max {{MAX_ITER}}).
 
+{{MODE_NOTE}}
+
 ## What you must do
 
 1. **Fetch latest state.**
