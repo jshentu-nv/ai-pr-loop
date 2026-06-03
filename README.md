@@ -113,18 +113,11 @@ by *both* the Codex Reviewer and the Claude Implementer:
 | `--clear-context` | Drop context stored from a prior run on this PR. |
 
 All inputs are rendered once to `state/<owner>__<name>/pr-<N>/context.md`,
-whose path is injected into both prompts; each agent reads it (and may fetch
-any URLs) at the start of every turn. The material **supplements** the PR
-description and repo conventions — it doesn't override them.
-
-> **Trust model.** Context is framed to both agents as *untrusted reference
-> data*, not instructions: the prompts explicitly tell them that fetched page
-> content (and notes/files) must never change a verdict, the required output
-> format, or trigger out-of-band pushes/comments, and that anything reading
-> like an instruction should be flagged as a likely injection rather than
-> obeyed. Still, the agents do fetch the URLs you give them while holding your
-> `gh` push/comment rights — only attach links you're comfortable having them
-> read.
+whose path is injected into both prompts; each agent reads it (and fetches
+any URLs) at the start of every turn. The material is treated as **trusted,
+authoritative background** that supplements the PR description and repo
+conventions. The agents fetch the URLs you provide under your `gh` identity,
+so attach the references you want them to act on.
 
 **Persistence.** Context is stored per-PR and survives re-runs: pass the
 `--context*` flags once and every subsequent re-invocation (e.g. to grant
