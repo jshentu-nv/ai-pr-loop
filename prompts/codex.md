@@ -49,7 +49,7 @@ of the loop (max {{MAX_ITER}}).
      may have shifted) and any Claude reply. If the underlying concern is
      fully addressed — code fixed, or Claude's pushback is sound and you
      accept it — post a one-line `Resolved.` reply inline on that thread
-     (see step 6c). Do **not** mark the thread resolved via GitHub's
+     (see step 6(a)). Do **not** mark the thread resolved via GitHub's
      resolve-thread mutation; the comment is the signal, humans flip the
      state. Skip threads you've already replied "Resolved" to in a prior
      iteration (search `{{THREAD_FILE}}` for your own `Resolved.` body on
@@ -75,9 +75,41 @@ of the loop (max {{MAX_ITER}}).
      preference, **read more code** before flagging it.
 
 5. **Review the current diff** (`git diff origin/{{BASE_REF}}...HEAD`) with
-   that context in mind. Evaluate: correctness, design, safety/concurrency,
-   perf, tests, docs, and consistency with the project's existing
-   conventions.
+   that context in mind. Evaluate correctness, design, perf, docs, and
+   consistency with the project's conventions. Apply these focused passes
+   when the diff touches the relevant area (skip a pass cleanly if it
+   doesn't apply — don't manufacture findings):
+   - **Breaking changes.** For each public/exported symbol the diff changes
+     (signature, type, return, semantics), `grep -rn` its callers across the
+     repo. A backward-incompatible change with live callers and no migration
+     path is a BLOCKER unless the PR description documents it; for internal
+     symbols, MAJOR.
+   - **Tests.** If the diff changes behavior (not a pure refactor) on a path
+     with no new or updated test, flag the gap (usually MAJOR). If tests
+     exist but don't cover a new branch or parameter, say which. If you're
+     unsure a path is covered, ask inline rather than asserting a gap. Run
+     the relevant tests if cheap and the build system is obvious.
+   - **Safety / concurrency.** If the diff touches shared state, locks,
+     atomics, channels, or async: check the invariants hold (locked before
+     access, no deadlock cycle, no lost signal) and trace a caller or two to
+     confirm. If unsure of the model, ask inline — don't assert a race.
+   - **Security.** If the diff touches auth, crypto, input validation, SQL,
+     deserialization, or file/path handling: check for injection, bypass, or
+     missing validation against the established patterns nearby.
+
+   **5a. Before you post — pressure-test every finding.** A review that cries
+   wolf gets ignored, and each false positive costs the implementer a wasted
+   push-back cycle. For every finding you intend to raise:
+   - Re-read the exact lines once more and confirm the problem is real in the
+     **current** code (it may have changed since you first looked).
+   - Confirm it isn't already handled — by a guard above/below, a caller, or a
+     test — or deliberate per the PR description / a human comment.
+   - State the concrete failure: the input or path that triggers it, or the
+     invariant it breaks. If you can't, it's probably a NIT or not a finding.
+   Drop anything that doesn't survive this — post only findings you'd defend.
+   Then sanity-check the review's shape: a healthy round is roughly 0–2
+   BLOCKERs, a handful of MAJORs, few NITs. Many NITs with no MAJOR/BLOCKER
+   means you're likely nitpicking; a pile of BLOCKERs means re-verify each.
 
 6. **Post your review across two surfaces:**
 
@@ -216,11 +248,19 @@ of the loop (max {{MAX_ITER}}).
    <one sentence>
    ```
 
-   Severities: `BLOCKER` (must fix), `MAJOR` (should fix), `NIT` (optional).
-   Count each finding once at its highest severity — inline and
-   cross-cutting findings both count toward the totals you report in
-   step 8. If there are no BLOCKER or MAJOR issues remaining, say so and
-   approve.
+   Severities (guidelines — use judgment for findings that span or fall
+   between categories):
+   - `BLOCKER` (must fix): a correctness bug (wrong logic, unhandled error,
+     type/contract violation), a safety/security/concurrency defect, or a
+     breaking change to a public API with no migration path.
+   - `MAJOR` (should fix): a design flaw, a perf regression on a hot path,
+     missing error handling for an expected failure, or a test gap on
+     changed behavior.
+   - `NIT` (optional): style, naming, docs, or a non-functional cleanup.
+   Downgrade or drop a valid concern the PR description explicitly defers.
+   Count each finding once at its highest severity — inline and cross-cutting
+   findings both count toward the totals you report in step 8. If there are no
+   BLOCKER or MAJOR issues remaining, say so and approve.
 
 8. **At the very end of YOUR final stdout message** (not in the GitHub
    comment), print exactly **two** lines on their own lines, in this order

@@ -75,6 +75,21 @@ else
   snapshot_codex_sessions "$SNAPSHOT_BEFORE"
 fi
 
+# Reasoning effort for the reviewer, set by the orchestrator's --codex-effort
+# (default: xhigh, the highest level for the gpt-5.x family — codex has no
+# "ultracode"/orchestration mode). Mapped to a `-c model_reasoning_effort=...`
+# override, which the CLI accepts on both fresh `exec` and `exec resume`, so we
+# pass it on every turn rather than relying on the host's global config.toml.
+# "off" leaves the CLI/config default untouched.
+CODEX_EFFORT_ARG=()
+CODEX_EFFORT_RESOLVED="${CODEX_EFFORT:-xhigh}"
+case "$CODEX_EFFORT_RESOLVED" in
+  low|medium|high|xhigh) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
+  off)                   CODEX_EFFORT_ARG=() ;;
+  *)                     log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
+esac
+(( ${#CODEX_EFFORT_ARG[@]} > 0 )) && log "codex: reasoning effort = ${CODEX_EFFORT_RESOLVED}"
+
 # Codex must be able to run gh + git, hence bypass-approvals-and-sandbox.
 # (User explicitly requested unattended operation; mutations to GitHub are
 # expected.) `codex exec resume` doesn't accept --cd or --color, so cd via
@@ -82,6 +97,7 @@ fi
 set +e
 ( cd "$REPO_DIR" && NO_COLOR=1 codex exec \
     "${CODEX_SUBCMD[@]}" \
+    "${CODEX_EFFORT_ARG[@]}" \
     --skip-git-repo-check \
     --dangerously-bypass-approvals-and-sandbox \
     - \

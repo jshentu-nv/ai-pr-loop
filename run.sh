@@ -17,7 +17,7 @@
 #                      [--max N] [--converge N] [--review-only]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
-#                      [--claude-effort LEVEL]
+#                      [--claude-effort LEVEL] [--codex-effort LEVEL]
 #
 # Arguments:
 #   --repo        OWNER/NAME of the GitHub repo (required).
@@ -54,8 +54,12 @@
 #                 orchestration, via --settings). Other values map to
 #                 `claude --effort LEVEL`: low | medium | high | xhigh | max.
 #                 Use `off` to leave the CLI/settings default untouched.
-#                 (The Codex reviewer has no effort flag; this is implementer-
-#                 only.)
+#   --codex-effort LEVEL
+#                 Reasoning effort for the Codex reviewer's `codex exec` turns,
+#                 applied as `-c model_reasoning_effort=LEVEL` on every turn:
+#                 low | medium | high | xhigh. Default: xhigh (the highest level
+#                 for the gpt-5.x family — codex has no ultracode/max). Use
+#                 `off` to leave the host's codex config untouched.
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -89,6 +93,7 @@ CONTEXT_NOTES=()
 CONTEXT_FILES=()
 CLEAR_CONTEXT=0
 CLAUDE_EFFORT="ultracode"
+CODEX_EFFORT="xhigh"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -103,8 +108,9 @@ while [[ $# -gt 0 ]]; do
     --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
     --clear-context) CLEAR_CONTEXT=1; shift ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
+    --codex-effort)  [[ $# -ge 2 ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
     -h|--help)
-      sed -n '2,66p' "$0"; exit 0 ;;
+      sed -n '2,70p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -133,6 +139,11 @@ case "$CLAUDE_EFFORT" in
   ultracode|low|medium|high|xhigh|max|off) ;;
   *) die "--claude-effort must be one of: ultracode low medium high xhigh max off (got: $CLAUDE_EFFORT)" ;;
 esac
+# Codex reasoning effort: gpt-5.x tops out at xhigh (no ultracode/max for codex).
+case "$CODEX_EFFORT" in
+  low|medium|high|xhigh|off) ;;
+  *) die "--codex-effort must be one of: low medium high xhigh off (got: $CODEX_EFFORT)" ;;
+esac
 
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -154,7 +165,7 @@ if [[ -z "$REPO_DIR" ]]; then
   REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY CLAUDE_EFFORT
+export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY CLAUDE_EFFORT CODEX_EFFORT
 
 preflight
 ensure_repo_clone
@@ -243,6 +254,7 @@ log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
 log "  claude effort: $CLAUDE_EFFORT"
+log "  codex effort:  $CODEX_EFFORT"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

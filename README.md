@@ -126,24 +126,36 @@ flag again to **replace** the stored context, or `--clear-context` to drop
 it. (`--clear-context` is ignored when new `--context*` flags are also
 given — those win.)
 
-## Implementer reasoning effort
+## Reasoning effort
 
-The Claude Implementer's `claude -p` turns run at **`ultracode`** effort by
-default — `xhigh` reasoning plus dynamic-workflow orchestration (passed via
+Both agents run at high reasoning effort by default; you can dial each one.
+
+**Claude Implementer** — `claude -p` turns default to **`ultracode`**: `xhigh`
+reasoning plus dynamic-workflow orchestration (passed via
 `--settings '{"ultracode": true}'`, the documented headless mechanism; it
 degrades to plain `xhigh` where orchestration doesn't apply in `-p` mode).
-Dial it with `--claude-effort LEVEL`:
+Dial with `--claude-effort LEVEL` — one of `ultracode` (default), `low`,
+`medium`, `high`, `xhigh`, `max`, or `off`.
+
+**Codex Reviewer** — `codex exec` turns default to **`xhigh`**, the highest
+reasoning level for the gpt-5.x family (Codex has no `ultracode`/`max`). It's
+applied as `-c model_reasoning_effort=xhigh` on every turn (fresh and
+`resume`), so the loop doesn't silently depend on the host's global
+`~/.codex/config.toml`. Dial with `--codex-effort LEVEL` — one of `low`,
+`medium`, `high`, `xhigh` (default), or `off` (leave the host's codex config
+untouched).
 
 ```bash
-~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # reasoning only, no orchestration
-~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort max     # deepest single-turn reasoning
-~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort off     # use the CLI/settings default
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # implementer: reasoning only, no orchestration
+~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: a notch down from xhigh
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort off --codex-effort off  # both: CLI/config defaults
 ```
 
-`LEVEL` is one of `ultracode` (default), `low`, `medium`, `high`, `xhigh`,
-`max`, or `off`. `ultracode`/`max` are the heaviest — more thorough, but more
-tokens and wall time per iteration. Effort applies to the implementer only;
-the Codex Reviewer's CLI has no equivalent effort flag.
+The heavier levels are more thorough but cost more tokens and wall time per
+iteration. Beyond the effort knob, the Codex review prompt itself runs a
+self-check-before-posting pass, a severity rubric, and targeted
+security/concurrency, breaking-change, and test-gap passes to keep findings
+high-signal.
 
 ## How agents are distinguished
 
@@ -252,8 +264,8 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
   --context "Must stay backward-compatible with the v1 API." \
   --context-file ./docs/spec.md
 
-# Dial the implementer's reasoning effort (default is ultracode):
-~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh
+# Dial reasoning effort (implementer default ultracode, reviewer default xhigh):
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh --codex-effort high
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex

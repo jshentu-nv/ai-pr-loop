@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-effort LEVEL]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-effort LEVEL] [--codex-effort LEVEL]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -89,7 +89,12 @@ Optional flags worth surfacing if the user mentions a constraint:
   turns. **Default `ultracode`** (xhigh + dynamic-workflow orchestration). Set
   it if the user asks for lighter/heavier implementer reasoning or flags cost:
   `xhigh` (reasoning only), `max`, `high`, `medium`, `low`, or `off` (CLI
-  default). Implementer-only — the Codex reviewer has no effort flag.
+  default).
+- `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
+  applied as `-c model_reasoning_effort=LEVEL`. **Default `xhigh`** (the top
+  level for gpt-5.x; Codex has no ultracode/max). Levels: `low`, `medium`,
+  `high`, `xhigh`, or `off` (leave the host's codex config untouched). Dial
+  down if the user flags cost/latency.
 
 ## Steps
 
