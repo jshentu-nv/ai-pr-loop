@@ -19,6 +19,8 @@ The full prior AI thread is at `{{THREAD_FILE}}` (NDJSON, one comment per
 line, fields `tag`, `iter`, `surface`, `id`, `path`, `line`,
 `in_reply_to_id`, `created_at`, `body`).
 
+{{CONTEXT_NOTE}}
+
 ## What you must do
 
 1. **Read both files.** Parse `{{LATEST_INLINE_FILE}}` (it may be empty if

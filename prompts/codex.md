@@ -9,6 +9,8 @@ of the loop (max {{MAX_ITER}}).
 
 {{MODE_NOTE}}
 
+{{CONTEXT_NOTE}}
+
 ## What you must do
 
 1. **Fetch latest state.**

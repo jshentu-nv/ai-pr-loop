@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -64,6 +64,29 @@ Optional flags worth surfacing if the user mentions a constraint:
   new HEAD at `last_codex+1`. If codex previously APPROVED, add
   `--restart` to force a fresh round.
 
+- **Additional context** (shared by both agents) — when the user wants the
+  bots to consider external reference material (a design doc, RFC, related
+  issue, API reference, style guide), pass it through. Phrases like "review
+  this against <link>", "here's the design doc: <url>", "keep <url> in mind",
+  "use this spec". All are repeatable and shared by both Codex and Claude:
+  - `--context-url URL` — a web link. The agents fetch it themselves
+    (Claude via WebFetch, Codex via curl).
+  - `--context TEXT` — a free-text note.
+  - `--context-file FILE` — a local file injected verbatim (read at launch).
+  - `--clear-context` — drop context stored from a prior run on this PR.
+
+  Context is stored per-PR and **persists across re-runs**: pass the flags
+  once and later re-invocations reuse it. Passing any `--context*` flag again
+  replaces the stored context. If the user pastes a URL as "context" or
+  "background" (not the PR URL itself), route it to `--context-url`.
+
+  **Trust note.** The agents fetch these URLs while holding the user's `gh`
+  push/comment rights. The prompts already frame the material as *untrusted
+  reference data* (it can't change a verdict, the output format, or trigger
+  out-of-band actions), but only attach links/files the user actually asked
+  for — don't infer context URLs from the surrounding conversation, and don't
+  attach internal/credentialed links the agents shouldn't be hitting.
+
 ## Steps
 
 ### 1. Locate the orchestrator
@@ -104,6 +127,11 @@ doubt, ask.
 ```bash
 "$RUN_SH" <PR_NUMBER> --repo <REPO_SLUG> --max <N> --converge <N>
 ```
+
+Append any context the user supplied, e.g.
+`--context-url <url> --context "<note>" --context-file <path>` (repeatable;
+shared by both agents). On a re-run to grant more iterations, omit them —
+stored context is reused automatically.
 
 Use the Bash tool with `run_in_background: true`. Note the returned task
 ID and output file path — you'll need both for the monitor.

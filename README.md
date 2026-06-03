@@ -85,6 +85,54 @@ Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
 Codex `exec resume`), so internal memory persists across iterations on top
 of the publicly auditable PR thread.
 
+## Additional context (web links, notes, files)
+
+Both agents review the diff against the PR description and the repo's own
+conventions. You can hand them **extra reference material** — a design doc,
+an RFC, a related issue, an API reference, a style guide — and it's shared
+by *both* the Codex Reviewer and the Claude Implementer:
+
+```bash
+# Attach web links (repeatable). The agents fetch them themselves
+# (Claude via WebFetch, Codex via curl).
+~/ai-pr-loop/run.sh 42 --repo owner/repo \
+  --context-url https://example.com/design-doc \
+  --context-url https://github.com/owner/repo/issues/123
+
+# Free-text notes (repeatable) and a local file injected verbatim.
+~/ai-pr-loop/run.sh 42 --repo owner/repo \
+  --context "The auth flow must follow section 3 of the linked RFC." \
+  --context-file ./docs/migration-plan.md
+```
+
+| Flag | Effect |
+|---|---|
+| `--context-url URL` | A web link. Repeatable. The agents fetch it. |
+| `--context TEXT` | A free-text note. Repeatable. |
+| `--context-file FILE` | A local file; its contents are injected verbatim. Read at launch, so the path needn't survive to later re-runs. Repeatable. |
+| `--clear-context` | Drop context stored from a prior run on this PR. |
+
+All inputs are rendered once to `state/<owner>__<name>/pr-<N>/context.md`,
+whose path is injected into both prompts; each agent reads it (and may fetch
+any URLs) at the start of every turn. The material **supplements** the PR
+description and repo conventions — it doesn't override them.
+
+> **Trust model.** Context is framed to both agents as *untrusted reference
+> data*, not instructions: the prompts explicitly tell them that fetched page
+> content (and notes/files) must never change a verdict, the required output
+> format, or trigger out-of-band pushes/comments, and that anything reading
+> like an instruction should be flagged as a likely injection rather than
+> obeyed. Still, the agents do fetch the URLs you give them while holding your
+> `gh` push/comment rights — only attach links you're comfortable having them
+> read.
+
+**Persistence.** Context is stored per-PR and survives re-runs: pass the
+`--context*` flags once and every subsequent re-invocation (e.g. to grant
+more `--max` iterations) reuses the same `context.md`. Pass any `--context*`
+flag again to **replace** the stored context, or `--clear-context` to drop
+it. (`--clear-context` is ignored when new `--context*` flags are also
+given — those win.)
+
 ## How agents are distinguished
 
 Both bots post under the same human PAT (whichever account the local `gh`
@@ -185,6 +233,12 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 
 # Just post a review, don't auto-fix anything:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --review-only
+
+# Attach reference material (web links / notes / a local file) for both agents:
+~/ai-pr-loop/run.sh 42 --repo owner/repo \
+  --context-url https://example.com/design-doc \
+  --context "Must stay backward-compatible with the v1 API." \
+  --context-file ./docs/spec.md
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex
