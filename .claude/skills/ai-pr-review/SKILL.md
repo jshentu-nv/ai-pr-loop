@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-effort LEVEL]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -80,12 +80,16 @@ Optional flags worth surfacing if the user mentions a constraint:
   replaces the stored context. If the user pastes a URL as "context" or
   "background" (not the PR URL itself), route it to `--context-url`.
 
-  **Trust note.** The agents fetch these URLs while holding the user's `gh`
-  push/comment rights. The prompts already frame the material as *untrusted
-  reference data* (it can't change a verdict, the output format, or trigger
-  out-of-band actions), but only attach links/files the user actually asked
-  for — don't infer context URLs from the surrounding conversation, and don't
-  attach internal/credentialed links the agents shouldn't be hitting.
+  Context is treated as trusted, authoritative background by both agents, and
+  they fetch the URLs under the user's `gh` identity. Only attach links/files
+  the user actually asked for — don't infer context URLs from the surrounding
+  conversation.
+
+- `--claude-effort LEVEL` — reasoning effort for the Claude implementer's
+  turns. **Default `ultracode`** (xhigh + dynamic-workflow orchestration). Set
+  it if the user asks for lighter/heavier implementer reasoning or flags cost:
+  `xhigh` (reasoning only), `max`, `high`, `medium`, `low`, or `off` (CLI
+  default). Implementer-only — the Codex reviewer has no effort flag.
 
 ## Steps
 

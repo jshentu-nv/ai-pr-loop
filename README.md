@@ -126,6 +126,25 @@ flag again to **replace** the stored context, or `--clear-context` to drop
 it. (`--clear-context` is ignored when new `--context*` flags are also
 given — those win.)
 
+## Implementer reasoning effort
+
+The Claude Implementer's `claude -p` turns run at **`ultracode`** effort by
+default — `xhigh` reasoning plus dynamic-workflow orchestration (passed via
+`--settings '{"ultracode": true}'`, the documented headless mechanism; it
+degrades to plain `xhigh` where orchestration doesn't apply in `-p` mode).
+Dial it with `--claude-effort LEVEL`:
+
+```bash
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # reasoning only, no orchestration
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort max     # deepest single-turn reasoning
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort off     # use the CLI/settings default
+```
+
+`LEVEL` is one of `ultracode` (default), `low`, `medium`, `high`, `xhigh`,
+`max`, or `off`. `ultracode`/`max` are the heaviest — more thorough, but more
+tokens and wall time per iteration. Effort applies to the implementer only;
+the Codex Reviewer's CLI has no equivalent effort flag.
+
 ## How agents are distinguished
 
 Both bots post under the same human PAT (whichever account the local `gh`
@@ -232,6 +251,9 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
   --context-url https://example.com/design-doc \
   --context "Must stay backward-compatible with the v1 API." \
   --context-file ./docs/spec.md
+
+# Dial the implementer's reasoning effort (default is ultracode):
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex

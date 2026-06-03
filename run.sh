@@ -17,6 +17,7 @@
 #                      [--max N] [--converge N] [--review-only]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
+#                      [--claude-effort LEVEL]
 #
 # Arguments:
 #   --repo        OWNER/NAME of the GitHub repo (required).
@@ -47,6 +48,14 @@
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
 #                 replace the prior context instead).
+#   --claude-effort LEVEL
+#                 Reasoning effort for the Claude implementer's `claude -p`
+#                 turns. Default: ultracode (xhigh reasoning + dynamic-workflow
+#                 orchestration, via --settings). Other values map to
+#                 `claude --effort LEVEL`: low | medium | high | xhigh | max.
+#                 Use `off` to leave the CLI/settings default untouched.
+#                 (The Codex reviewer has no effort flag; this is implementer-
+#                 only.)
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -79,21 +88,23 @@ CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
 CLEAR_CONTEXT=0
+CLAUDE_EFFORT="ultracode"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)         REPO_SLUG="$2"; shift 2 ;;
-    --dir)          REPO_DIR="$2";  shift 2 ;;
-    --max)          MAX_ITER="$2";  shift 2 ;;
-    --converge)     CONVERGE_N="$2"; shift 2 ;;
-    --restart)      RESTART=1; shift ;;
-    --review-only)  REVIEW_ONLY=1; shift ;;
-    --context-url)  [[ $# -ge 2 ]] || die "--context-url needs a URL";  CONTEXT_URLS+=("$2");  shift 2 ;;
-    --context)      [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
-    --context-file) [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
+    --repo)          REPO_SLUG="$2"; shift 2 ;;
+    --dir)           REPO_DIR="$2";  shift 2 ;;
+    --max)           MAX_ITER="$2";  shift 2 ;;
+    --converge)      CONVERGE_N="$2"; shift 2 ;;
+    --restart)       RESTART=1; shift ;;
+    --review-only)   REVIEW_ONLY=1; shift ;;
+    --context-url)   [[ $# -ge 2 ]] || die "--context-url needs a URL";  CONTEXT_URLS+=("$2");  shift 2 ;;
+    --context)       [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
+    --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
     --clear-context) CLEAR_CONTEXT=1; shift ;;
+    --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,57p' "$0"; exit 0 ;;
+      sed -n '2,66p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -116,6 +127,13 @@ if (( REVIEW_ONLY == 1 )); then
   log "review-only: running a single codex review turn (no claude implementer)"
 fi
 
+# Validate the implementer effort level up front (the claude CLI accepts an
+# unknown --effort at parse time and only falls back later, so catch typos here).
+case "$CLAUDE_EFFORT" in
+  ultracode|low|medium|high|xhigh|max|off) ;;
+  *) die "--claude-effort must be one of: ultracode low medium high xhigh max off (got: $CLAUDE_EFFORT)" ;;
+esac
+
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
 
@@ -136,7 +154,7 @@ if [[ -z "$REPO_DIR" ]]; then
   REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY
+export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY CLAUDE_EFFORT
 
 preflight
 ensure_repo_clone
@@ -224,6 +242,7 @@ log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
+log "  claude effort: $CLAUDE_EFFORT"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

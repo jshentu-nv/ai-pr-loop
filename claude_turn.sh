@@ -88,12 +88,27 @@ else
   log "claude: starting new session $CLAUDE_SESSION_UUID"
 fi
 
+# Reasoning effort for the implementer, set by the orchestrator's --claude-effort
+# (default: ultracode). "ultracode" sends xhigh reasoning + dynamic-workflow
+# orchestration via --settings (the documented headless mechanism; degrades to
+# plain xhigh if orchestration doesn't apply in -p mode). A bare level uses
+# --effort. "off" leaves the CLI/settings default untouched.
+CLAUDE_EFFORT_ARG=()
+case "${CLAUDE_EFFORT:-ultracode}" in
+  ultracode)                 CLAUDE_EFFORT_ARG=(--settings '{"ultracode": true}') ;;
+  low|medium|high|xhigh|max) CLAUDE_EFFORT_ARG=(--effort "${CLAUDE_EFFORT}") ;;
+  off|'')                    CLAUDE_EFFORT_ARG=() ;;
+  *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT}' — using CLI default"; CLAUDE_EFFORT_ARG=() ;;
+esac
+(( ${#CLAUDE_EFFORT_ARG[@]} > 0 )) && log "claude: effort = ${CLAUDE_EFFORT}"
+
 # claude -p runs non-interactively; --dangerously-skip-permissions is required
 # for unattended operation (user authorized this).
 set +e
 ( cd "$REPO_DIR" && \
   claude -p \
     "${CLAUDE_SESSION_ARG[@]}" \
+    "${CLAUDE_EFFORT_ARG[@]}" \
     --dangerously-skip-permissions \
     --add-dir "$REPO_DIR" \
     --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
