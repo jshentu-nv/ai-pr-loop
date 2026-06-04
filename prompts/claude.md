@@ -43,6 +43,17 @@ line, fields `tag`, `iter`, `surface`, `id`, `path`, `line`,
    - Make the edits.
    - Run any quick local checks the repo supports (build, format, light
      tests) — but do not block on slow integration suites.
+   - **Self-review before you commit.** Once you're done implementing and
+     before you stage anything, run the `/code-review` skill on the changes
+     you just made this iteration (the uncommitted working-tree diff). Treat
+     its findings exactly as you treat Codex's: fix the valid ones — folding
+     them into this iteration's changes so they land in the **same commit** —
+     and silently ignore false positives. This is your own gate: it catches
+     your bugs before they reach Codex and keeps the loop converging. Run it
+     at full strength — **xhigh reasoning with ultracode (dynamic-workflow)
+     orchestration**, the same effort you implement at — so it's an
+     exhaustive pass, not a quick skim. Skip this only when you made no code
+     changes (pushback-only iterations have nothing to review).
    - Stage and commit with a **distinct bot identity** so humans can tell
      these commits from the human author's:
      ```

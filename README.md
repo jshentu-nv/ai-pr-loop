@@ -78,6 +78,10 @@ named, and will ask you to confirm the first time it's about to post.
   identity (`claude-implementer (ai-bot)
   <claude-implementer+bot@users.noreply.github.com>`) and pushes, or
   pushes back inline with reasoning.
+- Before committing code changes, self-reviews this iteration's
+  uncommitted diff with the `/code-review` skill and folds any valid
+  findings into the same commit — catching its own bugs before they
+  reach Codex.
 - Replies inline to every finding via `in_reply_to`, posts a summary
   issue-comment, never force-pushes / amends / rebases.
 
