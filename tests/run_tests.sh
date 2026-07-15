@@ -10,9 +10,11 @@
 #     off), --session-id vs --resume
 #   - codex_turn.sh argv: -m / model_reasoning_effort / service_tier mapping,
 #     off omission, adaptive effort for non-sol models, fresh vs `exec resume`,
-#     session-id capture from the rollout file
-#   - run.sh flag validation die-paths (empty / unknown values) and resolved
-#     knob output via --print-config (adaptive default / explicit precedence)
+#     root-session discovery (sub-agent skip + cwd binding), stored-id
+#     migration / discard of unresumable ids
+#   - run.sh flag validation die-paths (empty / unknown / next-flag-as-value)
+#     and resolved knob output via --print-config (adaptive default / explicit
+#     precedence)
 #
 # Usage: tests/run_tests.sh
 set -uo pipefail
@@ -64,10 +66,16 @@ cat > "$STUBS/codex" <<'EOF'
 #!/usr/bin/env bash
 : > "$ARGV_FILE"
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
-# Real `codex exec` writes a session rollout file; emulate it so the
-# session-capture path (snapshot / discover / persist) is exercised.
+# Real `codex exec` writes a session rollout file recording its cwd; emulate
+# it so the session-capture path (snapshot / discover with cwd binding /
+# persist) is exercised. Also drop a DECOY root recorded for another checkout
+# that sorts before the real one — a concurrent loop's interleaved root —
+# so the fresh-capture assertions fail if discovery loses its cwd binding.
 mkdir -p "$CODEX_HOME/sessions"
-printf '{"payload":{"id":"stub-session-uuid"}}\n' > "$CODEX_HOME/sessions/rollout-stub.jsonl"
+printf '{"payload":{"id":"foreign-root-uuid","cwd":"/other-checkout","source":"exec"}}\n' \
+  > "$CODEX_HOME/sessions/rollout-a-decoy.jsonl"
+printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
+  > "$CODEX_HOME/sessions/rollout-stub.jsonl"
 echo "[CODEX_ISSUES: BLOCKER=0 MAJOR=0 NIT=0]"
 echo "[CODEX_VERDICT: APPROVED]"
 EOF
@@ -181,6 +189,74 @@ printf '{"payload":{"id":"legacy-uuid"}}\n' \
   > "$DISC2/sessions/rollout-2026-01-01T00-00-01-legacy.jsonl"
 assert_eq "$(CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty")" legacy-uuid
 
+# Concurrent loops: both loops' new root rollouts appear in the shared
+# sessions dir; cwd binding must pick this checkout's root, not the first
+# one by sort order.
+DISC3="$WORK/discover3"
+mkdir -p "$DISC3/sessions"
+: > "$DISC3/before-empty"
+printf '{"payload":{"id":"root-a-uuid","cwd":"/checkout-a","source":"exec"}}\n' \
+  > "$DISC3/sessions/rollout-2026-01-01T00-00-01-a.jsonl"
+printf '{"payload":{"id":"root-b-uuid","cwd":"/checkout-b","source":"exec"}}\n' \
+  > "$DISC3/sessions/rollout-2026-01-01T00-00-02-b.jsonl"
+
+t "discover: interleaved roots — cwd binding picks this checkout's root"
+assert_eq "$(CODEX_HOME="$DISC3" discover_new_codex_session_id "$DISC3/before-empty" /checkout-b)" root-b-uuid
+
+t "discover: cwd binding tolerates rollouts without a cwd (older codex)"
+assert_eq "$(CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty" /anywhere)" legacy-uuid
+
+# --- resolve_codex_root_session_id -----------------------------------------
+# Stored ids from older selectors may point at a sub-agent rollout (which
+# `codex exec resume` rejects) or another checkout's root; resolution must
+# migrate or reject instead of leaving the loop wedged.
+
+printf '{"payload":{"id":"sub3-uuid","source":{"subagent":{"thread_spawn":{"parent_thread_id":"sub-uuid","depth":2}}}}}\n' \
+  > "$DISC/sessions/d/rollout-2026-01-01T00-00-04-sub3.jsonl"
+
+t "resolve-session: root id resolves to itself"
+assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id root-uuid)" root-uuid
+
+t "resolve-session: sub-agent id migrates to its parent root"
+assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id sub-uuid)" root-uuid
+
+t "resolve-session: depth-2 sub-agent follows the chain to the root"
+assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id sub3-uuid)" root-uuid
+
+t "resolve-session: unknown id fails"
+if CODEX_HOME="$DISC" resolve_codex_root_session_id no-such-uuid >/dev/null 2>&1; then
+  bad "unexpectedly resolved an unknown id"
+else
+  ok
+fi
+
+t "resolve-session: root recorded for another checkout is rejected"
+if CODEX_HOME="$DISC3" resolve_codex_root_session_id root-a-uuid /checkout-b >/dev/null 2>&1; then
+  bad "unexpectedly accepted a root bound to a different cwd"
+else
+  ok
+fi
+
+t "resolve-session: cwd binding tolerates roots without a cwd"
+assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id root-uuid /anywhere)" root-uuid
+
+# The poisoned-state shape the resume validation exists for: a sub-agent id
+# captured by the old unbound discovery whose parent chain ends at ANOTHER
+# checkout's root. The cwd check must hold after following the chain, not
+# just on the stored id itself.
+printf '{"payload":{"id":"sub-a-uuid","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-a-uuid","depth":1}}}}}\n' \
+  > "$DISC3/sessions/rollout-2026-01-01T00-00-03-sub-a.jsonl"
+
+t "resolve-session: sub-agent chain ending at a foreign root is rejected"
+if CODEX_HOME="$DISC3" resolve_codex_root_session_id sub-a-uuid /checkout-b >/dev/null 2>&1; then
+  bad "unexpectedly migrated to another checkout's root"
+else
+  ok
+fi
+
+t "resolve-session: sub-agent chain ending at this checkout's root migrates"
+assert_eq "$(CODEX_HOME="$DISC3" resolve_codex_root_session_id sub-a-uuid /checkout-a)" root-a-uuid
+
 # --- claude_turn.sh ------------------------------------------------------
 
 t "claude: defaults (fable + ultracode + auto perms)"
@@ -287,8 +363,11 @@ assert_no_substr "$ARGV" model_reasoning_effort
 assert_no_substr "$ARGV" service_tier
 assert_line "$ARGV" --yolo
 
-t "codex: seeded session resumes with 'exec resume <id>'"
+t "codex: seeded root session resumes with 'exec resume <id>'"
 new_case codex-resume
+printf '{"payload":{"id":"cafebabe-dead-beef-sess","source":"exec","cwd":"%s"}}\n' \
+    "$(cd "$CASE_DIR/repo" && pwd -P)" \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-seed.jsonl"
 echo "cafebabe-dead-beef-sess" > "$CASE_DIR/state/codex.session.id"
 run_turn codex
 assert_rc0
@@ -297,6 +376,37 @@ assert_pair "$ARGV" resume cafebabe-dead-beef-sess
 
 t "codex: resume keeps the seeded session id"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafebabe-dead-beef-sess
+
+t "codex: stored sub-agent session id migrates to its root before resume"
+new_case codex-migrate
+printf '{"payload":{"id":"old-root-uuid","source":"exec","cwd":"%s"}}\n' \
+    "$(cd "$CASE_DIR/repo" && pwd -P)" \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-root.jsonl"
+printf '{"payload":{"id":"stale-sub-uuid","source":{"subagent":{"thread_spawn":{"parent_thread_id":"old-root-uuid","depth":1}}}}}\n' \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-02-sub.jsonl"
+echo "stale-sub-uuid" > "$CASE_DIR/state/codex.session.id"
+run_turn codex
+assert_rc0
+assert_pair "$ARGV" resume old-root-uuid
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" old-root-uuid
+
+t "codex: unresumable stored session id is discarded and a fresh session captured"
+new_case codex-stale
+echo "gone-uuid" > "$CASE_DIR/state/codex.session.id"
+run_turn codex
+assert_rc0
+assert_no_line "$ARGV" resume
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+t "codex: stored root recorded for another checkout is discarded, not hijacked"
+new_case codex-foreign
+printf '{"payload":{"id":"other-loop-root","source":"exec","cwd":"/other-checkout"}}\n' \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-other.jsonl"
+echo "other-loop-root" > "$CASE_DIR/state/codex.session.id"
+run_turn codex
+assert_rc0
+assert_no_line "$ARGV" resume
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
 
 # --- run.sh flag validation ----------------------------------------------
 
@@ -315,6 +425,25 @@ assert_dies_with "--claude-effort must be one of"
 t "run.sh: empty --codex-model is rejected"
 run_run_sh 1 --repo o/n --codex-model ''
 assert_dies_with "--codex-model needs a model"
+
+# Anti-swallow branch: a free-form flag must not consume the next option as
+# its value (e.g. --codex-model --review-only would otherwise eat the mode
+# flag and silently drop review-only).
+t "run.sh: --codex-model refuses the next flag as its value"
+run_run_sh 1 --repo o/n --codex-model --review-only
+assert_dies_with "--codex-model needs a model"
+
+t "run.sh: --claude-model refuses the next flag as its value"
+run_run_sh 1 --repo o/n --claude-model --review-only
+assert_dies_with "--claude-model needs a model"
+
+t "run.sh: --codex-tier refuses the next flag as its value"
+run_run_sh 1 --repo o/n --codex-tier --review-only
+assert_dies_with "--codex-tier needs a tier"
+
+t "run.sh: --claude-perms refuses the next flag as its value"
+run_run_sh 1 --repo o/n --claude-perms --review-only
+assert_dies_with "--claude-perms needs a mode"
 
 t "run.sh: unknown --claude-perms is rejected"
 run_run_sh 1 --repo o/n --claude-perms bogus

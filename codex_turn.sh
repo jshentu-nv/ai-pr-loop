@@ -63,14 +63,31 @@ log "codex: iter $ITER — running"
 # capture the session id from the filesystem after the first run, then resume
 # by id on subsequent iters. This gives Codex its own internal memory of the
 # whole review, on top of the public PR thread it re-reads from disk each turn.
+# Discovery and stored-id validation are bound to this checkout's canonical
+# path so concurrent loops on other checkouts can't cross-capture sessions.
+REPO_DIR_CANON=$(cd "$REPO_DIR" && pwd -P)
 CODEX_SESSION_FILE="$STATE_DIR/codex.session.id"
 CAPTURE_NEW_SESSION=0
 CODEX_SUBCMD=()
 if [[ -s "$CODEX_SESSION_FILE" ]]; then
-  CODEX_SESSION_ID=$(<"$CODEX_SESSION_FILE")
-  log "codex: resuming session $CODEX_SESSION_ID"
-  CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
-else
+  STORED_SESSION_ID=$(<"$CODEX_SESSION_FILE")
+  # State written by older selectors can hold a sub-agent id (which `codex
+  # exec resume` rejects) or another checkout's root (captured by the old
+  # unbound discovery under concurrent loops). Migrate to the root session or
+  # discard and start fresh instead of staying wedged.
+  if CODEX_SESSION_ID=$(resolve_codex_root_session_id "$STORED_SESSION_ID" "$REPO_DIR_CANON"); then
+    if [[ "$CODEX_SESSION_ID" != "$STORED_SESSION_ID" ]]; then
+      log "codex: stored session $STORED_SESSION_ID is a sub-agent — migrated to root $CODEX_SESSION_ID"
+      printf '%s\n' "$CODEX_SESSION_ID" > "$CODEX_SESSION_FILE"
+    fi
+    log "codex: resuming session $CODEX_SESSION_ID"
+    CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
+  else
+    log "codex: stored session $STORED_SESSION_ID is not resumable for this checkout — starting fresh"
+    rm -f "$CODEX_SESSION_FILE"
+  fi
+fi
+if (( ${#CODEX_SUBCMD[@]} == 0 )); then
   log "codex: starting new session"
   CAPTURE_NEW_SESSION=1
   SNAPSHOT_BEFORE="$ID/codex.sessions.before"
@@ -136,7 +153,7 @@ set -e
 # Capture the new session id so the next iter can resume. Only on success —
 # a failed first run probably didn't write a usable rollout file.
 if (( CAPTURE_NEW_SESSION == 1 )) && [[ $RC -eq 0 ]]; then
-  if NEW_SESSION_ID=$(discover_new_codex_session_id "$SNAPSHOT_BEFORE"); then
+  if NEW_SESSION_ID=$(discover_new_codex_session_id "$SNAPSHOT_BEFORE" "$REPO_DIR_CANON"); then
     printf '%s\n' "$NEW_SESSION_ID" > "$CODEX_SESSION_FILE"
     log "codex: captured session id $NEW_SESSION_ID"
   else

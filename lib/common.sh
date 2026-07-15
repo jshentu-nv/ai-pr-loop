@@ -215,21 +215,90 @@ snapshot_codex_sessions() {
 # rejects those ("direct app-server input is not allowed for multi-agent v2
 # sub-agents"), so skip them and take the earliest non-subagent file — the
 # root session is created at run start, sub-agents later.
+# $2 (optional) binds the search to one invocation: concurrent loops all see
+# each other's new rollouts in the host-global sessions dir, so a root whose
+# session_meta records a different cwd belongs to another loop's checkout and
+# is skipped. Rollouts without a cwd (older codex) still count.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
-  local before="$1"
+  local before="$1" want_cwd="${2:-}"
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  local f id
+  local f meta id cwd
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
-    head -1 "$f" \
-      | jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
-        >/dev/null 2>&1 || continue
-    id=$(head -1 "$f" | jq -er '.payload.id // empty' 2>/dev/null) || continue
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
+      <<<"$meta" >/dev/null 2>&1 || continue
+    if [[ -n "$want_cwd" ]]; then
+      cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
+      [[ -z "$cwd" || "$cwd" == "$want_cwd" ]] || continue
+    fi
+    id=$(jq -er '.payload.id // empty' <<<"$meta" 2>/dev/null) || continue
     [[ -n "$id" ]] || continue
     printf '%s\n' "$id"
     return 0
   done < <(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
             | sort | comm -23 - "$before")
+  return 1
+}
+
+# Print the session_meta (first JSONL line) of the rollout whose payload.id
+# matches $1, or fail. Codex embeds the session uuid in the rollout filename
+# (rollout-<timestamp>-<uuid>.jsonl), so try a targeted filename lookup first;
+# only fall back to scanning first lines when that misses (hosts accumulate
+# thousands of rollouts, and a head+jq per file over all of them costs
+# minutes). The payload.id check guards both paths, so an odd filename can't
+# return the wrong session.
+codex_rollout_meta_for_id() {
+  local id="$1"
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local f meta
+  while IFS= read -r f; do
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    if [[ "$(jq -r '.payload.id // empty' <<<"$meta" 2>/dev/null)" == "$id" ]]; then
+      printf '%s\n' "$meta"
+      return 0
+    fi
+  done < <(
+    find "$codex_home/sessions" -type f -name "rollout-*-${id}.jsonl" 2>/dev/null
+    find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null
+  )
+  return 1
+}
+
+# Resolve a stored codex session id to a resumable ROOT session id:
+#   - id belongs to a root rollout      → print it unchanged
+#   - id belongs to a sub-agent rollout → follow parent_thread_id up to the
+#                                          root (bounded hops) and print that;
+#                                          repairs state persisted by the old
+#                                          newest-file selector
+#   - id has no rollout / broken chain  → return 1 (caller starts fresh)
+# $2 (optional): the root must have been recorded for this cwd — a stored id
+# whose root belongs to another checkout (poisoned by a concurrent loop before
+# discovery was cwd-bound) is rejected rather than hijacking that loop's
+# conversation. Roots without a cwd (older codex) always pass. Deliberate
+# trade-off: a session whose checkout legitimately moved (e.g. the same PR
+# re-run with a different --dir) is also rejected and restarts fresh — losing
+# cross-iteration memory is recoverable, resuming another PR's conversation is
+# not, and the two cases are indistinguishable from the rollout alone.
+resolve_codex_root_session_id() {
+  local id="$1" want_cwd="${2:-}"
+  local hops found parent cwd
+  for (( hops = 0; hops < 5; hops++ )); do
+    found=$(codex_rollout_meta_for_id "$id") || return 1
+    if jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
+         <<<"$found" >/dev/null 2>&1; then
+      if [[ -n "$want_cwd" ]]; then
+        cwd=$(jq -r '.payload.cwd // empty' <<<"$found" 2>/dev/null) || cwd=''
+        [[ -z "$cwd" || "$cwd" == "$want_cwd" ]] || return 1
+      fi
+      printf '%s\n' "$id"
+      return 0
+    fi
+    parent=$(jq -er '.payload.source.subagent.thread_spawn.parent_thread_id // empty' \
+               <<<"$found" 2>/dev/null) || return 1
+    [[ -n "$parent" ]] || return 1
+    id="$parent"
+  done
   return 1
 }
