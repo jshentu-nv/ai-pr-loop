@@ -133,9 +133,12 @@ given — those win.)
 ## Models & reasoning effort
 
 Both agents run on a pinned model at high reasoning effort by default; you
-can dial each one. All of these are passed explicitly on every turn (fresh
-and resumed), so the loop doesn't silently depend on the host's global
-`claude` settings or `~/.codex/config.toml`.
+can dial each one. Every knob is passed explicitly on every turn (fresh and
+resumed), so the loop doesn't silently depend on the host's global `claude`
+settings or `~/.codex/config.toml` — with one deliberate exception: the
+codex reasoning effort is pinned only when the loop knows the model's
+ceiling (gpt-5.6-sol/-terra, or an explicit `--codex-effort`); for other
+models no level is forced, so the host codex config / model default applies.
 
 **Claude Implementer** — `claude -p` turns default to model **`fable`**
 (Claude Fable 5; the alias resolves to the latest model in the claude CLI)
@@ -162,16 +165,18 @@ unattended. Dial with:
   leaves the host's codex config untouched.
 - `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
-  model is gpt-5.6-sol/-terra, `xhigh` for any other `--codex-model` (older
-  gpt-5.x models reject `ultra`/`max` — the request 400s). An explicit level
-  is passed verbatim.
+  model is gpt-5.6-sol/-terra (the only models that support it); for any
+  other `--codex-model` no level is forced (same as `off`) — the host codex
+  config / the model's own default applies, since effort ceilings vary per
+  model (older gpt-5.x reject `ultra`/`max`, some models top out below
+  `xhigh`). An explicit level is passed verbatim.
 - `--codex-tier TIER` — passed as `-c service_tier=TIER`. Default `fast`;
   `off` leaves the host's codex config untouched.
 
 ```bash
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # implementer: reasoning only, no orchestration
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: dial reasoning down
-~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5  # older reviewer model (effort auto-drops to xhigh)
+~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5  # older reviewer model (no effort forced — host/model default)
 ~/ai-pr-loop/run.sh 42 --repo owner/repo \
   --claude-model off --claude-effort off \
   --codex-model off --codex-effort off --codex-tier off   # both: CLI/config defaults
@@ -300,6 +305,19 @@ Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex
 verdict, per-iter session captures) are kept under
 `state/<owner>__<name>/pr-<N>/iter-NN/` so you can replay any decision
 after the fact.
+
+## Testing
+
+`tests/run_tests.sh` runs the loop's regression tests — no network, no real
+`claude`/`codex`/`gh`: the turn scripts execute against PATH stubs that
+record their argv, and assertions check the recorded vectors (model /
+effort / tier mapping, `off` omission, the adaptive Codex effort default,
+explicit-level precedence, fresh-vs-resumed session flags) plus `run.sh`'s
+flag validation.
+
+```bash
+~/ai-pr-loop/tests/run_tests.sh
+```
 
 ## Notes
 

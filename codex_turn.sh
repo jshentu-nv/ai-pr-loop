@@ -81,9 +81,10 @@ fi
 # the orchestrator's --codex-model / --codex-effort / --codex-tier (defaults:
 # gpt-5.6-sol at ultra reasoning on the "fast" tier — 1.5x speed). Mapped to
 # `-m` / `-c model_reasoning_effort=...` / `-c service_tier=...` overrides,
-# which the CLI accepts on both fresh `exec` and `exec resume`, so we pass
-# them on every turn rather than relying on the host's global config.toml.
-# "off" leaves the CLI/config default untouched.
+# which the CLI accepts on both fresh `exec` and `exec resume`. Each knob is
+# passed on every turn unless it resolves to "off" (explicitly, or via the
+# adaptive effort default below for models without a known ceiling), which
+# omits the override and leaves the host CLI/config default untouched.
 CODEX_MODEL_ARG=()
 CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
 case "$CODEX_MODEL_RESOLVED" in
@@ -92,8 +93,12 @@ case "$CODEX_MODEL_RESOLVED" in
 esac
 (( ${#CODEX_MODEL_ARG[@]} > 0 )) && log "codex: model = ${CODEX_MODEL_RESOLVED}"
 
+# Adaptive effort default: an unset/empty CODEX_EFFORT resolves per-model
+# (ultra for gpt-5.6-sol/-terra, otherwise 'off' — ceilings vary per model,
+# so no level is forced on models we don't know). Explicit values pass
+# verbatim. See resolve_codex_effort in lib/common.sh.
 CODEX_EFFORT_ARG=()
-CODEX_EFFORT_RESOLVED="${CODEX_EFFORT:-ultra}"
+CODEX_EFFORT_RESOLVED=$(resolve_codex_effort "$CODEX_MODEL_RESOLVED" "${CODEX_EFFORT:-}")
 case "$CODEX_EFFORT_RESOLVED" in
   low|medium|high|xhigh|max|ultra) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
   off)                             CODEX_EFFORT_ARG=() ;;

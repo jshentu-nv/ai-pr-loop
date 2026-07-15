@@ -144,6 +144,28 @@ latest_ai_comment_iter() {
     | sort -n | tail -1
 }
 
+# --- Codex effort resolution ----------------------------------------------------
+#
+# Resolve the reviewer's reasoning effort. $1 = codex model ('off'/'' = host
+# default), $2 = explicit effort ('' = not supplied). An explicit effort always
+# wins verbatim. Otherwise the default adapts to the model: ultra for
+# gpt-5.6-sol/-terra (the only models that support it), and 'off' (no level
+# forced — the host codex config / model default applies) for everything else:
+# effort ceilings vary per model (older gpt-5.x reject ultra/max, some catalog
+# models top out below xhigh), so forcing a level on an arbitrary model risks
+# 400ing every request.
+resolve_codex_effort() {
+  local model="$1" explicit="$2"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return
+  fi
+  case "$model" in
+    gpt-5.6-sol|gpt-5.6-terra) printf 'ultra\n' ;;
+    *)                         printf 'off\n' ;;
+  esac
+}
+
 # --- State dirs ---------------------------------------------------------------
 
 ensure_state_dir() {

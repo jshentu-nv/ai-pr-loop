@@ -100,10 +100,10 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
   applied as `-c model_reasoning_effort=LEVEL`. The default adapts to the
   model: **`ultra`** when the codex model is gpt-5.6-sol/-terra (the
-  default), **`xhigh`** for any other `--codex-model` (older gpt-5.x models
-  reject `ultra`/`max`). Levels: `low`, `medium`, `high`, `xhigh`, `max`,
-  `ultra`, or `off` (leave the host's codex config untouched). Dial down if
-  the user flags cost/latency.
+  default); for any other `--codex-model` no level is forced — the host
+  codex config / model default applies (ceilings vary per model). Levels:
+  `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, or `off` (leave the
+  host's codex config untouched). Dial down if the user flags cost/latency.
 - `--codex-tier TIER` — service (speed) tier for the Codex reviewer, applied
   as `-c service_tier=TIER`. **Default `fast`** (1.5x speed, increased
   usage); `off` leaves the host's codex config untouched.
