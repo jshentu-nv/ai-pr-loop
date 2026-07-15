@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One Claude implementer iteration. Same env contract as codex_turn.sh, with
-# CLAUDE_MODEL / CLAUDE_EFFORT in place of the CODEX_* knobs.
+# CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_PERMS in place of the CODEX_* knobs.
 # Exits 0 on success (turn marker found), 1 on error.
 set -euo pipefail
 
@@ -100,42 +100,63 @@ case "$CLAUDE_MODEL_RESOLVED" in
 esac
 (( ${#CLAUDE_MODEL_ARG[@]} > 0 )) && log "claude: model = ${CLAUDE_MODEL_RESOLVED}"
 
-# Permission safety net. --dangerously-skip-permissions is silently downgraded
-# to the default permission mode on some hosts (managed no-bypass policies, and
-# nested launches from inside another Claude Code session — the skill path). In
-# default mode a -p session auto-denies every out-of-dir read and Bash call, so
-# the turn dies unable to even read the review. Grant what the turn needs via
-# the sanctioned settings mechanism instead: auto-accept edits in the working
-# dirs, allow Bash/WebFetch/WebSearch, and mount $STATE_DIR (review files) as a
-# second working dir below. Where bypass is honored these are no-ops.
-CLAUDE_PERMISSIONS='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}'
+# Permission handling for the implementer, set by the orchestrator's
+# --claude-perms (default: auto).
+#   auto   — --permission-mode auto: every action is gated by the Claude Code
+#            auto-mode classifier, which approves task-aligned actions
+#            headlessly and works on hosts where bypass is policy-disabled.
+#   bypass — --dangerously-skip-permissions, plus a settings safety net for
+#            hosts that silently downgrade bypass (managed no-bypass policies,
+#            nested launches from inside another Claude Code session — the
+#            skill path): auto-accepted edits + allowed Bash/WebFetch/
+#            WebSearch. Where bypass is honored the net is a no-op.
+#   off    — leave the host's CLI/settings default untouched.
+# In every mode $STATE_DIR is mounted as a second working dir below so the
+# turn can always read the codex review files.
+CLAUDE_PERMS_RESOLVED="${CLAUDE_PERMS:-auto}"
+CLAUDE_PERMS_ARG=()
+CLAUDE_PERMISSIONS=''
+case "$CLAUDE_PERMS_RESOLVED" in
+  auto)   CLAUDE_PERMS_ARG=(--permission-mode auto) ;;
+  bypass) CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
+          CLAUDE_PERMISSIONS='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}' ;;
+  off|'') ;;
+  *)      log "claude: unknown CLAUDE_PERMS='${CLAUDE_PERMS_RESOLVED}' — using CLI default" ;;
+esac
+(( ${#CLAUDE_PERMS_ARG[@]} > 0 )) && log "claude: permission mode = ${CLAUDE_PERMS_RESOLVED}"
 
 # Reasoning effort for the implementer, set by the orchestrator's --claude-effort
 # (default: ultracode). "ultracode" sends xhigh reasoning + dynamic-workflow
-# orchestration via --settings (the documented headless mechanism; degrades to
-# plain xhigh if orchestration doesn't apply in -p mode). A bare level uses
-# --effort. "off" leaves the CLI/settings effort default untouched. The single
-# --settings payload always carries the permission safety net above.
+# orchestration via a --settings payload (the documented headless mechanism;
+# degrades to plain xhigh if orchestration doesn't apply in -p mode). A bare
+# level uses --effort. "off" leaves the CLI/settings effort default untouched.
+# The bypass-mode permission safety net rides in the same --settings payload.
 CLAUDE_EFFORT_ARG=()
-CLAUDE_SETTINGS="{${CLAUDE_PERMISSIONS}}"
+SETTINGS_PARTS=()
 case "${CLAUDE_EFFORT:-ultracode}" in
-  ultracode)                 CLAUDE_SETTINGS="{\"ultracode\": true, ${CLAUDE_PERMISSIONS}}" ;;
+  ultracode)                 SETTINGS_PARTS+=('"ultracode": true') ;;
   low|medium|high|xhigh|max) CLAUDE_EFFORT_ARG=(--effort "${CLAUDE_EFFORT}") ;;
   off|'')                    ;;
   *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT}' — using CLI default" ;;
 esac
 log "claude: effort = ${CLAUDE_EFFORT:-ultracode}"
+[[ -n "$CLAUDE_PERMISSIONS" ]] && SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS")
+CLAUDE_SETTINGS_ARG=()
+if (( ${#SETTINGS_PARTS[@]} > 0 )); then
+  _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+  CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+fi
 
-# claude -p runs non-interactively; --dangerously-skip-permissions is required
-# for unattended operation (user authorized this).
+# claude -p runs non-interactively; permission handling for unattended
+# operation (user authorized this) is selected above via --claude-perms.
 set +e
 ( cd "$REPO_DIR" && \
   claude -p \
     "${CLAUDE_SESSION_ARG[@]}" \
     "${CLAUDE_MODEL_ARG[@]}" \
     "${CLAUDE_EFFORT_ARG[@]}" \
-    --settings "$CLAUDE_SETTINGS" \
-    --dangerously-skip-permissions \
+    "${CLAUDE_PERMS_ARG[@]}" \
+    "${CLAUDE_SETTINGS_ARG[@]}" \
     --add-dir "$REPO_DIR" \
     --add-dir "$STATE_DIR" \
     --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \

@@ -18,6 +18,7 @@
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
 #                      [--claude-model MODEL] [--claude-effort LEVEL]
+#                      [--claude-perms MODE]
 #                      [--codex-model MODEL] [--codex-effort LEVEL]
 #                      [--codex-tier TIER] [--print-config]
 #
@@ -61,6 +62,16 @@
 #                 orchestration, via --settings). Other values map to
 #                 `claude --effort LEVEL`: low | medium | high | xhigh | max.
 #                 Use `off` to leave the CLI/settings default untouched.
+#   --claude-perms MODE
+#                 Permission handling for the Claude implementer's `claude -p`
+#                 turns. auto (default): --permission-mode auto — every action
+#                 is gated by the Claude Code auto-mode classifier, which
+#                 approves task-aligned actions headlessly and works on hosts
+#                 where bypass is policy-disabled. bypass:
+#                 --dangerously-skip-permissions plus a settings safety net
+#                 (auto-accepted edits + allowed Bash/WebFetch/WebSearch) for
+#                 hosts that silently downgrade bypass. off: leave the host's
+#                 CLI/settings default untouched.
 #   --codex-model MODEL
 #                 Model for the Codex reviewer's `codex exec` turns, passed as
 #                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
@@ -120,6 +131,7 @@ CONTEXT_FILES=()
 CLEAR_CONTEXT=0
 CLAUDE_MODEL="fable"
 CLAUDE_EFFORT="ultracode"
+CLAUDE_PERMS="auto"
 CODEX_MODEL="gpt-5.6-sol"
 CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, off (host/model default) otherwise
 CODEX_TIER="fast"
@@ -138,12 +150,13 @@ while [[ $# -gt 0 ]]; do
     --clear-context) CLEAR_CONTEXT=1; shift ;;
     --claude-model)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-model needs a model";  CLAUDE_MODEL="$2";  shift 2 ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
+    --claude-perms)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-perms needs a mode";   CLAUDE_PERMS="$2";  shift 2 ;;
     --codex-model)   [[ $# -ge 2 && "$2" != -* ]] || die "--codex-model needs a model";   CODEX_MODEL="$2";   shift 2 ;;
     --codex-effort)  [[ $# -ge 2 && -n "$2" ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     -h|--help)
-      sed -n '2,95p' "$0"; exit 0 ;;
+      sed -n '2,106p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -172,6 +185,11 @@ case "$CLAUDE_EFFORT" in
   ultracode|low|medium|high|xhigh|max|off) ;;
   *) die "--claude-effort must be one of: ultracode low medium high xhigh max off (got: $CLAUDE_EFFORT)" ;;
 esac
+# Implementer permission handling: classifier-gated auto mode by default.
+case "$CLAUDE_PERMS" in
+  auto|bypass|off) ;;
+  *) die "--claude-perms must be one of: auto bypass off (got: $CLAUDE_PERMS)" ;;
+esac
 # Codex reasoning effort: ceilings vary per model (ultra only exists for
 # gpt-5.6-sol/-terra; older gpt-5.x reject ultra/max, some catalog models top
 # out below xhigh), so when --codex-effort is not given the default adapts:
@@ -193,7 +211,7 @@ esac
 # --print-config: report the resolved knobs and exit before any GitHub access.
 # Lets tests (and humans) observe adaptive-default resolution directly.
 if (( PRINT_CONFIG == 1 )); then
-  printf 'claude: model=%s effort=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT"
+  printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
 fi
@@ -219,7 +237,7 @@ if [[ -z "$REPO_DIR" ]]; then
 fi
 
 export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
-       CLAUDE_MODEL CLAUDE_EFFORT CODEX_MODEL CODEX_EFFORT CODEX_TIER
+       CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
 ensure_repo_clone
@@ -307,7 +325,7 @@ log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT"
+log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
 log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"

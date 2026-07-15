@@ -6,7 +6,8 @@
 # Covers:
 #   - resolve_codex_effort: adaptive default, explicit precedence, off
 #   - claude_turn.sh argv: --model, ultracode --settings payload, --effort
-#     levels, off omission, permission safety net, --session-id vs --resume
+#     levels, off omission, --claude-perms modes (auto / bypass safety net /
+#     off), --session-id vs --resume
 #   - codex_turn.sh argv: -m / model_reasoning_effort / service_tier mapping,
 #     off omission, adaptive effort for non-sol models, fresh vs `exec resume`,
 #     session-id capture from the rollout file
@@ -148,15 +149,16 @@ assert_eq "$(resolve_codex_effort gpt-5.6-sol off)" off
 
 # --- claude_turn.sh ------------------------------------------------------
 
-t "claude: defaults (fable + ultracode)"
+t "claude: defaults (fable + ultracode + auto perms)"
 new_case claude-default
 run_turn claude
 assert_rc0
 assert_pair "$ARGV" --model fable
 assert_value_has "$ARGV" --settings '"ultracode": true'
-assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
 assert_no_line "$ARGV" --effort
-assert_line "$ARGV" --dangerously-skip-permissions
+assert_pair "$ARGV" --permission-mode auto
+assert_no_line "$ARGV" --dangerously-skip-permissions
+assert_value_lacks "$ARGV" --settings acceptEdits
 assert_pair "$ARGV" --add-dir "$CASE_DIR/repo"
 assert_pair "$ARGV" --add-dir "$CASE_DIR/state"
 
@@ -164,13 +166,12 @@ t "claude: fresh session pins --session-id"
 assert_pair "$ARGV" --session-id "$(cat "$CASE_DIR/state/claude.session.uuid")"
 assert_no_line "$ARGV" --resume
 
-t "claude: bare effort level uses --effort, keeps permission settings, drops ultracode"
+t "claude: bare effort level uses --effort and drops the settings payload"
 new_case claude-xhigh
 run_turn claude CLAUDE_EFFORT=xhigh
 assert_rc0
 assert_pair "$ARGV" --effort xhigh
-assert_value_lacks "$ARGV" --settings ultracode
-assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+assert_no_line "$ARGV" --settings
 
 t "claude: model/effort off omits --model and --effort"
 new_case claude-off
@@ -178,8 +179,24 @@ run_turn claude CLAUDE_MODEL=off CLAUDE_EFFORT=off
 assert_rc0
 assert_no_line "$ARGV" --model
 assert_no_line "$ARGV" --effort
-assert_value_lacks "$ARGV" --settings ultracode
+assert_no_line "$ARGV" --settings
+assert_pair "$ARGV" --permission-mode auto
+
+t "claude: bypass perms use skip-permissions plus the settings safety net"
+new_case claude-bypass
+run_turn claude CLAUDE_PERMS=bypass
+assert_rc0
+assert_line "$ARGV" --dangerously-skip-permissions
+assert_no_line "$ARGV" --permission-mode
+assert_value_has "$ARGV" --settings '"ultracode": true'
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+
+t "claude: perms off leaves permission handling untouched"
+new_case claude-perms-off
+run_turn claude CLAUDE_PERMS=off
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+assert_no_line "$ARGV" --dangerously-skip-permissions
 
 t "claude: seeded session resumes with --resume"
 new_case claude-resume
@@ -265,6 +282,10 @@ t "run.sh: empty --codex-model is rejected"
 run_run_sh 1 --repo o/n --codex-model ''
 assert_dies_with "--codex-model needs a model"
 
+t "run.sh: unknown --claude-perms is rejected"
+run_run_sh 1 --repo o/n --claude-perms bogus
+assert_dies_with "--claude-perms must be one of"
+
 t "run.sh: non-sol model with explicit ultra passes validation"
 run_run_sh 1 --repo o/n --codex-model gpt-oss-120b --codex-effort ultra
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
@@ -273,7 +294,7 @@ assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 # these have teeth against run.sh regressing to a forced level.
 t "run.sh: default knobs resolve to sol @ ultra on fast"
 run_run_sh --repo o/n --print-config
-assert_prints 'claude: model=fable effort=ultracode'
+assert_prints 'claude: model=fable effort=ultracode perms=auto'
 assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast'
 
 t "run.sh: non-sol model resolves to adaptive off (no forced level)"
