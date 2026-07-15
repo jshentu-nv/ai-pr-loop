@@ -208,15 +208,28 @@ snapshot_codex_sessions() {
     | sort > "$out"
 }
 
-# Diff the current session-file list against the snapshot, take the newest new
-# file, and extract its session UUID from the first JSONL line (session_meta).
+# Diff the current session-file list against the snapshot and extract the new
+# ROOT session's UUID from its first JSONL line (session_meta). A gpt-5.6
+# review can spawn sub-agent threads mid-run, each with its own rollout file
+# whose session_meta carries a source.subagent marker; `codex exec resume`
+# rejects those ("direct app-server input is not allowed for multi-agent v2
+# sub-agents"), so skip them and take the earliest non-subagent file — the
+# root session is created at run start, sub-agents later.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
   local before="$1"
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  local newest
-  newest=$(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
-            | sort | comm -23 - "$before" | tail -1)
-  [[ -n "$newest" ]] || return 1
-  head -1 "$newest" | jq -er '.payload.id // empty' 2>/dev/null
+  local f id
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    head -1 "$f" \
+      | jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
+        >/dev/null 2>&1 || continue
+    id=$(head -1 "$f" | jq -er '.payload.id // empty' 2>/dev/null) || continue
+    [[ -n "$id" ]] || continue
+    printf '%s\n' "$id"
+    return 0
+  done < <(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
+            | sort | comm -23 - "$before")
+  return 1
 }

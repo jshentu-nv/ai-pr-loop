@@ -147,6 +147,40 @@ assert_eq "$(resolve_codex_effort gpt-oss-120b xhigh)" xhigh
 t "resolve: explicit off stays off"
 assert_eq "$(resolve_codex_effort gpt-5.6-sol off)" off
 
+# --- discover_new_codex_session_id ----------------------------------------
+# A gpt-5.6 review can spawn sub-agent threads, each writing its own (newer)
+# rollout file; `codex exec resume` rejects sub-agent ids, so discovery must
+# return the ROOT session even when a sub-agent file is newest.
+
+DISC="$WORK/discover"
+mkdir -p "$DISC/sessions/d"
+: > "$DISC/before-empty"
+printf '{"payload":{"id":"root-uuid","source":"exec"}}\n' \
+  > "$DISC/sessions/d/rollout-2026-01-01T00-00-01-root.jsonl"
+printf '{"payload":{"id":"sub-uuid","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-uuid","depth":1}}}}}\n' \
+  > "$DISC/sessions/d/rollout-2026-01-01T00-00-02-sub.jsonl"
+
+t "discover: picks the root session over a newer sub-agent rollout"
+assert_eq "$(CODEX_HOME="$DISC" discover_new_codex_session_id "$DISC/before-empty")" root-uuid
+
+t "discover: fails when only sub-agent rollouts are new"
+CODEX_HOME="$DISC" snapshot_codex_sessions "$DISC/before-full"
+printf '{"payload":{"id":"sub2-uuid","source":{"subagent":{"thread_spawn":{"parent_thread_id":"root-uuid","depth":1}}}}}\n' \
+  > "$DISC/sessions/d/rollout-2026-01-01T00-00-03-sub2.jsonl"
+if CODEX_HOME="$DISC" discover_new_codex_session_id "$DISC/before-full" >/dev/null 2>&1; then
+  bad "unexpectedly discovered an id from sub-agent-only rollouts"
+else
+  ok
+fi
+
+t "discover: treats rollouts without a source field as root (older codex)"
+DISC2="$WORK/discover2"
+mkdir -p "$DISC2/sessions"
+: > "$DISC2/before-empty"
+printf '{"payload":{"id":"legacy-uuid"}}\n' \
+  > "$DISC2/sessions/rollout-2026-01-01T00-00-01-legacy.jsonl"
+assert_eq "$(CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty")" legacy-uuid
+
 # --- claude_turn.sh ------------------------------------------------------
 
 t "claude: defaults (fable + ultracode + auto perms)"
