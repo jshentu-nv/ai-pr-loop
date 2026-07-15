@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # One Codex review iteration. Reads env: REPO_OWNER, REPO_NAME, PR_NUMBER,
-# REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR.
+# REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR,
+# REVIEW_ONLY, HAS_CONTEXT, CONTEXT_FILE, CODEX_MODEL, CODEX_EFFORT,
+# CODEX_TIER.
 # Exits 0 if APPROVED, 2 if CHANGES_REQUESTED, 1 on error / no verdict found.
 set -euo pipefail
 
@@ -75,31 +77,51 @@ else
   snapshot_codex_sessions "$SNAPSHOT_BEFORE"
 fi
 
-# Reasoning effort for the reviewer, set by the orchestrator's --codex-effort
-# (default: xhigh, the highest level for the gpt-5.x family — codex has no
-# "ultracode"/orchestration mode). Mapped to a `-c model_reasoning_effort=...`
-# override, which the CLI accepts on both fresh `exec` and `exec resume`, so we
-# pass it on every turn rather than relying on the host's global config.toml.
+# Model, reasoning effort, and service (speed) tier for the reviewer, set by
+# the orchestrator's --codex-model / --codex-effort / --codex-tier (defaults:
+# gpt-5.6-sol at ultra reasoning on the "fast" tier — 1.5x speed). Mapped to
+# `-m` / `-c model_reasoning_effort=...` / `-c service_tier=...` overrides,
+# which the CLI accepts on both fresh `exec` and `exec resume`, so we pass
+# them on every turn rather than relying on the host's global config.toml.
 # "off" leaves the CLI/config default untouched.
+CODEX_MODEL_ARG=()
+CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
+case "$CODEX_MODEL_RESOLVED" in
+  off|'') CODEX_MODEL_ARG=() ;;
+  *)      CODEX_MODEL_ARG=(-m "$CODEX_MODEL_RESOLVED") ;;
+esac
+(( ${#CODEX_MODEL_ARG[@]} > 0 )) && log "codex: model = ${CODEX_MODEL_RESOLVED}"
+
 CODEX_EFFORT_ARG=()
-CODEX_EFFORT_RESOLVED="${CODEX_EFFORT:-xhigh}"
+CODEX_EFFORT_RESOLVED="${CODEX_EFFORT:-ultra}"
 case "$CODEX_EFFORT_RESOLVED" in
-  low|medium|high|xhigh) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
-  off)                   CODEX_EFFORT_ARG=() ;;
-  *)                     log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
+  low|medium|high|xhigh|max|ultra) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
+  off)                             CODEX_EFFORT_ARG=() ;;
+  *)                               log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
 esac
 (( ${#CODEX_EFFORT_ARG[@]} > 0 )) && log "codex: reasoning effort = ${CODEX_EFFORT_RESOLVED}"
 
-# Codex must be able to run gh + git, hence bypass-approvals-and-sandbox.
-# (User explicitly requested unattended operation; mutations to GitHub are
-# expected.) `codex exec resume` doesn't accept --cd or --color, so cd via
-# subshell and use NO_COLOR=1 for both fresh and resume paths.
+CODEX_TIER_ARG=()
+CODEX_TIER_RESOLVED="${CODEX_TIER:-fast}"
+case "$CODEX_TIER_RESOLVED" in
+  off|'') CODEX_TIER_ARG=() ;;
+  *)      CODEX_TIER_ARG=(-c "service_tier=\"${CODEX_TIER_RESOLVED}\"") ;;
+esac
+(( ${#CODEX_TIER_ARG[@]} > 0 )) && log "codex: service tier = ${CODEX_TIER_RESOLVED}"
+
+# Codex must be able to run gh + git, hence --yolo (autorun: the alias for
+# --dangerously-bypass-approvals-and-sandbox). (User explicitly requested
+# unattended operation; mutations to GitHub are expected.) `codex exec resume`
+# doesn't accept --cd or --color, so cd via subshell and use NO_COLOR=1 for
+# both fresh and resume paths.
 set +e
 ( cd "$REPO_DIR" && NO_COLOR=1 codex exec \
     "${CODEX_SUBCMD[@]}" \
+    "${CODEX_MODEL_ARG[@]}" \
     "${CODEX_EFFORT_ARG[@]}" \
+    "${CODEX_TIER_ARG[@]}" \
     --skip-git-repo-check \
-    --dangerously-bypass-approvals-and-sandbox \
+    --yolo \
     - \
     < "$PROMPT_FILE" \
     > "$ID/codex.stdout" 2> "$ID/codex.stderr" )

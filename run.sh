@@ -17,7 +17,9 @@
 #                      [--max N] [--converge N] [--review-only]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
-#                      [--claude-effort LEVEL] [--codex-effort LEVEL]
+#                      [--claude-model MODEL] [--claude-effort LEVEL]
+#                      [--codex-model MODEL] [--codex-effort LEVEL]
+#                      [--codex-tier TIER]
 #
 # Arguments:
 #   --repo        OWNER/NAME of the GitHub repo (required).
@@ -48,18 +50,35 @@
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
 #                 replace the prior context instead).
+#   --claude-model MODEL
+#                 Model for the Claude implementer's `claude -p` turns, passed
+#                 as `--model MODEL`. Default: fable (Claude Fable 5; alias
+#                 resolved by the claude CLI). Use `off` to leave the CLI/
+#                 settings default untouched.
 #   --claude-effort LEVEL
 #                 Reasoning effort for the Claude implementer's `claude -p`
 #                 turns. Default: ultracode (xhigh reasoning + dynamic-workflow
 #                 orchestration, via --settings). Other values map to
 #                 `claude --effort LEVEL`: low | medium | high | xhigh | max.
 #                 Use `off` to leave the CLI/settings default untouched.
+#   --codex-model MODEL
+#                 Model for the Codex reviewer's `codex exec` turns, passed as
+#                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
+#                 leave the host's codex config untouched.
 #   --codex-effort LEVEL
 #                 Reasoning effort for the Codex reviewer's `codex exec` turns,
 #                 applied as `-c model_reasoning_effort=LEVEL` on every turn:
-#                 low | medium | high | xhigh. Default: xhigh (the highest level
-#                 for the gpt-5.x family — codex has no ultracode/max). Use
-#                 `off` to leave the host's codex config untouched.
+#                 low | medium | high | xhigh | max | ultra. Default: ultra
+#                 when the codex model is gpt-5.6-sol/-terra (the only models
+#                 that support it), xhigh for any other --codex-model (older
+#                 gpt-5.x models reject ultra/max). An explicit level is
+#                 passed verbatim. Use `off` to leave the host's codex
+#                 config untouched.
+#   --codex-tier TIER
+#                 Service (speed) tier for the Codex reviewer, applied as
+#                 `-c service_tier=TIER` on every turn. Default: fast (the
+#                 "Fast" tier: 1.5x speed, increased usage). Use `off` to
+#                 leave the host's codex config untouched.
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -92,8 +111,11 @@ CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
 CLEAR_CONTEXT=0
+CLAUDE_MODEL="fable"
 CLAUDE_EFFORT="ultracode"
-CODEX_EFFORT="xhigh"
+CODEX_MODEL="gpt-5.6-sol"
+CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, xhigh otherwise
+CODEX_TIER="fast"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -107,10 +129,13 @@ while [[ $# -gt 0 ]]; do
     --context)       [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
     --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
     --clear-context) CLEAR_CONTEXT=1; shift ;;
+    --claude-model)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-model needs a model";  CLAUDE_MODEL="$2";  shift 2 ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
+    --codex-model)   [[ $# -ge 2 && "$2" != -* ]] || die "--codex-model needs a model";   CODEX_MODEL="$2";   shift 2 ;;
     --codex-effort)  [[ $# -ge 2 ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
+    --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     -h|--help)
-      sed -n '2,70p' "$0"; exit 0 ;;
+      sed -n '2,89p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -139,11 +164,26 @@ case "$CLAUDE_EFFORT" in
   ultracode|low|medium|high|xhigh|max|off) ;;
   *) die "--claude-effort must be one of: ultracode low medium high xhigh max off (got: $CLAUDE_EFFORT)" ;;
 esac
-# Codex reasoning effort: gpt-5.x tops out at xhigh (no ultracode/max for codex).
+# Codex reasoning effort: ultra is the ceiling for gpt-5.6-sol/-terra, but
+# older gpt-5.x models reject it (codex maps ultra->max at the API layer and
+# the request 400s), so the *default* adapts to the model. An explicit
+# --codex-effort always wins verbatim.
+if [[ -z "$CODEX_EFFORT" ]]; then
+  case "$CODEX_MODEL" in
+    gpt-5.6-sol|gpt-5.6-terra) CODEX_EFFORT="ultra" ;;
+    *)                         CODEX_EFFORT="xhigh" ;;
+  esac
+fi
 case "$CODEX_EFFORT" in
-  low|medium|high|xhigh|off) ;;
-  *) die "--codex-effort must be one of: low medium high xhigh off (got: $CODEX_EFFORT)" ;;
+  low|medium|high|xhigh|max|ultra|off) ;;
+  *) die "--codex-effort must be one of: low medium high xhigh max ultra off (got: $CODEX_EFFORT)" ;;
 esac
+# Models and the codex service tier are free-form (validated by the CLIs /
+# the codex model catalog); only guard against empty values. `off` = leave
+# the host's CLI/config default untouched.
+[[ -n "$CLAUDE_MODEL" ]] || die "--claude-model needs a model (or 'off')"
+[[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
+[[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
 
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -165,7 +205,8 @@ if [[ -z "$REPO_DIR" ]]; then
   REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY CLAUDE_EFFORT CODEX_EFFORT
+export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
+       CLAUDE_MODEL CLAUDE_EFFORT CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
 ensure_repo_clone
@@ -253,8 +294,8 @@ log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude effort: $CLAUDE_EFFORT"
-log "  codex effort:  $CODEX_EFFORT"
+log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT"
+log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

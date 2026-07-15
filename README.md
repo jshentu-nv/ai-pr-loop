@@ -130,29 +130,51 @@ flag again to **replace** the stored context, or `--clear-context` to drop
 it. (`--clear-context` is ignored when new `--context*` flags are also
 given — those win.)
 
-## Reasoning effort
+## Models & reasoning effort
 
-Both agents run at high reasoning effort by default; you can dial each one.
+Both agents run on a pinned model at high reasoning effort by default; you
+can dial each one. All of these are passed explicitly on every turn (fresh
+and resumed), so the loop doesn't silently depend on the host's global
+`claude` settings or `~/.codex/config.toml`.
 
-**Claude Implementer** — `claude -p` turns default to **`ultracode`**: `xhigh`
-reasoning plus dynamic-workflow orchestration (passed via
-`--settings '{"ultracode": true}'`, the documented headless mechanism; it
-degrades to plain `xhigh` where orchestration doesn't apply in `-p` mode).
-Dial with `--claude-effort LEVEL` — one of `ultracode` (default), `low`,
-`medium`, `high`, `xhigh`, `max`, or `off`.
+**Claude Implementer** — `claude -p` turns default to model **`fable`**
+(Claude Fable 5; the alias resolves to the latest model in the claude CLI)
+at effort **`ultracode`**: `xhigh` reasoning plus dynamic-workflow
+orchestration (passed via `--settings '{"ultracode": true}'`, the documented
+headless mechanism; it degrades to plain `xhigh` where orchestration doesn't
+apply in `-p` mode). Dial with:
 
-**Codex Reviewer** — `codex exec` turns default to **`xhigh`**, the highest
-reasoning level for the gpt-5.x family (Codex has no `ultracode`/`max`). It's
-applied as `-c model_reasoning_effort=xhigh` on every turn (fresh and
-`resume`), so the loop doesn't silently depend on the host's global
-`~/.codex/config.toml`. Dial with `--codex-effort LEVEL` — one of `low`,
-`medium`, `high`, `xhigh` (default), or `off` (leave the host's codex config
-untouched).
+- `--claude-model MODEL` — passed as `--model`. Default `fable`; `off`
+  leaves the CLI/settings default untouched.
+- `--claude-effort LEVEL` — one of `ultracode` (default), `low`, `medium`,
+  `high`, `xhigh`, `max`, or `off`.
+
+**Codex Reviewer** — `codex exec` turns default to model **`gpt-5.6-sol`**
+at reasoning effort **`ultra`** (the ceiling for gpt-5.6-sol/-terra; older
+gpt-5.x models top out at `xhigh`) on the **`fast`** service tier (the
+"Fast" speed tier: 1.5x speed, increased usage), applied as
+`-m gpt-5.6-sol -c model_reasoning_effort=ultra -c service_tier=fast` on
+every turn. Turns run with `--yolo` (autorun — the alias for
+`--dangerously-bypass-approvals-and-sandbox`) so gh/git mutations proceed
+unattended. Dial with:
+
+- `--codex-model MODEL` — passed as `-m`. Default `gpt-5.6-sol`; `off`
+  leaves the host's codex config untouched.
+- `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
+  `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
+  model is gpt-5.6-sol/-terra, `xhigh` for any other `--codex-model` (older
+  gpt-5.x models reject `ultra`/`max` — the request 400s). An explicit level
+  is passed verbatim.
+- `--codex-tier TIER` — passed as `-c service_tier=TIER`. Default `fast`;
+  `off` leaves the host's codex config untouched.
 
 ```bash
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # implementer: reasoning only, no orchestration
-~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: a notch down from xhigh
-~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort off --codex-effort off  # both: CLI/config defaults
+~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: dial reasoning down
+~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5  # older reviewer model (effort auto-drops to xhigh)
+~/ai-pr-loop/run.sh 42 --repo owner/repo \
+  --claude-model off --claude-effort off \
+  --codex-model off --codex-effort off --codex-tier off   # both: CLI/config defaults
 ```
 
 The heavier levels are more thorough but cost more tokens and wall time per
@@ -268,8 +290,10 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
   --context "Must stay backward-compatible with the v1 API." \
   --context-file ./docs/spec.md
 
-# Dial reasoning effort (implementer default ultracode, reviewer default xhigh):
+# Dial models / reasoning effort (defaults: implementer fable @ ultracode,
+# reviewer gpt-5.6-sol @ ultra on the fast tier):
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh --codex-effort high
+~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5 --codex-tier off
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex

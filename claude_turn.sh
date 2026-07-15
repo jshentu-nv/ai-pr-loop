@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One Claude implementer iteration. Same env contract as codex_turn.sh.
+# One Claude implementer iteration. Same env contract as codex_turn.sh, with
+# CLAUDE_MODEL / CLAUDE_EFFORT in place of the CODEX_* knobs.
 # Exits 0 on success (turn marker found), 1 on error.
 set -euo pipefail
 
@@ -88,6 +89,17 @@ else
   log "claude: starting new session $CLAUDE_SESSION_UUID"
 fi
 
+# Model for the implementer, set by the orchestrator's --claude-model
+# (default: fable — Claude Fable 5; the alias resolves to the latest model in
+# the claude CLI). "off" leaves the CLI/settings default untouched.
+CLAUDE_MODEL_ARG=()
+CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-fable}"
+case "$CLAUDE_MODEL_RESOLVED" in
+  off|'') CLAUDE_MODEL_ARG=() ;;
+  *)      CLAUDE_MODEL_ARG=(--model "$CLAUDE_MODEL_RESOLVED") ;;
+esac
+(( ${#CLAUDE_MODEL_ARG[@]} > 0 )) && log "claude: model = ${CLAUDE_MODEL_RESOLVED}"
+
 # Reasoning effort for the implementer, set by the orchestrator's --claude-effort
 # (default: ultracode). "ultracode" sends xhigh reasoning + dynamic-workflow
 # orchestration via --settings (the documented headless mechanism; degrades to
@@ -108,6 +120,7 @@ set +e
 ( cd "$REPO_DIR" && \
   claude -p \
     "${CLAUDE_SESSION_ARG[@]}" \
+    "${CLAUDE_MODEL_ARG[@]}" \
     "${CLAUDE_EFFORT_ARG[@]}" \
     --dangerously-skip-permissions \
     --add-dir "$REPO_DIR" \
