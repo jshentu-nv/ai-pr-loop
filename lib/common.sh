@@ -216,9 +216,11 @@ snapshot_codex_sessions() {
 # sub-agents"), so skip them and take the earliest non-subagent file — the
 # root session is created at run start, sub-agents later.
 # $2 (optional) binds the search to one invocation: concurrent loops all see
-# each other's new rollouts in the host-global sessions dir, so a root whose
-# session_meta records a different cwd belongs to another loop's checkout and
-# is skipped. Rollouts without a cwd (older codex) still count.
+# each other's new rollouts in the host-global sessions dir, so only a root
+# whose session_meta records exactly this cwd is accepted. FAIL CLOSED: a
+# rollout without a cwd (older codex) cannot prove ownership and is skipped —
+# the loop then starts fresh each iteration rather than risk capturing a
+# concurrent loop's session.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
   local before="$1" want_cwd="${2:-}"
@@ -231,7 +233,7 @@ discover_new_codex_session_id() {
       <<<"$meta" >/dev/null 2>&1 || continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
-      [[ -z "$cwd" || "$cwd" == "$want_cwd" ]] || continue
+      [[ "$cwd" == "$want_cwd" ]] || continue
     fi
     id=$(jq -er '.payload.id // empty' <<<"$meta" 2>/dev/null) || continue
     [[ -n "$id" ]] || continue
@@ -273,10 +275,11 @@ codex_rollout_meta_for_id() {
 #                                          repairs state persisted by the old
 #                                          newest-file selector
 #   - id has no rollout / broken chain  → return 1 (caller starts fresh)
-# $2 (optional): the root must have been recorded for this cwd — a stored id
-# whose root belongs to another checkout (poisoned by a concurrent loop before
-# discovery was cwd-bound) is rejected rather than hijacking that loop's
-# conversation. Roots without a cwd (older codex) always pass. Deliberate
+# $2 (optional): the root must have been recorded for exactly this cwd — a
+# stored id whose root belongs to another checkout (poisoned by a concurrent
+# loop before discovery was cwd-bound) is rejected rather than hijacking that
+# loop's conversation. FAIL CLOSED: a root without a cwd (older codex) cannot
+# prove ownership and is rejected too; the caller starts fresh. Deliberate
 # trade-off: a session whose checkout legitimately moved (e.g. the same PR
 # re-run with a different --dir) is also rejected and restarts fresh — losing
 # cross-iteration memory is recoverable, resuming another PR's conversation is
@@ -290,7 +293,7 @@ resolve_codex_root_session_id() {
          <<<"$found" >/dev/null 2>&1; then
       if [[ -n "$want_cwd" ]]; then
         cwd=$(jq -r '.payload.cwd // empty' <<<"$found" 2>/dev/null) || cwd=''
-        [[ -z "$cwd" || "$cwd" == "$want_cwd" ]] || return 1
+        [[ "$cwd" == "$want_cwd" ]] || return 1
       fi
       printf '%s\n' "$id"
       return 0

@@ -188,7 +188,7 @@ unattended. Dial with:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: dial reasoning down
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5  # older reviewer model (no effort forced — host/model default)
 ~/ai-pr-loop/run.sh 42 --repo owner/repo \
-  --claude-model off --claude-effort off \
+  --claude-model off --claude-effort off --claude-perms off \
   --codex-model off --codex-effort off --codex-tier off   # both: CLI/config defaults
 ```
 

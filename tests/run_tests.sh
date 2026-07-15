@@ -203,8 +203,12 @@ printf '{"payload":{"id":"root-b-uuid","cwd":"/checkout-b","source":"exec"}}\n' 
 t "discover: interleaved roots — cwd binding picks this checkout's root"
 assert_eq "$(CODEX_HOME="$DISC3" discover_new_codex_session_id "$DISC3/before-empty" /checkout-b)" root-b-uuid
 
-t "discover: cwd binding tolerates rollouts without a cwd (older codex)"
-assert_eq "$(CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty" /anywhere)" legacy-uuid
+t "discover: cwd binding fails closed on rollouts without a cwd (older codex)"
+if CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty" /anywhere >/dev/null 2>&1; then
+  bad "unexpectedly captured a root that cannot prove checkout ownership"
+else
+  ok
+fi
 
 # --- resolve_codex_root_session_id -----------------------------------------
 # Stored ids from older selectors may point at a sub-agent rollout (which
@@ -237,8 +241,12 @@ else
   ok
 fi
 
-t "resolve-session: cwd binding tolerates roots without a cwd"
-assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id root-uuid /anywhere)" root-uuid
+t "resolve-session: cwd binding fails closed on roots without a cwd"
+if CODEX_HOME="$DISC" resolve_codex_root_session_id root-uuid /anywhere >/dev/null 2>&1; then
+  bad "unexpectedly validated a root that cannot prove checkout ownership"
+else
+  ok
+fi
 
 # The poisoned-state shape the resume validation exists for: a sub-agent id
 # captured by the old unbound discovery whose parent chain ends at ANOTHER
@@ -403,6 +411,16 @@ new_case codex-foreign
 printf '{"payload":{"id":"other-loop-root","source":"exec","cwd":"/other-checkout"}}\n' \
   > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-other.jsonl"
 echo "other-loop-root" > "$CASE_DIR/state/codex.session.id"
+run_turn codex
+assert_rc0
+assert_no_line "$ARGV" resume
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+t "codex: stored root without a recorded cwd is discarded (fail closed)"
+new_case codex-nocwd
+printf '{"payload":{"id":"legacy-root-uuid","source":"exec"}}\n' \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-legacy.jsonl"
+echo "legacy-root-uuid" > "$CASE_DIR/state/codex.session.id"
 run_turn codex
 assert_rc0
 assert_no_line "$ARGV" resume
