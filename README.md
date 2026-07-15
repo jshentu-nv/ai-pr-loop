@@ -148,6 +148,16 @@ apply in `-p` mode). Dial with:
   leaves the CLI/settings default untouched.
 - `--claude-effort LEVEL` — one of `ultracode` (default), `low`, `medium`,
   `high`, `xhigh`, `max`, or `off`.
+- `--claude-perms MODE` — permission handling for the headless turns. `auto`
+  (default): `--permission-mode auto`, every action gated by the Claude Code
+  auto-mode classifier — headless-safe approvals that also work on hosts
+  where bypass is policy-disabled. `bypass`: `--dangerously-skip-permissions`
+  plus a settings safety net (auto-accepted edits + allowed
+  Bash/WebFetch/WebSearch) for hosts that silently downgrade bypass (managed
+  no-bypass policies, nested launches from inside another Claude Code
+  session). `off`: leave the host default untouched. In every mode the
+  per-PR state dir is mounted as a second working dir so the turn can read
+  the codex review files.
 
 **Codex Reviewer** — `codex exec` turns default to model **`gpt-5.6-sol`**
 at reasoning effort **`ultra`** (the ceiling for gpt-5.6-sol/-terra; older
