@@ -80,6 +80,10 @@ done
 : > "$ARGV_FILE"
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
 printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
+# Record the background-task wait ceiling the turn script exported; without
+# it headless claude drops the final message (and the completion marker)
+# when a backgrounded build outlives the CLI's 600s default.
+printf '%s\n' "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}" > "${ARGV_FILE}.bgwait"
 # Simulate a host/account where auto permission mode is unavailable: the
 # real CLI rejects the flag at startup, before doing any work, with one of
 # its startup-eligibility diagnostics.
@@ -517,6 +521,18 @@ run_turn claude
 assert_rc0
 assert_pair "$ARGV" --resume 11111111-2222-3333-4444-555555555555
 assert_no_line "$ARGV" --session-id
+
+t "claude: turn raises the background-task wait ceiling to 60 min"
+new_case claude-bgwait-default
+run_turn claude
+assert_rc0
+assert_eq "$(cat "$ARGV.bgwait" 2>/dev/null)" 3600000
+
+t "claude: background-task wait ceiling honors the env override"
+new_case claude-bgwait-override
+run_turn claude CLAUDE_BG_WAIT_CEILING_MS=120000
+assert_rc0
+assert_eq "$(cat "$ARGV.bgwait" 2>/dev/null)" 120000
 
 # --- codex_turn.sh -------------------------------------------------------
 

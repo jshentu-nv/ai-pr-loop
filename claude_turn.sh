@@ -210,10 +210,22 @@ if (( ${#SETTINGS_PARTS[@]} > 0 )); then
   CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
 fi
 
+# The implementer sometimes launches a long build/test as a background task
+# and ends its message expecting to be re-invoked when the task completes.
+# Headless claude holds the final message while background tasks are pending,
+# but only up to CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (default 600s) — past
+# that it terminates the turn WITHOUT emitting the final message, so the
+# orchestrator sees a marker-less exit 0 and fails the iteration even though
+# work happened (observed on ovstage-internal PR 58 iter 1). Give such tasks
+# a bounded but realistic window; 0 (= wait forever) is unsafe here because
+# no outer watchdog wraps the turn. Override via env if a repo needs more.
+: "${CLAUDE_BG_WAIT_CEILING_MS:=3600000}"
+
 # claude -p runs non-interactively; permission handling for unattended
 # operation (user authorized this) is selected above via --claude-perms.
 run_claude_turn() {
   ( cd "$REPO_DIR" && \
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
     claude -p \
       "${CLAUDE_SESSION_ARG[@]}" \
       "${CLAUDE_MODEL_ARG[@]}" \
