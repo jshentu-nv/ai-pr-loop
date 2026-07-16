@@ -4,7 +4,7 @@
 # Exits 0 on success (turn marker found), 1 on error.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
 
@@ -105,6 +105,10 @@ esac
 #   auto   — --permission-mode auto: every action is gated by the Claude Code
 #            auto-mode classifier, which approves task-aligned actions
 #            headlessly and works on hosts where bypass is policy-disabled.
+#            Auto mode is not available on every account/provider (Pro and
+#            Bedrock/Vertex/Foundry are excluded; Team/Enterprise needs admin
+#            enablement); the CLI rejects it at startup there, and the turn
+#            retries once with the settings safety net (see below).
 #   bypass — --dangerously-skip-permissions, plus a settings safety net for
 #            hosts that silently downgrade bypass (managed no-bypass policies,
 #            nested launches from inside another Claude Code session — the
@@ -113,13 +117,14 @@ esac
 #   off    — leave the host's CLI/settings default untouched.
 # In every mode $STATE_DIR is mounted as a second working dir below so the
 # turn can always read the codex review files.
+CLAUDE_PERMISSIONS_NET='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}'
 CLAUDE_PERMS_RESOLVED="${CLAUDE_PERMS:-auto}"
 CLAUDE_PERMS_ARG=()
 CLAUDE_PERMISSIONS=''
 case "$CLAUDE_PERMS_RESOLVED" in
   auto)   CLAUDE_PERMS_ARG=(--permission-mode auto) ;;
   bypass) CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
-          CLAUDE_PERMISSIONS='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}' ;;
+          CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET" ;;
   off|'') ;;
   *)      log "claude: unknown CLAUDE_PERMS='${CLAUDE_PERMS_RESOLVED}' — using CLI default" ;;
 esac
@@ -149,21 +154,47 @@ fi
 
 # claude -p runs non-interactively; permission handling for unattended
 # operation (user authorized this) is selected above via --claude-perms.
+run_claude_turn() {
+  ( cd "$REPO_DIR" && \
+    claude -p \
+      "${CLAUDE_SESSION_ARG[@]}" \
+      "${CLAUDE_MODEL_ARG[@]}" \
+      "${CLAUDE_EFFORT_ARG[@]}" \
+      "${CLAUDE_PERMS_ARG[@]}" \
+      "${CLAUDE_SETTINGS_ARG[@]}" \
+      --add-dir "$REPO_DIR" \
+      --add-dir "$STATE_DIR" \
+      --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
+      "$(cat "$PROMPT_FILE")" \
+      > "$ID/claude.stdout" 2> "$ID/claude.stderr" )
+}
+
 set +e
-( cd "$REPO_DIR" && \
-  claude -p \
-    "${CLAUDE_SESSION_ARG[@]}" \
-    "${CLAUDE_MODEL_ARG[@]}" \
-    "${CLAUDE_EFFORT_ARG[@]}" \
-    "${CLAUDE_PERMS_ARG[@]}" \
-    "${CLAUDE_SETTINGS_ARG[@]}" \
-    --add-dir "$REPO_DIR" \
-    --add-dir "$STATE_DIR" \
-    --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
-    "$(cat "$PROMPT_FILE")" \
-    > "$ID/claude.stdout" 2> "$ID/claude.stderr" )
+run_claude_turn
 RC=$?
 set -e
+
+# Auto mode is not available on every account/provider; the CLI refuses the
+# flag at startup there — before any turn work runs — so a retry cannot
+# duplicate side effects. Fall back once to the broadly available settings
+# safety net rather than failing every iteration on such hosts. The guard
+# enforces the startup-only contract: non-zero exit, EMPTY stdout (a turn
+# that produced any output may have done real work — never rerun it), and a
+# stderr complaint that names the permission/auto mode.
+if [[ $RC -ne 0 && "$CLAUDE_PERMS_RESOLVED" == "auto" ]] \
+   && [[ ! -s "$ID/claude.stdout" ]] \
+   && grep -qiE 'permission[- ]?mode|auto[- ]?mode' "$ID/claude.stderr"; then
+  log "claude: permission mode 'auto' unavailable on this host — retrying with the settings safety net"
+  mv "$ID/claude.stderr" "$ID/claude.stderr.auto-rejected"
+  CLAUDE_PERMS_ARG=()
+  SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
+  _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+  CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+  set +e
+  run_claude_turn
+  RC=$?
+  set -e
+fi
 
 log "claude: iter $ITER — exit $RC"
 

@@ -154,7 +154,11 @@ apply in `-p` mode). Dial with:
 - `--claude-perms MODE` — permission handling for the headless turns. `auto`
   (default): `--permission-mode auto`, every action gated by the Claude Code
   auto-mode classifier — headless-safe approvals that also work on hosts
-  where bypass is policy-disabled. `bypass`: `--dangerously-skip-permissions`
+  where bypass is policy-disabled. Auto mode isn't available on every
+  account/provider (Pro and Bedrock/Vertex/Foundry are excluded;
+  Team/Enterprise needs admin enablement); when the CLI rejects it at
+  startup, the turn automatically retries once with the same settings
+  safety net `bypass` uses. `bypass`: `--dangerously-skip-permissions`
   plus a settings safety net (auto-accepted edits + allowed
   Bash/WebFetch/WebSearch) for hosts that silently downgrade bypass (managed
   no-bypass policies, nested launches from inside another Claude Code

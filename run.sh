@@ -67,11 +67,14 @@
 #                 turns. auto (default): --permission-mode auto — every action
 #                 is gated by the Claude Code auto-mode classifier, which
 #                 approves task-aligned actions headlessly and works on hosts
-#                 where bypass is policy-disabled. bypass:
-#                 --dangerously-skip-permissions plus a settings safety net
-#                 (auto-accepted edits + allowed Bash/WebFetch/WebSearch) for
-#                 hosts that silently downgrade bypass. off: leave the host's
-#                 CLI/settings default untouched.
+#                 where bypass is policy-disabled. Auto mode is not available
+#                 on every account/provider; if the CLI rejects it at startup
+#                 the turn automatically retries once with the settings
+#                 safety net. bypass: --dangerously-skip-permissions plus a
+#                 settings safety net (auto-accepted edits + allowed
+#                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
+#                 bypass. off: leave the host's CLI/settings default
+#                 untouched.
 #   --codex-model MODEL
 #                 Model for the Codex reviewer's `codex exec` turns, passed as
 #                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
@@ -107,7 +110,7 @@
 
 set -euo pipefail
 
-LOOP_HOME="$(cd "$(dirname "$0")" && pwd)"
+LOOP_HOME="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$LOOP_HOME/lib/common.sh"
 
@@ -156,7 +159,7 @@ while [[ $# -gt 0 ]]; do
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     -h|--help)
-      sed -n '2,106p' "$0"; exit 0 ;;
+      sed -n '2,109p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;

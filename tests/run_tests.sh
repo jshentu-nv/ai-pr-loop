@@ -18,6 +18,10 @@
 #
 # Usage: tests/run_tests.sh
 set -uo pipefail
+# A user-exported CDPATH makes a successful relative `cd` print its
+# destination, corrupting cd-based fixture paths; the scripts under test
+# guard their own substitutions, the runner clears it once here.
+unset CDPATH
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -59,6 +63,23 @@ cat > "$STUBS/claude" <<'EOF'
 #!/usr/bin/env bash
 : > "$ARGV_FILE"
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+# Simulate a host/account where auto permission mode is unavailable: the
+# real CLI rejects the flag at startup before doing any work.
+if [[ "${STUB_REJECT_AUTO:-0}" == "1" ]]; then
+  for a in "$@"; do
+    if [[ "$a" == "--permission-mode" ]]; then
+      echo "Error: --permission-mode auto is not available on this account" >&2
+      exit 1
+    fi
+  done
+fi
+# Simulate a turn that did real work, then died with stderr that happens to
+# mention the permission mode — the fallback must NOT rerun such a turn.
+if [[ "${STUB_FAIL_MIDRUN:-0}" == "1" ]]; then
+  echo "partial turn output, no completion marker"
+  echo "Error: crashed mid-run; see --permission-mode docs" >&2
+  exit 1
+fi
 echo "[CLAUDE_TURN: COMPLETE]"
 EOF
 
@@ -316,6 +337,33 @@ assert_rc0
 assert_no_line "$ARGV" --permission-mode
 assert_no_line "$ARGV" --dangerously-skip-permissions
 
+t "claude: rejected auto mode falls back to the settings safety net"
+new_case claude-auto-fallback
+run_turn claude STUB_REJECT_AUTO=1
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+assert_no_line "$ARGV" --dangerously-skip-permissions
+assert_value_has "$ARGV" --settings '"ultracode": true'
+assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+
+t "claude: rejected auto attempt's stderr is preserved for audit"
+if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
+  ok
+else
+  bad "missing claude.stderr.auto-rejected from the rejected first attempt"
+fi
+
+t "claude: a mid-run failure never triggers the auto fallback rerun"
+new_case claude-midrun-fail
+run_turn claude STUB_FAIL_MIDRUN=1
+assert_eq "$TURN_RC" 1
+assert_pair "$ARGV" --permission-mode auto
+if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
+  bad "fallback fired on a turn that had already produced output"
+else
+  ok
+fi
+
 t "claude: seeded session resumes with --resume"
 new_case claude-resume
 echo "11111111-2222-3333-4444-555555555555" > "$CASE_DIR/state/claude.session.uuid"
@@ -425,6 +473,31 @@ run_turn codex
 assert_rc0
 assert_no_line "$ARGV" resume
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+t "codex: session persistence survives inherited CDPATH with a relative --dir"
+new_case codex-cdpath
+printf '{"payload":{"id":"cafe-cdpath-sess","source":"exec","cwd":"%s"}}\n' \
+    "$(cd "$CASE_DIR/repo" && pwd -P)" \
+  > "$CASE_DIR/codex-home/sessions/rollout-2026-01-01T00-00-01-seed.jsonl"
+echo "cafe-cdpath-sess" > "$CASE_DIR/state/codex.session.id"
+# Bespoke invocation: relative REPO_DIR resolved from $CASE_DIR, with a
+# hostile CDPATH that makes every successful relative `cd` echo its
+# destination — canonicalization must still produce a single clean path.
+( cd "$CASE_DIR" && env -i \
+    PATH="$STUBS:/usr/bin:/bin" \
+    HOME="$CASE_DIR" \
+    ARGV_FILE="$CASE_DIR/argv" \
+    CODEX_HOME="$CASE_DIR/codex-home" \
+    CDPATH=".:$WORK" \
+    REPO_OWNER=o REPO_NAME=r PR_NUMBER=1 \
+    REPO_DIR=repo STATE_DIR="$CASE_DIR/state" \
+    BASE_REF=main HEAD_REF=feature/x ITER=1 MAX_ITER=6 \
+    GH_USER=testuser REVIEW_ONLY=0 HAS_CONTEXT=0 \
+    bash "$ROOT/codex_turn.sh" > "$CASE_DIR/turn.log" 2>&1 )
+TURN_RC=$?
+assert_rc0
+assert_pair "$ARGV" resume cafe-cdpath-sess
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafe-cdpath-sess
 
 # --- run.sh flag validation ----------------------------------------------
 

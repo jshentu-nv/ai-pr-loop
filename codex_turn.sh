@@ -6,7 +6,7 @@
 # Exits 0 if APPROVED, 2 if CHANGES_REQUESTED, 1 on error / no verdict found.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
 
@@ -65,7 +65,9 @@ log "codex: iter $ITER — running"
 # whole review, on top of the public PR thread it re-reads from disk each turn.
 # Discovery and stored-id validation are bound to this checkout's canonical
 # path so concurrent loops on other checkouts can't cross-capture sessions.
-REPO_DIR_CANON=$(cd "$REPO_DIR" && pwd -P)
+# CDPATH= guards the substitution: an inherited CDPATH makes a successful
+# relative `cd` print the destination, which would corrupt the captured path.
+REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P)
 CODEX_SESSION_FILE="$STATE_DIR/codex.session.id"
 CAPTURE_NEW_SESSION=0
 CODEX_SUBCMD=()

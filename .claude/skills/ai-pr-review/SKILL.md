@@ -96,10 +96,12 @@ Optional flags worth surfacing if the user mentions a constraint:
   default).
 - `--claude-perms MODE` — permission handling for the implementer's headless
   turns. **Default `auto`** (`--permission-mode auto`: actions gated by the
-  Claude Code auto-mode classifier; works where bypass is policy-disabled).
-  `bypass` = `--dangerously-skip-permissions` + a settings safety net for
-  hosts that silently downgrade bypass; `off` = host default. Only set it if
-  the user explicitly asks for unsandboxed/bypass operation.
+  Claude Code auto-mode classifier; works where bypass is policy-disabled;
+  where auto mode itself is unavailable the turn auto-retries once with the
+  settings safety net). `bypass` = `--dangerously-skip-permissions` + the
+  settings safety net for hosts that silently downgrade bypass; `off` = host
+  default. Only set it if the user explicitly asks for unsandboxed/bypass
+  operation.
 - `--codex-model MODEL` — model for the Codex reviewer's turns, passed as
   `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
   different reviewer model; `off` leaves the host's codex config untouched.
