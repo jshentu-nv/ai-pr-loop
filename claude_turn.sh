@@ -170,20 +170,32 @@ run_claude_turn() {
 }
 
 set +e
+TURN_START=$SECONDS
 run_claude_turn
 RC=$?
+TURN_ELAPSED=$(( SECONDS - TURN_START ))
 set -e
 
 # Auto mode is not available on every account/provider; the CLI refuses the
 # flag at startup there — before any turn work runs — so a retry cannot
 # duplicate side effects. Fall back once to the broadly available settings
-# safety net rather than failing every iteration on such hosts. The guard
-# enforces the startup-only contract: non-zero exit, EMPTY stdout (a turn
-# that produced any output may have done real work — never rerun it), and a
-# stderr complaint that names the permission/auto mode.
+# safety net rather than failing every iteration on such hosts. Retry ONLY
+# on proven startup ineligibility, never on a turn that may have done work:
+#   - stderr must carry one of the CLI's startup-eligibility diagnostics
+#     ("auto mode disabled by settings" / "is unavailable for your plan" /
+#     "requires CLAUDE_CODE_ENABLE_AUTO_MODE" / "unavailable for this model",
+#     extracted from the claude 2.1.211 bundle), and must NOT be the
+#     documented runtime classifier abort ("auto mode cannot determine the
+#     safety ..."), which can fire after tool side effects;
+#   - stdout must be empty (text mode prints only the final response, so
+#     this alone cannot prove no work — hence the checks above);
+#   - the attempt must have died almost immediately: a turn that reached
+#     the model and executed tools cannot finish this fast.
 if [[ $RC -ne 0 && "$CLAUDE_PERMS_RESOLVED" == "auto" ]] \
+   && (( TURN_ELAPSED < 15 )) \
    && [[ ! -s "$ID/claude.stdout" ]] \
-   && grep -qiE 'permission[- ]?mode|auto[- ]?mode' "$ID/claude.stderr"; then
+   && ! grep -qi 'cannot determine the safety' "$ID/claude.stderr" \
+   && grep -qiE 'auto[ -]mode (is )?(disabled by settings|unavailable for (your plan|this model)|requires CLAUDE_CODE_ENABLE_AUTO_MODE)' "$ID/claude.stderr"; then
   log "claude: permission mode 'auto' unavailable on this host — retrying with the settings safety net"
   mv "$ID/claude.stderr" "$ID/claude.stderr.auto-rejected"
   CLAUDE_PERMS_ARG=()

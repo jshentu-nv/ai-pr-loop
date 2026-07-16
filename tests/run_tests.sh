@@ -63,21 +63,32 @@ cat > "$STUBS/claude" <<'EOF'
 #!/usr/bin/env bash
 : > "$ARGV_FILE"
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
 # Simulate a host/account where auto permission mode is unavailable: the
-# real CLI rejects the flag at startup before doing any work.
+# real CLI rejects the flag at startup, before doing any work, with one of
+# its startup-eligibility diagnostics.
 if [[ "${STUB_REJECT_AUTO:-0}" == "1" ]]; then
   for a in "$@"; do
     if [[ "$a" == "--permission-mode" ]]; then
-      echo "Error: --permission-mode auto is not available on this account" >&2
+      echo "Error: auto mode is unavailable for your plan" >&2
       exit 1
     fi
   done
 fi
-# Simulate a turn that did real work, then died with stderr that happens to
-# mention the permission mode — the fallback must NOT rerun such a turn.
+# Simulate a turn that did real work, produced output, then died with stderr
+# matching a startup-eligibility diagnostic — only the empty-stdout guard
+# stands between this and a duplicate rerun.
 if [[ "${STUB_FAIL_MIDRUN:-0}" == "1" ]]; then
   echo "partial turn output, no completion marker"
-  echo "Error: crashed mid-run; see --permission-mode docs" >&2
+  echo "Error: auto mode is unavailable for your plan" >&2
+  exit 1
+fi
+# Simulate the documented runtime classifier abort: side effects happened,
+# stdout is EMPTY (text mode only prints the final response), and stderr
+# mentions auto mode — the fallback must never rerun this turn.
+if [[ "${STUB_RUNTIME_AUTO_ABORT:-0}" == "1" ]]; then
+  touch "${ARGV_FILE}.side-effect"
+  echo "Error: repeated permission blocks, so auto mode cannot determine the safety of this action" >&2
   exit 1
 fi
 echo "[CLAUDE_TURN: COMPLETE]"
@@ -345,6 +356,7 @@ assert_no_line "$ARGV" --permission-mode
 assert_no_line "$ARGV" --dangerously-skip-permissions
 assert_value_has "$ARGV" --settings '"ultracode": true'
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 2
 
 t "claude: rejected auto attempt's stderr is preserved for audit"
 if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
@@ -353,13 +365,26 @@ else
   bad "missing claude.stderr.auto-rejected from the rejected first attempt"
 fi
 
-t "claude: a mid-run failure never triggers the auto fallback rerun"
+t "claude: a mid-run failure with output never triggers the auto fallback"
 new_case claude-midrun-fail
 run_turn claude STUB_FAIL_MIDRUN=1
 assert_eq "$TURN_RC" 1
 assert_pair "$ARGV" --permission-mode auto
+assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 1
 if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
   bad "fallback fired on a turn that had already produced output"
+else
+  ok
+fi
+
+t "claude: runtime auto abort after side effects never triggers the fallback"
+new_case claude-runtime-abort
+run_turn claude STUB_RUNTIME_AUTO_ABORT=1
+assert_eq "$TURN_RC" 1
+assert_pair "$ARGV" --permission-mode auto
+assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 1
+if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
+  bad "fallback fired on the documented runtime classifier abort"
 else
   ok
 fi
