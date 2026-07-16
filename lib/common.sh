@@ -144,6 +144,35 @@ latest_ai_comment_iter() {
     | sort -n | tail -1
 }
 
+# --- Portable watchdog ----------------------------------------------------------
+#
+# run_with_timeout SECS CMD [ARGS...] — run CMD under a watchdog. Prefers GNU
+# timeout, then gtimeout (macOS with brew coreutils, where the command carries
+# the g prefix unless gnubin is on PATH), and otherwise falls back to a pure
+# bash background-kill implementation, so no host needs a new dependency.
+# Returns CMD's exit status (or the kill status when the watchdog fires).
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    local pid watchdog rc=0
+    "$@" &
+    pid=$!
+    # Detach the watchdog's stdio: it must not inherit (and hold open) the
+    # caller's stdout pipe, or a fast empty-output command leaves pipeline
+    # readers blocked until the full timeout expires.
+    ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$rc"
+  fi
+}
+
 # --- Codex effort resolution ----------------------------------------------------
 #
 # Resolve the reviewer's reasoning effort. $1 = codex model ('off'/'' = host

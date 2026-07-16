@@ -132,9 +132,12 @@ CLAUDE_PERMISSIONS=''
 # — and reports the mode actually in effect, so this detects the silent
 # downgrade deterministically (verified on claude 2.1.211: an ineligible host
 # reports "default" here while exiting 0 with empty stderr). Probing with the
-# turn's own model args matters: eligibility can be per-model.
+# turn's own model args matters: eligibility can be per-model. The watchdog is
+# run_with_timeout (lib/common.sh) — portable across hosts without GNU
+# timeout, where a bare `timeout` would silently make every probe
+# inconclusive.
 probe_claude_effective_auto_mode() {
-  ( cd "$REPO_DIR" && timeout 60 claude -p \
+  ( cd "$REPO_DIR" && run_with_timeout 60 claude -p \
       "${CLAUDE_MODEL_ARG[@]}" \
       --permission-mode auto \
       --output-format stream-json --verbose \
@@ -144,18 +147,29 @@ probe_claude_effective_auto_mode() {
 
 case "$CLAUDE_PERMS_RESOLVED" in
   auto)
-    # Definitive probe results are cached per PR — eligibility is
-    # account/host/model state, not per-turn. Delete the cache file after
-    # changing auto-mode enablement to re-probe.
+    # Definitive probe results are cached per PR AND per resolved model —
+    # eligibility is account/host/model state, and --claude-model can change
+    # between invocations sharing this state dir ('off' = host default model
+    # is a key of its own). A cache line is "<mode> <model>", mode first
+    # because modes are single tokens while a model string could contain
+    # whitespace — `read` hands the remainder to the model field verbatim,
+    # so the match is exact for any model. A stored line for a different
+    # model (or the older formats) is treated as absent and re-probed.
+    # Delete the cache file after changing auto-mode enablement to re-probe.
     AUTOMODE_CACHE="$STATE_DIR/claude.automode.effective"
+    EFFECTIVE_AUTO=''
     if [[ -s "$AUTOMODE_CACHE" ]]; then
-      EFFECTIVE_AUTO=$(<"$AUTOMODE_CACHE")
-      log "claude: auto-mode probe (cached) = '$EFFECTIVE_AUTO'"
-    else
+      read -r CACHED_MODE CACHED_MODEL < "$AUTOMODE_CACHE" || true
+      if [[ "${CACHED_MODEL:-}" == "$CLAUDE_MODEL_RESOLVED" && -n "${CACHED_MODE:-}" ]]; then
+        EFFECTIVE_AUTO="$CACHED_MODE"
+        log "claude: auto-mode probe (cached for model '$CACHED_MODEL') = '$EFFECTIVE_AUTO'"
+      fi
+    fi
+    if [[ -z "$EFFECTIVE_AUTO" ]]; then
       EFFECTIVE_AUTO=$(probe_claude_effective_auto_mode || true)
       if [[ -n "$EFFECTIVE_AUTO" ]]; then
-        printf '%s\n' "$EFFECTIVE_AUTO" > "$AUTOMODE_CACHE"
-        log "claude: auto-mode probe = '$EFFECTIVE_AUTO'"
+        printf '%s %s\n' "$EFFECTIVE_AUTO" "$CLAUDE_MODEL_RESOLVED" > "$AUTOMODE_CACHE"
+        log "claude: auto-mode probe (model '$CLAUDE_MODEL_RESOLVED') = '$EFFECTIVE_AUTO'"
       else
         log "claude: auto-mode probe inconclusive — proceeding with auto (startup-rejection retry still applies)"
       fi

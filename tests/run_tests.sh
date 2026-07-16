@@ -203,6 +203,57 @@ assert_eq "$(resolve_codex_effort gpt-oss-120b xhigh)" xhigh
 t "resolve: explicit off stays off"
 assert_eq "$(resolve_codex_effort gpt-5.6-sol off)" off
 
+# --- run_with_timeout -------------------------------------------------------
+# The probe watchdog must be portable: GNU timeout, gtimeout (brew coreutils
+# on macOS), or the pure-bash fallback when neither exists (stock macOS).
+
+t "watchdog: passes through a zero exit status"
+if run_with_timeout 5 true; then ok; else bad "true under watchdog returned nonzero"; fi
+
+t "watchdog: passes through a failure exit status"
+if run_with_timeout 5 false; then bad "false under watchdog returned zero"; else ok; fi
+
+t "watchdog: kills a hung command"
+WD_START=$SECONDS
+if run_with_timeout 1 sleep 30 2>/dev/null; then bad "hung command not killed"; else ok; fi
+t "watchdog: hung-command kill is prompt"
+if (( SECONDS - WD_START < 10 )); then ok; else bad "kill took $((SECONDS - WD_START))s"; fi
+
+FBIN="$WORK/fallback-bin"
+mkdir -p "$FBIN"
+ln -s "$(command -v sleep)" "$FBIN/sleep"
+ln -s "$(command -v head)" "$FBIN/head"
+BASH_BIN="$(command -v bash)"
+
+t "watchdog: fallback without timeout/gtimeout passes through exit status"
+if env -i PATH="$FBIN" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; run_with_timeout 5 sleep 0"; then
+  ok
+else
+  bad "fallback returned nonzero for a fast command"
+fi
+
+t "watchdog: fallback without timeout/gtimeout kills a hung command"
+WD_START=$SECONDS
+if env -i PATH="$FBIN" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; run_with_timeout 1 sleep 30" 2>/dev/null; then
+  bad "fallback did not kill the hung command"
+else
+  ok
+fi
+t "watchdog: fallback kill is prompt"
+if (( SECONDS - WD_START < 10 )); then ok; else bad "fallback kill took $((SECONDS - WD_START))s"; fi
+
+t "watchdog: fallback does not hold the stdout pipe open after the command exits"
+# The 1s command guarantees the watchdog subshell has forked its sleep before
+# being killed, so without stdio detachment the orphan would deterministically
+# hold the pipe and block the reader for the remaining ~7s.
+WD_START=$SECONDS
+env -i PATH="$FBIN" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; run_with_timeout 8 sleep 1 | head -1" >/dev/null 2>&1
+if (( SECONDS - WD_START < 5 )); then
+  ok
+else
+  bad "pipeline reader blocked $((SECONDS - WD_START))s on the watchdog's inherited pipe fd"
+fi
+
 # --- discover_new_codex_session_id ----------------------------------------
 # A gpt-5.6 review can spawn sub-agent threads, each writing its own (newer)
 # rollout file; `codex exec resume` rejects sub-agent ids, so discovery must
@@ -373,8 +424,8 @@ assert_no_line "$ARGV" --dangerously-skip-permissions
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
 assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 1
 
-t "claude: downgrade probe result is cached per PR"
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" default
+t "claude: downgrade probe result is cached per PR and model"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "default fable"
 run_turn claude STUB_EFFECTIVE_PERMS=auto
 assert_rc0
 assert_no_line "$ARGV" --permission-mode
@@ -384,7 +435,32 @@ new_case claude-auto-eligible
 run_turn claude STUB_EFFECTIVE_PERMS=auto
 assert_rc0
 assert_pair "$ARGV" --permission-mode auto
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" auto
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "auto fable"
+
+t "claude: changing the model re-probes instead of reusing cached eligibility"
+new_case claude-cache-model
+run_turn claude CLAUDE_MODEL=model-a STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+run_turn claude CLAUDE_MODEL=model-b STUB_EFFECTIVE_PERMS=default
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "default model-b"
+
+t "claude: switching back to an eligible model restores classifier gating"
+run_turn claude CLAUDE_MODEL=model-a STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+
+t "claude: a whitespace model's cache line cannot false-hit a prefix model"
+new_case claude-cache-space
+run_turn claude 'CLAUDE_MODEL=fable extra' STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+run_turn claude CLAUDE_MODEL=fable STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "auto fable"
 
 t "claude: rejected auto mode falls back to the settings safety net"
 new_case claude-auto-fallback
