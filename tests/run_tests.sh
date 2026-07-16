@@ -528,6 +528,9 @@ run_turn claude
 assert_rc0
 assert_eq "$(cat "$ARGV.bgwait" 2>/dev/null)" 3600000
 
+t "claude: yield-style tools are disallowed in one-shot turns"
+assert_pair "$ARGV" --disallowedTools "ScheduleWakeup,Monitor,CronCreate"
+
 t "claude: background-task wait ceiling honors the env override"
 new_case claude-bgwait-override
 run_turn claude CLAUDE_BG_WAIT_CEILING_MS=120000

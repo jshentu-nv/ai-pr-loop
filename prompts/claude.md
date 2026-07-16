@@ -183,3 +183,8 @@ line, fields `tag`, `iter`, `surface`, `id`, `path`, `line`,
   message until background tasks drain and gives up after a ceiling — the
   orchestrator then sees no completion marker and fails the whole turn,
   even if your commits landed.
+- **You are a one-shot headless process — never yield the turn expecting
+  to be re-invoked later.** Scheduled wakeups, monitors, and cron jobs
+  never fire: the process exits the moment your turn ends, the completion
+  marker never prints, and the orchestrator fails the iteration. Finish
+  everything — including waiting on long test runs — within this turn.

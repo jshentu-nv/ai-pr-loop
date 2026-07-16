@@ -221,12 +221,23 @@ fi
 # no outer watchdog wraps the turn. Override via env if a repo needs more.
 : "${CLAUDE_BG_WAIT_CEILING_MS:=3600000}"
 
+# A -p turn is a one-shot process: when the model ends its turn the CLI
+# exits (it waits only for pending background tasks, bounded above). Tools
+# that yield the turn expecting a later re-invocation — scheduled wakeups,
+# monitors, cron jobs — therefore end the run with NO final message and no
+# completion marker: observed on ovstage-internal PR 58 iter 9, where the
+# implementer backgrounded a stress run and called ScheduleWakeup as a
+# "fallback heartbeat", killing the turn 6s later with empty stdout. Ban
+# them outright; the prompt also says to drain work in-turn.
+CLAUDE_DISALLOWED_TOOLS="ScheduleWakeup,Monitor,CronCreate"
+
 # claude -p runs non-interactively; permission handling for unattended
 # operation (user authorized this) is selected above via --claude-perms.
 run_claude_turn() {
   ( cd "$REPO_DIR" && \
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
     claude -p \
+      --disallowedTools "$CLAUDE_DISALLOWED_TOOLS" \
       "${CLAUDE_SESSION_ARG[@]}" \
       "${CLAUDE_MODEL_ARG[@]}" \
       "${CLAUDE_EFFORT_ARG[@]}" \
