@@ -68,9 +68,12 @@
 #                 is gated by the Claude Code auto-mode classifier, which
 #                 approves task-aligned actions headlessly and works on hosts
 #                 where bypass is policy-disabled. Auto mode is not available
-#                 on every account/provider; if the CLI rejects it at startup
-#                 the turn automatically retries once with the settings
-#                 safety net. bypass: --dangerously-skip-permissions plus a
+#                 on every account/provider, and ineligible hosts silently
+#                 downgrade it; a deterministic preflight probe reads the
+#                 CLI-reported effective mode (cached per PR) and uses the
+#                 settings safety net when auto does not stick. A CLI that
+#                 hard-rejects the flag at startup instead triggers a single
+#                 retry with the same net. bypass: --dangerously-skip-permissions plus a
 #                 settings safety net (auto-accepted edits + allowed
 #                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
 #                 bypass. off: leave the host's CLI/settings default
@@ -159,7 +162,7 @@ while [[ $# -gt 0 ]]; do
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     -h|--help)
-      sed -n '2,109p' "$0"; exit 0 ;;
+      sed -n '2,112p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;

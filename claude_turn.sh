@@ -107,8 +107,12 @@ esac
 #            headlessly and works on hosts where bypass is policy-disabled.
 #            Auto mode is not available on every account/provider (Pro and
 #            Bedrock/Vertex/Foundry are excluded; Team/Enterprise needs admin
-#            enablement); the CLI rejects it at startup there, and the turn
-#            retries once with the settings safety net (see below).
+#            enablement). Ineligible hosts SILENTLY DOWNGRADE to default mode
+#            (rc 0, empty stderr, every headless action denied), so a
+#            deterministic preflight probe reads the CLI-reported effective
+#            mode first and switches to the settings safety net when auto
+#            does not stick (cached per PR). A CLI that instead hard-rejects
+#            the flag at startup is handled by a one-shot retry (see below).
 #   bypass — --dangerously-skip-permissions, plus a settings safety net for
 #            hosts that silently downgrade bypass (managed no-bypass policies,
 #            nested launches from inside another Claude Code session — the
@@ -121,8 +125,48 @@ CLAUDE_PERMISSIONS_NET='"permissions": {"defaultMode": "acceptEdits", "allow": [
 CLAUDE_PERMS_RESOLVED="${CLAUDE_PERMS:-auto}"
 CLAUDE_PERMS_ARG=()
 CLAUDE_PERMISSIONS=''
+
+# Print the effective permission mode the CLI grants for --permission-mode
+# auto, or nothing when the probe is inconclusive. The stream-json init event
+# is emitted by the CLI itself at startup — before any model or tool activity
+# — and reports the mode actually in effect, so this detects the silent
+# downgrade deterministically (verified on claude 2.1.211: an ineligible host
+# reports "default" here while exiting 0 with empty stderr). Probing with the
+# turn's own model args matters: eligibility can be per-model.
+probe_claude_effective_auto_mode() {
+  ( cd "$REPO_DIR" && timeout 60 claude -p \
+      "${CLAUDE_MODEL_ARG[@]}" \
+      --permission-mode auto \
+      --output-format stream-json --verbose \
+      'Reply with exactly: OK' 2>/dev/null \
+    | head -1 | jq -r '.permissionMode // empty' 2>/dev/null )
+}
+
 case "$CLAUDE_PERMS_RESOLVED" in
-  auto)   CLAUDE_PERMS_ARG=(--permission-mode auto) ;;
+  auto)
+    # Definitive probe results are cached per PR — eligibility is
+    # account/host/model state, not per-turn. Delete the cache file after
+    # changing auto-mode enablement to re-probe.
+    AUTOMODE_CACHE="$STATE_DIR/claude.automode.effective"
+    if [[ -s "$AUTOMODE_CACHE" ]]; then
+      EFFECTIVE_AUTO=$(<"$AUTOMODE_CACHE")
+      log "claude: auto-mode probe (cached) = '$EFFECTIVE_AUTO'"
+    else
+      EFFECTIVE_AUTO=$(probe_claude_effective_auto_mode || true)
+      if [[ -n "$EFFECTIVE_AUTO" ]]; then
+        printf '%s\n' "$EFFECTIVE_AUTO" > "$AUTOMODE_CACHE"
+        log "claude: auto-mode probe = '$EFFECTIVE_AUTO'"
+      else
+        log "claude: auto-mode probe inconclusive — proceeding with auto (startup-rejection retry still applies)"
+      fi
+    fi
+    if [[ -z "$EFFECTIVE_AUTO" || "$EFFECTIVE_AUTO" == "auto" ]]; then
+      CLAUDE_PERMS_ARG=(--permission-mode auto)
+    else
+      log "claude: auto mode silently downgraded to '$EFFECTIVE_AUTO' on this host — using the settings safety net"
+      CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET"
+    fi
+    ;;
   bypass) CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
           CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET" ;;
   off|'') ;;
@@ -192,6 +236,7 @@ set -e
 #   - the attempt must have died almost immediately: a turn that reached
 #     the model and executed tools cannot finish this fast.
 if [[ $RC -ne 0 && "$CLAUDE_PERMS_RESOLVED" == "auto" ]] \
+   && (( ${#CLAUDE_PERMS_ARG[@]} > 0 )) \
    && (( TURN_ELAPSED < 15 )) \
    && [[ ! -s "$ID/claude.stdout" ]] \
    && ! grep -qi 'cannot determine the safety' "$ID/claude.stderr" \

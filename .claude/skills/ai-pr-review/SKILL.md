@@ -97,7 +97,8 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--claude-perms MODE` — permission handling for the implementer's headless
   turns. **Default `auto`** (`--permission-mode auto`: actions gated by the
   Claude Code auto-mode classifier; works where bypass is policy-disabled;
-  where auto mode itself is unavailable the turn auto-retries once with the
+  where auto mode itself is unavailable — silently downgraded or rejected —
+  a deterministic preflight probe / one-shot retry switches the turn to the
   settings safety net). `bypass` = `--dangerously-skip-permissions` + the
   settings safety net for hosts that silently downgrade bypass; `off` = host
   default. Only set it if the user explicitly asks for unsandboxed/bypass

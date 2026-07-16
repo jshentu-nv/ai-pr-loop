@@ -61,6 +61,22 @@ mkdir -p "$STUBS"
 
 cat > "$STUBS/claude" <<'EOF'
 #!/usr/bin/env bash
+# Auto-mode preflight probes (stream-json) get a CLI-style init line
+# reporting the effective permission mode; they are not turn attempts, so
+# they are neither argv-recorded nor counted. A hard-reject host rejects
+# the probe as well (it passes --permission-mode auto), so it yields no
+# init line — the inconclusive path in claude_turn.sh.
+for a in "$@"; do
+  if [[ "$a" == "stream-json" ]]; then
+    if [[ "${STUB_REJECT_AUTO:-0}" == "1" ]]; then
+      echo "Error: auto mode is unavailable for your plan" >&2
+      exit 1
+    fi
+    printf '{"type":"system","subtype":"init","permissionMode":"%s"}\n' \
+      "${STUB_EFFECTIVE_PERMS:-auto}"
+    exit 0
+  fi
+done
 : > "$ARGV_FILE"
 for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
 printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
@@ -348,6 +364,28 @@ assert_rc0
 assert_no_line "$ARGV" --permission-mode
 assert_no_line "$ARGV" --dangerously-skip-permissions
 
+t "claude: silently downgraded auto mode selects the settings safety net upfront"
+new_case claude-auto-downgraded
+run_turn claude STUB_EFFECTIVE_PERMS=default
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+assert_no_line "$ARGV" --dangerously-skip-permissions
+assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 1
+
+t "claude: downgrade probe result is cached per PR"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" default
+run_turn claude STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+
+t "claude: eligible auto mode keeps classifier gating after the probe"
+new_case claude-auto-eligible
+run_turn claude STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" auto
+
 t "claude: rejected auto mode falls back to the settings safety net"
 new_case claude-auto-fallback
 run_turn claude STUB_REJECT_AUTO=1
@@ -357,6 +395,13 @@ assert_no_line "$ARGV" --dangerously-skip-permissions
 assert_value_has "$ARGV" --settings '"ultracode": true'
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
 assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 2
+
+t "claude: inconclusive probe stays optimistic and caches nothing"
+if [[ -f "$CASE_DIR/state/claude.automode.effective" ]]; then
+  bad "cache written from an inconclusive (rejected) probe"
+else
+  ok
+fi
 
 t "claude: rejected auto attempt's stderr is preserved for audit"
 if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then

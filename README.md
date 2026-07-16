@@ -156,9 +156,14 @@ apply in `-p` mode). Dial with:
   auto-mode classifier — headless-safe approvals that also work on hosts
   where bypass is policy-disabled. Auto mode isn't available on every
   account/provider (Pro and Bedrock/Vertex/Foundry are excluded;
-  Team/Enterprise needs admin enablement); when the CLI rejects it at
-  startup, the turn automatically retries once with the same settings
-  safety net `bypass` uses. `bypass`: `--dangerously-skip-permissions`
+  Team/Enterprise needs admin enablement), and ineligible hosts silently
+  downgrade it to default mode — so each PR's first turn runs a
+  deterministic preflight probe that reads the CLI-reported effective mode
+  (cached in the PR's state dir; delete `claude.automode.effective` to
+  re-probe after changing enablement) and switches to the same settings
+  safety net `bypass` uses when auto doesn't stick. A CLI that hard-rejects
+  the flag at startup instead triggers a single retry with that net.
+  `bypass`: `--dangerously-skip-permissions`
   plus a settings safety net (auto-accepted edits + allowed
   Bash/WebFetch/WebSearch) for hosts that silently downgrade bypass (managed
   no-bypass policies, nested launches from inside another Claude Code
