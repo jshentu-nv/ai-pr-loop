@@ -144,6 +144,57 @@ latest_ai_comment_iter() {
     | sort -n | tail -1
 }
 
+# --- Portable watchdog ----------------------------------------------------------
+#
+# run_with_timeout SECS CMD [ARGS...] — run CMD under a watchdog. Prefers GNU
+# timeout, then gtimeout (macOS with brew coreutils, where the command carries
+# the g prefix unless gnubin is on PATH), and otherwise falls back to a pure
+# bash background-kill implementation, so no host needs a new dependency.
+# Returns CMD's exit status (or the kill status when the watchdog fires).
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    local pid watchdog rc=0
+    "$@" &
+    pid=$!
+    # Detach the watchdog's stdio: it must not inherit (and hold open) the
+    # caller's stdout pipe, or a fast empty-output command leaves pipeline
+    # readers blocked until the full timeout expires.
+    ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" || rc=$?
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$rc"
+  fi
+}
+
+# --- Codex effort resolution ----------------------------------------------------
+#
+# Resolve the reviewer's reasoning effort. $1 = codex model ('off'/'' = host
+# default), $2 = explicit effort ('' = not supplied). An explicit effort always
+# wins verbatim. Otherwise the default adapts to the model: ultra for
+# gpt-5.6-sol/-terra (the only models that support it), and 'off' (no level
+# forced — the host codex config / model default applies) for everything else:
+# effort ceilings vary per model (older gpt-5.x reject ultra/max, some catalog
+# models top out below xhigh), so forcing a level on an arbitrary model risks
+# 400ing every request.
+resolve_codex_effort() {
+  local model="$1" explicit="$2"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return
+  fi
+  case "$model" in
+    gpt-5.6-sol|gpt-5.6-terra) printf 'ultra\n' ;;
+    *)                         printf 'off\n' ;;
+  esac
+}
+
 # --- State dirs ---------------------------------------------------------------
 
 ensure_state_dir() {
@@ -186,15 +237,100 @@ snapshot_codex_sessions() {
     | sort > "$out"
 }
 
-# Diff the current session-file list against the snapshot, take the newest new
-# file, and extract its session UUID from the first JSONL line (session_meta).
+# Diff the current session-file list against the snapshot and extract the new
+# ROOT session's UUID from its first JSONL line (session_meta). A gpt-5.6
+# review can spawn sub-agent threads mid-run, each with its own rollout file
+# whose session_meta carries a source.subagent marker; `codex exec resume`
+# rejects those ("direct app-server input is not allowed for multi-agent v2
+# sub-agents"), so skip them and take the earliest non-subagent file — the
+# root session is created at run start, sub-agents later.
+# $2 (optional) binds the search to one invocation: concurrent loops all see
+# each other's new rollouts in the host-global sessions dir, so only a root
+# whose session_meta records exactly this cwd is accepted. FAIL CLOSED: a
+# rollout without a cwd (older codex) cannot prove ownership and is skipped —
+# the loop then starts fresh each iteration rather than risk capturing a
+# concurrent loop's session.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
-  local before="$1"
+  local before="$1" want_cwd="${2:-}"
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  local newest
-  newest=$(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
-            | sort | comm -23 - "$before" | tail -1)
-  [[ -n "$newest" ]] || return 1
-  head -1 "$newest" | jq -er '.payload.id // empty' 2>/dev/null
+  local f meta id cwd
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
+      <<<"$meta" >/dev/null 2>&1 || continue
+    if [[ -n "$want_cwd" ]]; then
+      cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
+      [[ "$cwd" == "$want_cwd" ]] || continue
+    fi
+    id=$(jq -er '.payload.id // empty' <<<"$meta" 2>/dev/null) || continue
+    [[ -n "$id" ]] || continue
+    printf '%s\n' "$id"
+    return 0
+  done < <(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
+            | sort | comm -23 - "$before")
+  return 1
+}
+
+# Print the session_meta (first JSONL line) of the rollout whose payload.id
+# matches $1, or fail. Codex embeds the session uuid in the rollout filename
+# (rollout-<timestamp>-<uuid>.jsonl), so try a targeted filename lookup first;
+# only fall back to scanning first lines when that misses (hosts accumulate
+# thousands of rollouts, and a head+jq per file over all of them costs
+# minutes). The payload.id check guards both paths, so an odd filename can't
+# return the wrong session.
+codex_rollout_meta_for_id() {
+  local id="$1"
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local f meta
+  while IFS= read -r f; do
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    if [[ "$(jq -r '.payload.id // empty' <<<"$meta" 2>/dev/null)" == "$id" ]]; then
+      printf '%s\n' "$meta"
+      return 0
+    fi
+  done < <(
+    find "$codex_home/sessions" -type f -name "rollout-*-${id}.jsonl" 2>/dev/null
+    find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null
+  )
+  return 1
+}
+
+# Resolve a stored codex session id to a resumable ROOT session id:
+#   - id belongs to a root rollout      → print it unchanged
+#   - id belongs to a sub-agent rollout → follow parent_thread_id up to the
+#                                          root (bounded hops) and print that;
+#                                          repairs state persisted by the old
+#                                          newest-file selector
+#   - id has no rollout / broken chain  → return 1 (caller starts fresh)
+# $2 (optional): the root must have been recorded for exactly this cwd — a
+# stored id whose root belongs to another checkout (poisoned by a concurrent
+# loop before discovery was cwd-bound) is rejected rather than hijacking that
+# loop's conversation. FAIL CLOSED: a root without a cwd (older codex) cannot
+# prove ownership and is rejected too; the caller starts fresh. Deliberate
+# trade-off: a session whose checkout legitimately moved (e.g. the same PR
+# re-run with a different --dir) is also rejected and restarts fresh — losing
+# cross-iteration memory is recoverable, resuming another PR's conversation is
+# not, and the two cases are indistinguishable from the rollout alone.
+resolve_codex_root_session_id() {
+  local id="$1" want_cwd="${2:-}"
+  local hops found parent cwd
+  for (( hops = 0; hops < 5; hops++ )); do
+    found=$(codex_rollout_meta_for_id "$id") || return 1
+    if jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
+         <<<"$found" >/dev/null 2>&1; then
+      if [[ -n "$want_cwd" ]]; then
+        cwd=$(jq -r '.payload.cwd // empty' <<<"$found" 2>/dev/null) || cwd=''
+        [[ "$cwd" == "$want_cwd" ]] || return 1
+      fi
+      printf '%s\n' "$id"
+      return 0
+    fi
+    parent=$(jq -er '.payload.source.subagent.thread_spawn.parent_thread_id // empty' \
+               <<<"$found" 2>/dev/null) || return 1
+    [[ -n "$parent" ]] || return 1
+    id="$parent"
+  done
+  return 1
 }

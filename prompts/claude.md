@@ -176,3 +176,15 @@ line, fields `tag`, `iter`, `surface`, `id`, `path`, `line`,
 - If you cannot understand or address an issue, push back honestly with
   what you tried — don't fabricate a fix.
 - Be terse in the reply comment. Diff speaks for itself.
+- **Never end your turn while background tasks are still running.** Run
+  builds and tests in the foreground with a raised command timeout instead
+  of backgrounding them; if you did background something, wait for it (or
+  kill it) before your final message. The headless CLI holds your final
+  message until background tasks drain and gives up after a ceiling — the
+  orchestrator then sees no completion marker and fails the whole turn,
+  even if your commits landed.
+- **You are a one-shot headless process — never yield the turn expecting
+  to be re-invoked later.** Scheduled wakeups, monitors, and cron jobs
+  never fire: the process exits the moment your turn ends, the completion
+  marker never prints, and the orchestrator fails the iteration. Finish
+  everything — including waiting on long test runs — within this turn.

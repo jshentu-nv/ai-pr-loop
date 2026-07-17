@@ -17,7 +17,10 @@
 #                      [--max N] [--converge N] [--review-only]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
-#                      [--claude-effort LEVEL] [--codex-effort LEVEL]
+#                      [--claude-model MODEL] [--claude-effort LEVEL]
+#                      [--claude-perms MODE]
+#                      [--codex-model MODEL] [--codex-effort LEVEL]
+#                      [--codex-tier TIER] [--print-config]
 #
 # Arguments:
 #   --repo        OWNER/NAME of the GitHub repo (required).
@@ -48,18 +51,57 @@
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
 #                 replace the prior context instead).
+#   --claude-model MODEL
+#                 Model for the Claude implementer's `claude -p` turns, passed
+#                 as `--model MODEL`. Default: fable (Claude Fable 5; alias
+#                 resolved by the claude CLI). Use `off` to leave the CLI/
+#                 settings default untouched.
 #   --claude-effort LEVEL
 #                 Reasoning effort for the Claude implementer's `claude -p`
 #                 turns. Default: ultracode (xhigh reasoning + dynamic-workflow
 #                 orchestration, via --settings). Other values map to
 #                 `claude --effort LEVEL`: low | medium | high | xhigh | max.
 #                 Use `off` to leave the CLI/settings default untouched.
+#   --claude-perms MODE
+#                 Permission handling for the Claude implementer's `claude -p`
+#                 turns. auto (default): --permission-mode auto — every action
+#                 is gated by the Claude Code auto-mode classifier, which
+#                 approves task-aligned actions headlessly and works on hosts
+#                 where bypass is policy-disabled. Auto mode is not available
+#                 on every account/provider, and ineligible hosts silently
+#                 downgrade it; a deterministic preflight probe reads the
+#                 CLI-reported effective mode (cached per PR) and uses the
+#                 settings safety net when auto does not stick. A CLI that
+#                 hard-rejects the flag at startup instead triggers a single
+#                 retry with the same net. bypass: --dangerously-skip-permissions plus a
+#                 settings safety net (auto-accepted edits + allowed
+#                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
+#                 bypass. off: leave the host's CLI/settings default
+#                 untouched.
+#   --codex-model MODEL
+#                 Model for the Codex reviewer's `codex exec` turns, passed as
+#                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
+#                 leave the host's codex config untouched.
 #   --codex-effort LEVEL
 #                 Reasoning effort for the Codex reviewer's `codex exec` turns,
 #                 applied as `-c model_reasoning_effort=LEVEL` on every turn:
-#                 low | medium | high | xhigh. Default: xhigh (the highest level
-#                 for the gpt-5.x family — codex has no ultracode/max). Use
-#                 `off` to leave the host's codex config untouched.
+#                 low | medium | high | xhigh | max | ultra. Default: ultra
+#                 when the codex model is gpt-5.6-sol/-terra (the only models
+#                 that support it); for any other --codex-model no level is
+#                 forced (same as `off`) — the host codex config / the model's
+#                 own default applies, since effort ceilings vary per model.
+#                 An explicit level is passed verbatim. Use `off` to leave
+#                 the host's codex config untouched.
+#   --codex-tier TIER
+#                 Service (speed) tier for the Codex reviewer, applied as
+#                 `-c service_tier=TIER` on every turn. Default: fast (the
+#                 "Fast" tier: 1.5x speed, increased usage). Use `off` to
+#                 leave the host's codex config untouched.
+#   --print-config
+#                 Print the resolved model/effort/tier knobs (after adaptive
+#                 defaults) and exit without contacting GitHub; the PR number
+#                 is optional in this mode. Used by tests/run_tests.sh to
+#                 observe the resolution.
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -71,7 +113,7 @@
 
 set -euo pipefail
 
-LOOP_HOME="$(cd "$(dirname "$0")" && pwd)"
+LOOP_HOME="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$LOOP_HOME/lib/common.sh"
 
@@ -88,12 +130,17 @@ CONVERGE_N="$CONVERGE_DEFAULT"
 PR_NUMBER=""
 RESTART=0
 REVIEW_ONLY=0
+PRINT_CONFIG=0
 CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
 CLEAR_CONTEXT=0
+CLAUDE_MODEL="fable"
 CLAUDE_EFFORT="ultracode"
-CODEX_EFFORT="xhigh"
+CLAUDE_PERMS="auto"
+CODEX_MODEL="gpt-5.6-sol"
+CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, off (host/model default) otherwise
+CODEX_TIER="fast"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -107,10 +154,15 @@ while [[ $# -gt 0 ]]; do
     --context)       [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
     --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
     --clear-context) CLEAR_CONTEXT=1; shift ;;
+    --claude-model)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-model needs a model";  CLAUDE_MODEL="$2";  shift 2 ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
-    --codex-effort)  [[ $# -ge 2 ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
+    --claude-perms)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-perms needs a mode";   CLAUDE_PERMS="$2";  shift 2 ;;
+    --codex-model)   [[ $# -ge 2 && "$2" != -* ]] || die "--codex-model needs a model";   CODEX_MODEL="$2";   shift 2 ;;
+    --codex-effort)  [[ $# -ge 2 && -n "$2" ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
+    --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
+    --print-config)  PRINT_CONFIG=1; shift ;;
     -h|--help)
-      sed -n '2,70p' "$0"; exit 0 ;;
+      sed -n '2,112p' "$0"; exit 0 ;;
     *)
       [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
       PR_NUMBER="$1"; shift ;;
@@ -139,11 +191,36 @@ case "$CLAUDE_EFFORT" in
   ultracode|low|medium|high|xhigh|max|off) ;;
   *) die "--claude-effort must be one of: ultracode low medium high xhigh max off (got: $CLAUDE_EFFORT)" ;;
 esac
-# Codex reasoning effort: gpt-5.x tops out at xhigh (no ultracode/max for codex).
-case "$CODEX_EFFORT" in
-  low|medium|high|xhigh|off) ;;
-  *) die "--codex-effort must be one of: low medium high xhigh off (got: $CODEX_EFFORT)" ;;
+# Implementer permission handling: classifier-gated auto mode by default.
+case "$CLAUDE_PERMS" in
+  auto|bypass|off) ;;
+  *) die "--claude-perms must be one of: auto bypass off (got: $CLAUDE_PERMS)" ;;
 esac
+# Codex reasoning effort: ceilings vary per model (ultra only exists for
+# gpt-5.6-sol/-terra; older gpt-5.x reject ultra/max, some catalog models top
+# out below xhigh), so when --codex-effort is not given the default adapts:
+# ultra for sol/terra, otherwise 'off' — no level is forced and the host
+# codex config / the model's own default applies. An explicit --codex-effort
+# always wins verbatim.
+CODEX_EFFORT=$(resolve_codex_effort "$CODEX_MODEL" "$CODEX_EFFORT")
+case "$CODEX_EFFORT" in
+  low|medium|high|xhigh|max|ultra|off) ;;
+  *) die "--codex-effort must be one of: low medium high xhigh max ultra off (got: $CODEX_EFFORT)" ;;
+esac
+# Models and the codex service tier are free-form (validated by the CLIs /
+# the codex model catalog); only guard against empty values. `off` = leave
+# the host's CLI/config default untouched.
+[[ -n "$CLAUDE_MODEL" ]] || die "--claude-model needs a model (or 'off')"
+[[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
+[[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
+
+# --print-config: report the resolved knobs and exit before any GitHub access.
+# Lets tests (and humans) observe adaptive-default resolution directly.
+if (( PRINT_CONFIG == 1 )); then
+  printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
+  printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
+  exit 0
+fi
 
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -165,7 +242,8 @@ if [[ -z "$REPO_DIR" ]]; then
   REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY CLAUDE_EFFORT CODEX_EFFORT
+export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
+       CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
 ensure_repo_clone
@@ -253,8 +331,8 @@ log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude effort: $CLAUDE_EFFORT"
-log "  codex effort:  $CODEX_EFFORT"
+log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
+log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

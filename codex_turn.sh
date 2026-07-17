@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # One Codex review iteration. Reads env: REPO_OWNER, REPO_NAME, PR_NUMBER,
-# REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR.
+# REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR,
+# REVIEW_ONLY, HAS_CONTEXT, CONTEXT_FILE, CODEX_MODEL, CODEX_EFFORT,
+# CODEX_TIER.
 # Exits 0 if APPROVED, 2 if CHANGES_REQUESTED, 1 on error / no verdict found.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "$0")" && pwd)"
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
 
@@ -61,45 +63,89 @@ log "codex: iter $ITER — running"
 # capture the session id from the filesystem after the first run, then resume
 # by id on subsequent iters. This gives Codex its own internal memory of the
 # whole review, on top of the public PR thread it re-reads from disk each turn.
+# Discovery and stored-id validation are bound to this checkout's canonical
+# path so concurrent loops on other checkouts can't cross-capture sessions.
+# CDPATH= guards the substitution: an inherited CDPATH makes a successful
+# relative `cd` print the destination, which would corrupt the captured path.
+REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P)
 CODEX_SESSION_FILE="$STATE_DIR/codex.session.id"
 CAPTURE_NEW_SESSION=0
 CODEX_SUBCMD=()
 if [[ -s "$CODEX_SESSION_FILE" ]]; then
-  CODEX_SESSION_ID=$(<"$CODEX_SESSION_FILE")
-  log "codex: resuming session $CODEX_SESSION_ID"
-  CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
-else
+  STORED_SESSION_ID=$(<"$CODEX_SESSION_FILE")
+  # State written by older selectors can hold a sub-agent id (which `codex
+  # exec resume` rejects) or another checkout's root (captured by the old
+  # unbound discovery under concurrent loops). Migrate to the root session or
+  # discard and start fresh instead of staying wedged.
+  if CODEX_SESSION_ID=$(resolve_codex_root_session_id "$STORED_SESSION_ID" "$REPO_DIR_CANON"); then
+    if [[ "$CODEX_SESSION_ID" != "$STORED_SESSION_ID" ]]; then
+      log "codex: stored session $STORED_SESSION_ID is a sub-agent — migrated to root $CODEX_SESSION_ID"
+      printf '%s\n' "$CODEX_SESSION_ID" > "$CODEX_SESSION_FILE"
+    fi
+    log "codex: resuming session $CODEX_SESSION_ID"
+    CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
+  else
+    log "codex: stored session $STORED_SESSION_ID is not resumable for this checkout — starting fresh"
+    rm -f "$CODEX_SESSION_FILE"
+  fi
+fi
+if (( ${#CODEX_SUBCMD[@]} == 0 )); then
   log "codex: starting new session"
   CAPTURE_NEW_SESSION=1
   SNAPSHOT_BEFORE="$ID/codex.sessions.before"
   snapshot_codex_sessions "$SNAPSHOT_BEFORE"
 fi
 
-# Reasoning effort for the reviewer, set by the orchestrator's --codex-effort
-# (default: xhigh, the highest level for the gpt-5.x family — codex has no
-# "ultracode"/orchestration mode). Mapped to a `-c model_reasoning_effort=...`
-# override, which the CLI accepts on both fresh `exec` and `exec resume`, so we
-# pass it on every turn rather than relying on the host's global config.toml.
-# "off" leaves the CLI/config default untouched.
+# Model, reasoning effort, and service (speed) tier for the reviewer, set by
+# the orchestrator's --codex-model / --codex-effort / --codex-tier (defaults:
+# gpt-5.6-sol at ultra reasoning on the "fast" tier — 1.5x speed). Mapped to
+# `-m` / `-c model_reasoning_effort=...` / `-c service_tier=...` overrides,
+# which the CLI accepts on both fresh `exec` and `exec resume`. Each knob is
+# passed on every turn unless it resolves to "off" (explicitly, or via the
+# adaptive effort default below for models without a known ceiling), which
+# omits the override and leaves the host CLI/config default untouched.
+CODEX_MODEL_ARG=()
+CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
+case "$CODEX_MODEL_RESOLVED" in
+  off|'') CODEX_MODEL_ARG=() ;;
+  *)      CODEX_MODEL_ARG=(-m "$CODEX_MODEL_RESOLVED") ;;
+esac
+(( ${#CODEX_MODEL_ARG[@]} > 0 )) && log "codex: model = ${CODEX_MODEL_RESOLVED}"
+
+# Adaptive effort default: an unset/empty CODEX_EFFORT resolves per-model
+# (ultra for gpt-5.6-sol/-terra, otherwise 'off' — ceilings vary per model,
+# so no level is forced on models we don't know). Explicit values pass
+# verbatim. See resolve_codex_effort in lib/common.sh.
 CODEX_EFFORT_ARG=()
-CODEX_EFFORT_RESOLVED="${CODEX_EFFORT:-xhigh}"
+CODEX_EFFORT_RESOLVED=$(resolve_codex_effort "$CODEX_MODEL_RESOLVED" "${CODEX_EFFORT:-}")
 case "$CODEX_EFFORT_RESOLVED" in
-  low|medium|high|xhigh) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
-  off)                   CODEX_EFFORT_ARG=() ;;
-  *)                     log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
+  low|medium|high|xhigh|max|ultra) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
+  off)                             CODEX_EFFORT_ARG=() ;;
+  *)                               log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
 esac
 (( ${#CODEX_EFFORT_ARG[@]} > 0 )) && log "codex: reasoning effort = ${CODEX_EFFORT_RESOLVED}"
 
-# Codex must be able to run gh + git, hence bypass-approvals-and-sandbox.
-# (User explicitly requested unattended operation; mutations to GitHub are
-# expected.) `codex exec resume` doesn't accept --cd or --color, so cd via
-# subshell and use NO_COLOR=1 for both fresh and resume paths.
+CODEX_TIER_ARG=()
+CODEX_TIER_RESOLVED="${CODEX_TIER:-fast}"
+case "$CODEX_TIER_RESOLVED" in
+  off|'') CODEX_TIER_ARG=() ;;
+  *)      CODEX_TIER_ARG=(-c "service_tier=\"${CODEX_TIER_RESOLVED}\"") ;;
+esac
+(( ${#CODEX_TIER_ARG[@]} > 0 )) && log "codex: service tier = ${CODEX_TIER_RESOLVED}"
+
+# Codex must be able to run gh + git, hence --yolo (autorun: the alias for
+# --dangerously-bypass-approvals-and-sandbox). (User explicitly requested
+# unattended operation; mutations to GitHub are expected.) `codex exec resume`
+# doesn't accept --cd or --color, so cd via subshell and use NO_COLOR=1 for
+# both fresh and resume paths.
 set +e
 ( cd "$REPO_DIR" && NO_COLOR=1 codex exec \
     "${CODEX_SUBCMD[@]}" \
+    "${CODEX_MODEL_ARG[@]}" \
     "${CODEX_EFFORT_ARG[@]}" \
+    "${CODEX_TIER_ARG[@]}" \
     --skip-git-repo-check \
-    --dangerously-bypass-approvals-and-sandbox \
+    --yolo \
     - \
     < "$PROMPT_FILE" \
     > "$ID/codex.stdout" 2> "$ID/codex.stderr" )
@@ -109,7 +155,7 @@ set -e
 # Capture the new session id so the next iter can resume. Only on success —
 # a failed first run probably didn't write a usable rollout file.
 if (( CAPTURE_NEW_SESSION == 1 )) && [[ $RC -eq 0 ]]; then
-  if NEW_SESSION_ID=$(discover_new_codex_session_id "$SNAPSHOT_BEFORE"); then
+  if NEW_SESSION_ID=$(discover_new_codex_session_id "$SNAPSHOT_BEFORE" "$REPO_DIR_CANON"); then
     printf '%s\n' "$NEW_SESSION_ID" > "$CODEX_SESSION_FILE"
     log "codex: captured session id $NEW_SESSION_ID"
   else

@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-effort LEVEL] [--codex-effort LEVEL]"
+argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -85,16 +85,37 @@ Optional flags worth surfacing if the user mentions a constraint:
   the user actually asked for — don't infer context URLs from the surrounding
   conversation.
 
+- `--claude-model MODEL` — model for the Claude implementer's turns, passed
+  as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if
+  the user names a different implementer model; `off` leaves the CLI/settings
+  default untouched.
 - `--claude-effort LEVEL` — reasoning effort for the Claude implementer's
   turns. **Default `ultracode`** (xhigh + dynamic-workflow orchestration). Set
   it if the user asks for lighter/heavier implementer reasoning or flags cost:
   `xhigh` (reasoning only), `max`, `high`, `medium`, `low`, or `off` (CLI
   default).
+- `--claude-perms MODE` — permission handling for the implementer's headless
+  turns. **Default `auto`** (`--permission-mode auto`: actions gated by the
+  Claude Code auto-mode classifier; works where bypass is policy-disabled;
+  where auto mode itself is unavailable — silently downgraded or rejected —
+  a deterministic preflight probe / one-shot retry switches the turn to the
+  settings safety net). `bypass` = `--dangerously-skip-permissions` + the
+  settings safety net for hosts that silently downgrade bypass; `off` = host
+  default. Only set it if the user explicitly asks for unsandboxed/bypass
+  operation.
+- `--codex-model MODEL` — model for the Codex reviewer's turns, passed as
+  `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
+  different reviewer model; `off` leaves the host's codex config untouched.
 - `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
-  applied as `-c model_reasoning_effort=LEVEL`. **Default `xhigh`** (the top
-  level for gpt-5.x; Codex has no ultracode/max). Levels: `low`, `medium`,
-  `high`, `xhigh`, or `off` (leave the host's codex config untouched). Dial
-  down if the user flags cost/latency.
+  applied as `-c model_reasoning_effort=LEVEL`. The default adapts to the
+  model: **`ultra`** when the codex model is gpt-5.6-sol/-terra (the
+  default); for any other `--codex-model` no level is forced — the host
+  codex config / model default applies (ceilings vary per model). Levels:
+  `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, or `off` (leave the
+  host's codex config untouched). Dial down if the user flags cost/latency.
+- `--codex-tier TIER` — service (speed) tier for the Codex reviewer, applied
+  as `-c service_tier=TIER`. **Default `fast`** (1.5x speed, increased
+  usage); `off` leaves the host's codex config untouched.
 
 ## Steps
 
