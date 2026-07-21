@@ -39,11 +39,18 @@ else
   CONTEXT_NOTE=''
 fi
 
-# Render the prompt template.
+# Render the prompt template. GitLab loops use the gitlab prompt variant —
+# same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
+# instead of gh.
+PROMPT_TEMPLATE="$HERE/prompts/codex.md"
+[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/codex.gitlab.md"
 PROMPT_FILE="$ID/codex.prompt.md"
 sed \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
+  -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
+  -e "s|{{FORGE_HOST}}|${FORGE_HOST:-github.com}|g" \
+  -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
   -e "s|{{BASE_REF}}|${BASE_REF}|g" \
@@ -55,7 +62,7 @@ sed \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$HERE/prompts/codex.md" > "$PROMPT_FILE"
+  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"
 

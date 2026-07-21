@@ -13,7 +13,8 @@
 # at that iteration.
 #
 # Usage:
-#   run.sh <pr-number> --repo OWNER/NAME [--dir REPO_DIR]
+#   run.sh <pr-number-or-url> [--repo OWNER/NAME] [--dir REPO_DIR]
+#                      [--forge github|gitlab] [--host HOST]
 #                      [--max N] [--converge N] [--review-only]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
@@ -22,11 +23,25 @@
 #                      [--codex-model MODEL] [--codex-effort LEVEL]
 #                      [--codex-tier TIER] [--print-config]
 #
+# The positional argument is either a PR/MR number (with --repo) or a full
+# PR/MR URL, from which the forge, host, repo, and number are all derived:
+#   https://github.com/OWNER/NAME/pull/42                     → GitHub
+#   https://<gitlab-host>/<group>/<project>/-/merge_requests/7 → GitLab
+#                                            (gitlab.com or self-hosted)
+#
 # Arguments:
-#   --repo        OWNER/NAME of the GitHub repo (required).
+#   --repo        Repo slug (required unless a URL is given). GitHub:
+#                 OWNER/NAME. GitLab: full project path — subgroups allowed
+#                 (e.g. group/subgroup/project).
+#   --forge       github (default) | gitlab. Inferred from a URL positional
+#                 or from a non-github --host, so usually not needed.
+#   --host        Forge hostname, for self-hosted GitLab (e.g.
+#                 gitlab-master.nvidia.com). Defaults: github.com /
+#                 gitlab.com. Implies --forge gitlab when not github.com.
 #   --dir         Local checkout to use. If omitted, the loop manages its own
-#                 clone at $LOOP_HOME/checkouts/<owner>__<name>, cloning on
-#                 first use via `gh repo clone` and reusing it thereafter.
+#                 clone at $LOOP_HOME/checkouts/<slug with / -> __>, cloning
+#                 on first use via the forge CLI (`gh repo clone` /
+#                 `glab repo clone`) and reusing it thereafter.
 #   --max         6 iterations this invocation; pass 0 for uncapped (ceiling 50).
 #   --converge    3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
 #   --restart     Force a new review round even if codex previously APPROVED.
@@ -107,9 +122,13 @@
 # context.md, so you only pass them once. Pass any --context* flag to replace
 # the stored context, or --clear-context to drop it.
 #
-# The only credential needed is GH_TOKEN/GITHUB_TOKEN (the gh CLI must be
-# logged in to the repo's host). Works on any GitHub repo the authenticated
-# user has push + comment access to.
+# Credentials — one per forge:
+#   GitHub: GH_TOKEN/GITHUB_TOKEN (the gh CLI must be logged in). Works on
+#           any GitHub repo the authenticated user can push + comment on.
+#   GitLab: GITLAB_TOKEN, or a `glab auth login --hostname <host>` session
+#           (the token is read from the glab config). The token is exported
+#           to both agents — all GitLab REST calls go through curl, because
+#           `glab api` silently drops position payloads on inline comments.
 
 set -euo pipefail
 
@@ -128,6 +147,9 @@ REPO_DIR=""
 MAX_ITER="$MAX_ITER_DEFAULT"
 CONVERGE_N="$CONVERGE_DEFAULT"
 PR_NUMBER=""
+URL_ARG=""
+FORGE=""
+FORGE_HOST=""
 RESTART=0
 REVIEW_ONLY=0
 PRINT_CONFIG=0
@@ -146,6 +168,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)          REPO_SLUG="$2"; shift 2 ;;
     --dir)           REPO_DIR="$2";  shift 2 ;;
+    --forge)         [[ $# -ge 2 && "$2" != -* ]] || die "--forge needs github or gitlab"; FORGE="$2"; shift 2 ;;
+    --host)          [[ $# -ge 2 && "$2" != -* ]] || die "--host needs a hostname"; FORGE_HOST="$2"; shift 2 ;;
     --max)           MAX_ITER="$2";  shift 2 ;;
     --converge)      CONVERGE_N="$2"; shift 2 ;;
     --restart)       RESTART=1; shift ;;
@@ -162,12 +186,66 @@ while [[ $# -gt 0 ]]; do
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     -h|--help)
-      sed -n '2,112p' "$0"; exit 0 ;;
+      awk 'NR < 2 { next } /^set -euo pipefail/ { exit } { print }' "$0"; exit 0 ;;
     *)
-      [[ -z "$PR_NUMBER" ]] || die "unexpected arg: $1"
-      PR_NUMBER="$1"; shift ;;
+      [[ -z "$PR_NUMBER" && -z "$URL_ARG" ]] || die "unexpected arg: $1"
+      if [[ "$1" == http://* || "$1" == https://* ]]; then
+        URL_ARG="$1"
+      else
+        PR_NUMBER="$1"
+      fi
+      shift ;;
   esac
 done
+
+# --- forge resolution -----------------------------------------------------------
+#
+# A URL positional pins forge, host, repo, and number all at once; explicit
+# --forge/--host/--repo may accompany it but must agree. Without a URL, the
+# forge defaults to github unless --forge says otherwise or --host names a
+# non-github host (self-hosted GitHub is not supported, so any other host
+# must be GitLab).
+if [[ -n "$URL_ARG" ]]; then
+  if [[ "$URL_ARG" =~ ^https?://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+    URL_FORGE=github; URL_HOST=github.com
+    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
+  elif [[ "$URL_ARG" =~ ^https?://([^/]+)/(.+)/-/merge_requests/([0-9]+) ]]; then
+    URL_FORGE=gitlab; URL_HOST="${BASH_REMATCH[1]}"
+    URL_SLUG="${BASH_REMATCH[2]}"; URL_PR="${BASH_REMATCH[3]}"
+  elif [[ "$URL_ARG" =~ ^https?://([^/]+)/(.+)/merge_requests/([0-9]+) ]]; then
+    # Legacy GitLab URL form (pre-13.0, no /-/ separator).
+    URL_FORGE=gitlab; URL_HOST="${BASH_REMATCH[1]}"
+    URL_SLUG="${BASH_REMATCH[2]}"; URL_PR="${BASH_REMATCH[3]}"
+  else
+    die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
+  fi
+  [[ -z "$FORGE" || "$FORGE" == "$URL_FORGE" ]] \
+    || die "--forge $FORGE conflicts with the URL (a $URL_FORGE link)"
+  [[ -z "$FORGE_HOST" || "$FORGE_HOST" == "$URL_HOST" ]] \
+    || die "--host $FORGE_HOST conflicts with the URL host ($URL_HOST)"
+  [[ -z "$REPO_SLUG" || "$REPO_SLUG" == "$URL_SLUG" ]] \
+    || die "--repo $REPO_SLUG conflicts with the URL repo ($URL_SLUG)"
+  FORGE="$URL_FORGE"; FORGE_HOST="$URL_HOST"
+  REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
+fi
+if [[ -z "$FORGE" ]]; then
+  if [[ -n "$FORGE_HOST" && "$FORGE_HOST" != "github.com" ]]; then
+    FORGE=gitlab
+  else
+    FORGE=github
+  fi
+fi
+case "$FORGE" in
+  github)
+    FORGE_HOST="${FORGE_HOST:-github.com}"
+    [[ "$FORGE_HOST" == "github.com" ]] \
+      || die "self-hosted GitHub is not supported (--host $FORGE_HOST)"
+    ;;
+  gitlab)
+    FORGE_HOST="${FORGE_HOST:-gitlab.com}"
+    ;;
+  *) die "--forge must be github or gitlab (got: $FORGE)" ;;
+esac
 
 [[ -n "$REPO_SLUG" ]] || die "--repo OWNER/NAME is required (see --help)"
 [[ "$REPO_SLUG" == */* ]] || die "--repo must be in OWNER/NAME form, got: $REPO_SLUG"
@@ -214,9 +292,11 @@ esac
 [[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
 [[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
 
-# --print-config: report the resolved knobs and exit before any GitHub access.
-# Lets tests (and humans) observe adaptive-default resolution directly.
+# --print-config: report the resolved knobs and exit before any forge access.
+# Lets tests (and humans) observe adaptive-default and URL/forge resolution
+# directly.
 if (( PRINT_CONFIG == 1 )); then
+  printf 'forge: %s host=%s repo=%s pr=%s\n' "$FORGE" "$FORGE_HOST" "$REPO_SLUG" "${PR_NUMBER:--}"
   printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
@@ -232,17 +312,24 @@ for _cf in "${CONTEXT_FILES[@]}"; do
   [[ -r "$_cf" ]] || die "--context-file not readable: $_cf"
 done
 
+# First/last path component. Exact owner/name on GitHub; on GitLab (where
+# the slug may contain subgroups) these are informational only — API paths
+# and naming use the full $REPO_SLUG.
 REPO_OWNER="${REPO_SLUG%%/*}"
 REPO_NAME="${REPO_SLUG##*/}"
 
 # Default checkout location when --dir not given: one managed clone per repo,
 # shared across PRs of that repo. (Concurrent loops on the same repo should
-# pass --dir to point at separate clones.)
+# pass --dir to point at separate clones.) Slug-derived name: identical to
+# the old <owner>__<name> layout for GitHub. A GitLab path with a literal
+# "__" component can alias another path's flat name; ensure_repo_clone and
+# ensure_state_dir both detect that and die rather than share.
 if [[ -z "$REPO_DIR" ]]; then
-  REPO_DIR="$LOOP_HOME/checkouts/${REPO_OWNER}__${REPO_NAME}"
+  REPO_DIR="$LOOP_HOME/checkouts/${REPO_SLUG//\//__}"
 fi
 
-export REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
+export FORGE FORGE_HOST REPO_SLUG \
+       REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
        CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
@@ -250,14 +337,30 @@ ensure_repo_clone
 
 # --- discover branches --------------------------------------------------------
 
-PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO_SLUG" \
-            --json headRefName,baseRefName,state,url)
-PR_STATE=$(jq -r '.state'        <<<"$PR_JSON")
-HEAD_REF=$(jq -r '.headRefName'  <<<"$PR_JSON")
-BASE_REF=$(jq -r '.baseRefName'  <<<"$PR_JSON")
-PR_URL=$(jq -r '.url'            <<<"$PR_JSON")
-
-[[ "$PR_STATE" == "OPEN" ]] || die "PR is not OPEN (state=$PR_STATE)"
+case "$FORGE" in
+  gitlab)
+    PR_JSON=$(gl_api_get "projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}") \
+      || die "failed to fetch MR !${PR_NUMBER} of ${REPO_SLUG} from ${FORGE_HOST}"
+    PR_STATE=$(jq -r '.state'          <<<"$PR_JSON")
+    HEAD_REF=$(jq -r '.source_branch'  <<<"$PR_JSON")
+    BASE_REF=$(jq -r '.target_branch'  <<<"$PR_JSON")
+    PR_URL=$(jq -r '.web_url'          <<<"$PR_JSON")
+    [[ "$PR_STATE" == "opened" ]] || die "MR is not open (state=$PR_STATE)"
+    # The loop fetches/pushes origin/$HEAD_REF; a cross-fork MR's source
+    # branch lives in another project, which this flow can't reach.
+    [[ "$(jq -r '.source_project_id == .target_project_id' <<<"$PR_JSON")" == "true" ]] \
+      || die "cross-fork MRs are not supported (source project differs from target)"
+    ;;
+  *)
+    PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO_SLUG" \
+                --json headRefName,baseRefName,state,url)
+    PR_STATE=$(jq -r '.state'        <<<"$PR_JSON")
+    HEAD_REF=$(jq -r '.headRefName'  <<<"$PR_JSON")
+    BASE_REF=$(jq -r '.baseRefName'  <<<"$PR_JSON")
+    PR_URL=$(jq -r '.url'            <<<"$PR_JSON")
+    [[ "$PR_STATE" == "OPEN" ]] || die "PR is not OPEN (state=$PR_STATE)"
+    ;;
+esac
 export HEAD_REF BASE_REF
 
 ensure_state_dir
@@ -325,6 +428,7 @@ export CONTEXT_FILE HAS_CONTEXT
 log "------------------------------------------------------------"
 log "AI PR loop starting"
 log "  PR:    $PR_URL"
+log "  forge: $FORGE ($FORGE_HOST)"
 log "  base:  $BASE_REF"
 log "  head:  $HEAD_REF"
 log "  dir:   $REPO_DIR"

@@ -18,8 +18,9 @@ fetch_ai_thread > "$THREAD_FILE" || true
 # Extract this iter's codex output split by surface:
 #   - LATEST_REVIEW_FILE  → summary issue-comment body (cross-cutting + verdict)
 #   - LATEST_INLINE_FILE  → NDJSON of inline findings, one per line:
-#                            { id, path, line, body }
-#     id is needed when Claude posts in_reply_to replies.
+#                            { id, discussion_id, path, line, body }
+#     GitHub: id is what Claude's in_reply_to replies target (discussion_id
+#     is null). GitLab: replies POST to discussions/<discussion_id>/notes.
 LATEST_REVIEW_FILE="$ID/codex-review.md"
 LATEST_INLINE_FILE="$ID/codex-inline.ndjson"
 
@@ -29,7 +30,7 @@ jq -r --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
 
 jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
     select(.tag==$t and .iter==$it and .surface=="inline")
-    | {id, path, line, body}' \
+    | {id, discussion_id, path, line, body}' \
     "$THREAD_FILE" > "$LATEST_INLINE_FILE"
 
 if [[ ! -s "$LATEST_REVIEW_FILE" ]]; then
@@ -54,11 +55,18 @@ else
   CONTEXT_NOTE=''
 fi
 
-# Render the prompt.
+# Render the prompt. GitLab loops use the gitlab prompt variant — same
+# implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
+# instead of gh.
+PROMPT_TEMPLATE="$HERE/prompts/claude.md"
+[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/claude.gitlab.md"
 PROMPT_FILE="$ID/claude.prompt.md"
 sed \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
+  -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
+  -e "s|{{FORGE_HOST}}|${FORGE_HOST:-github.com}|g" \
+  -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
   -e "s|{{BASE_REF}}|${BASE_REF}|g" \
@@ -70,7 +78,7 @@ sed \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$HERE/prompts/claude.md" > "$PROMPT_FILE"
+  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"
 

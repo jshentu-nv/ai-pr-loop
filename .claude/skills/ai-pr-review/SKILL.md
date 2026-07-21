@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
-description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
+description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments and pushes commits under the user's forge identity (gh PAT / GitLab token).
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -15,8 +15,9 @@ user, then stream progress back into the conversation.
 `ai-pr-loop` alternates two CLIs:
 
 - **`codex exec`** as reviewer — reads the diff + prior thread, posts
-  inline review comments via the GitHub reviews API for line-specific
-  findings plus a summary issue-comment with a `[CODEX_VERDICT: …]` line.
+  inline review comments for line-specific findings (GitHub reviews API /
+  GitLab positioned discussions) plus a summary comment with a
+  `[CODEX_VERDICT: …]` line.
 - **`claude -p`** as implementer — replies inline to each finding,
   commits fixes under a bot git identity, pushes back when it disagrees.
 
@@ -27,13 +28,23 @@ accumulates round over round.
 
 Parse the user's request into:
 
-- `PR_NUMBER` — numeric PR id.
-- `REPO_SLUG` — `OWNER/NAME`.
+- `PR_NUMBER` — numeric PR id (GitLab: the MR iid).
+- `REPO_SLUG` — `OWNER/NAME` (GitLab: the full project path, subgroups
+  included, e.g. `group/subgroup/project`).
+- Forge — GitHub (default) or GitLab (`--forge gitlab`, plus
+  `--host <hostname>` for self-hosted).
 
-If the user pasted a URL like `https://github.com/foo/bar/pull/42`:
-- `REPO_SLUG=foo/bar`, `PR_NUMBER=42`.
+**If the user pasted a PR/MR URL, pass it straight through as the
+positional argument** — `run.sh` derives forge, host, repo, and number
+itself:
+- `https://github.com/foo/bar/pull/42` → GitHub
+- `https://<any-host>/<group>/<project>/-/merge_requests/7` → GitLab
+  (gitlab.com or self-hosted; the host is kept)
 
-If only a bare number, ask the user for the repo slug — don't guess from cwd.
+If only a bare number, ask the user for the repo slug — don't guess from
+cwd. For a GitLab repo given as slug + number, also pass
+`--host <hostname>` (implies the gitlab forge) unless it's gitlab.com,
+where `--forge gitlab` alone suffices.
 
 Optional flags worth surfacing if the user mentions a constraint:
 
@@ -132,7 +143,9 @@ and ask where they want it cloned. Do not silently clone for them.
 ### 2. Preflight
 
 Run these checks in parallel and surface any failures **before** kicking off
-the loop:
+the loop.
+
+GitHub:
 
 ```bash
 gh auth status 2>&1 | head -2
@@ -141,21 +154,36 @@ command -v claude && claude --version 2>&1 | head -1
 gh pr view <PR_NUMBER> --repo <REPO_SLUG> --json state,headRefName,title,url
 ```
 
-Bail if `gh auth` is bad, either CLI is missing, or the PR isn't `OPEN`.
+GitLab (self-hosted: substitute the host):
+
+```bash
+glab auth status --hostname <HOST> 2>&1 | head -3
+command -v codex && codex --version 2>&1 | head -1
+command -v claude && claude --version 2>&1 | head -1
+TOKEN="${GITLAB_TOKEN:-$(glab config get token --host <HOST>)}"
+curl -sS -H "PRIVATE-TOKEN: $TOKEN" \
+  "https://<HOST>/api/v4/projects/<URL-ENCODED-SLUG>/merge_requests/<IID>" \
+  | jq '{state, source_branch, title, web_url}'
+```
+
+Bail if forge auth is bad, either CLI is missing, or the PR/MR isn't open
+(GitHub `OPEN` / GitLab `opened`).
 
 ### 3. Confirm before posting
 
-The loop writes to a live PR: it will post comments and (via Claude) push
-commits using the gh-authed user's PAT. Always tell the user the exact
-identity and the PR URL, then ask for confirmation **unless they already
-authorized the run explicitly** in the same conversation (e.g. "start the
-review", "kick it off", "go", a previous run in this session). When in
-doubt, ask.
+The loop writes to a live PR/MR: it will post comments and (via Claude)
+push commits using the user's forge identity (gh PAT on GitHub, GitLab
+token on GitLab). Always tell the user the exact identity and the PR/MR
+URL, then ask for confirmation **unless they already authorized the run
+explicitly** in the same conversation (e.g. "start the review", "kick it
+off", "go", a previous run in this session). When in doubt, ask.
 
 ### 4. Launch in the background
 
 ```bash
 "$RUN_SH" <PR_NUMBER> --repo <REPO_SLUG> --max <N> --converge <N>
+# or, when the user gave a URL (works for GitHub and GitLab):
+"$RUN_SH" <PR_OR_MR_URL> --max <N> --converge <N>
 ```
 
 Append any context the user supplied, e.g.
