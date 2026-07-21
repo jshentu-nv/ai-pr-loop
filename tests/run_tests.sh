@@ -16,13 +16,17 @@
 #     and resolved knob output via --print-config (adaptive default / explicit
 #     precedence)
 #   - forge resolution: PR/MR URL parsing (github / gitlab.com / self-hosted /
-#     legacy no-/-/ form), --host implying gitlab, URL-vs-flag conflicts
-#   - gitlab plumbing: preflight token resolution via the glab stub,
-#     fetch_ai_thread mapping of /discussions (surfaces, discussion_id,
-#     reply chaining, system/non-marker filtering), API-failure propagation
-#     (no silent empty thread), state-dir flat-name collision guard,
-#     post_ai_comment via curl, gitlab prompt-template selection in both
-#     turn scripts, remote-URL slug normalization
+#     legacy no-/-/ form), --host implying gitlab, URL-vs-flag conflicts,
+#     scheme preservation (http MR URLs / scheme-qualified --host)
+#   - summary-as-completion: resume high-water ignores inline-only iters;
+#     both turn scripts fail when their iteration summary never landed
+#   - gitlab plumbing: preflight token resolution via the glab stub (incl.
+#     OAuth-session rejection), fetch_ai_thread mapping of /discussions
+#     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
+#     API-failure propagation (no silent empty thread), state-dir flat-name
+#     collision guard, forge/host-namespaced state + checkout identity (clone
+#     origin host guard), post_ai_comment via curl, gitlab prompt-template
+#     selection in both turn scripts, remote-URL slug/host normalization
 #
 # Usage: tests/run_tests.sh
 set -uo pipefail
@@ -140,14 +144,26 @@ echo "[CODEX_ISSUES: BLOCKER=0 MAJOR=0 NIT=0]"
 echo "[CODEX_VERDICT: APPROVED]"
 EOF
 
-# fetch_ai_thread hits gh twice (issue + inline comments). Emit one codex
-# summary comment for the issues endpoint so claude_turn.sh has a review to
-# read; everything else returns empty.
+# fetch_ai_thread hits gh twice (issue + inline comments). Emit one codex and
+# one claude summary comment for the issues endpoint — claude_turn.sh needs a
+# review to read, and both turn scripts verify their own summary landed after
+# the turn. STUB_NO_*_SUMMARY knobs simulate a turn whose summary POST never
+# landed (crash after inline-only posts / rejected POST); everything else
+# returns empty.
 cat > "$STUBS/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   *"/issues/"*"/comments"*)
-    printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\nStub codex review."}\n' "${ITER:-1}"
+    if [[ "${STUB_NO_CODEX_SUMMARY:-0}" != "1" ]]; then
+      CX_ITER="${ITER:-1}"
+      # Stale-thread shape: only an OLDER iteration's codex summary exists
+      # (the current iter's summary POST never landed).
+      [[ "${STUB_STALE_CODEX_SUMMARY:-0}" == "1" ]] && CX_ITER=0
+      printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\nStub codex review."}\n' "$CX_ITER"
+    fi
+    if [[ "${STUB_NO_CLAUDE_SUMMARY:-0}" != "1" ]]; then
+      printf '{"surface":"issue","id":102,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:10Z","body":"<!-- ai-loop:claude-implementer iter=%s -->\\nStub claude reply."}\n' "${ITER:-1}"
+    fi
     ;;
 esac
 EOF
@@ -159,6 +175,9 @@ case "$*" in
   "config get token --host "*)
     if [[ "${STUB_GLAB_NO_TOKEN:-0}" == "1" ]]; then exit 1; fi
     echo "stub-glab-token"
+    ;;
+  "config get is_oauth2 --host "*)
+    echo "${STUB_GLAB_OAUTH:-false}"
     ;;
   "repo clone "*)
     :
@@ -186,12 +205,14 @@ case "$method $url" in
     echo '{"username":"testuser"}'
     ;;
   "GET "*"/discussions"*)
-    # One codex summary note (marker), one inline DiffNote thread with a
-    # claude reply, one system note, one human note without a marker. The
-    # page is short (<100), so the pagination loop stops after one fetch.
+    # One codex + one claude summary note (markers; both turn scripts verify
+    # their own summary landed), one inline DiffNote thread with a claude
+    # reply, one system note, one human note without a marker. The page is
+    # short (<100), so the pagination loop stops after one fetch.
     cat <<PAYLOAD
 [
  {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nStub codex review.","position":null}]},
+ {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\nStub claude reply.","position":null}]},
  {"id":"disc-inline","notes":[
    {"id":301,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nInline finding.","position":{"new_path":"src/a.c","new_line":12}},
    {"id":302,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:02Z","body":"<!-- ai-loop:claude-implementer iter=0 -->\nOld reply.","position":{"new_path":"src/a.c","new_line":12}}]},
@@ -292,6 +313,24 @@ t "slug: ssh:// remote with a port"
 assert_eq "$(normalize_remote_slug 'ssh://git@gitlab.example.com:2222/g/p.git')" g/p
 t "slug: scp-style gitlab remote with subgroups"
 assert_eq "$(normalize_remote_slug 'git@gitlab-master.example.com:group/sub/proj.git')" group/sub/proj
+
+# --- normalize_remote_host --------------------------------------------------
+# Host extraction for the clone guard's forge/host identity check.
+
+t "host: scp-style remote"
+assert_eq "$(normalize_remote_host 'git@github.com:o/r.git')" github.com
+t "host: https remote"
+assert_eq "$(normalize_remote_host 'https://gitlab.example.com/g/p.git')" gitlab.example.com
+t "host: https remote with credentials"
+assert_eq "$(normalize_remote_host 'https://user@gitlab.example.com/g/p.git')" gitlab.example.com
+t "host: https remote with a port"
+assert_eq "$(normalize_remote_host 'https://gl.example:8443/g/p.git')" gl.example
+t "host: ssh:// remote with a port"
+assert_eq "$(normalize_remote_host 'ssh://git@gitlab.example.com:2222/g/p.git')" gitlab.example.com
+t "host: local path yields nothing (unknown, not validated)"
+assert_eq "$(normalize_remote_host '/srv/git/mirror.git')" ""
+t "host: port stripped from a plain host string"
+assert_eq "$(host_sans_port 'gitlab.lab:8929')" gitlab.lab
 
 # --- run_with_timeout -------------------------------------------------------
 # The probe watchdog must be portable: GNU timeout, gtimeout (brew coreutils
@@ -750,16 +789,75 @@ assert_rc0
 assert_pair "$ARGV" resume cafe-cdpath-sess
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafe-cdpath-sess
 
+# --- summary-as-completion enforcement --------------------------------------
+# The summary comment is each turn's completion contract: the resume
+# high-water counts only summaries (inline-only turns are incomplete), and
+# both turn scripts refetch the thread to verify their own summary landed —
+# a crash after inline-only posts, or a rejected summary POST, must fail the
+# turn instead of advancing the loop past an incomplete review/response.
+
+t "resume high-water: inline-only iterations don't advance it"
+HW=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":2,\"surface\":\"inline\",\"in_reply_to_id\":null}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":3,\"surface\":\"issue\",\"in_reply_to_id\":201}'
+  }
+  latest_ai_comment_iter codex")
+assert_eq "$HW" 1
+
+t "codex: turn fails when its summary never landed despite an APPROVED stdout"
+new_case codex-no-summary
+run_turn codex STUB_NO_CODEX_SUMMARY=1
+assert_eq "$TURN_RC" 1
+t "codex: no verdict is recorded for a summary-less turn"
+if [[ -e "$CASE_DIR/state/iter-01/verdict" ]]; then
+  bad "verdict recorded despite the missing summary"
+else
+  ok
+fi
+
+t "claude: turn fails when its summary never landed despite the COMPLETE marker"
+new_case claude-no-summary
+run_turn claude STUB_NO_CLAUDE_SUMMARY=1
+assert_eq "$TURN_RC" 1
+
+t "claude: dies instead of answering a stale review when this iter's codex summary is missing"
+new_case claude-stale-review
+run_turn claude STUB_NO_CODEX_SUMMARY=1
+assert_eq "$TURN_RC" 1
+if grep -q "codex summary for iter 1 not found" "$CASE_DIR/turn.log"; then
+  ok
+else
+  bad "missing die message (log: $(tail -2 "$CASE_DIR/turn.log" 2>/dev/null | tr '\n' ' '))"
+fi
+
+t "claude: an older-iter codex summary is not answered as a fallback"
+new_case claude-stale-summary
+run_turn claude STUB_STALE_CODEX_SUMMARY=1
+assert_eq "$TURN_RC" 1
+t "claude: the stale-review die happens before any claude invocation"
+if [[ -e "$ARGV" ]]; then
+  bad "claude was invoked despite only a stale (iter-0) codex summary being present"
+else
+  ok
+fi
+
 # --- gitlab forge plumbing -------------------------------------------------
 # The gitlab path talks to /api/v4 via the curl stub: one summary note, one
 # inline DiffNote thread with a reply, one system note, one human note.
 
 GL_ENV='FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r PR_NUMBER=9 GITLAB_TOKEN=t'
 
-t "gitlab thread: maps discussions to the NDJSON schema (3 marked notes)"
+t "gitlab thread: maps discussions to the NDJSON schema (4 marked notes)"
 GL_THREAD=$(env -i PATH="$STUBS:/usr/bin:/bin" ITER=3 "$BASH_BIN" -c \
   "$GL_ENV; . '$ROOT/lib/common.sh'; fetch_ai_thread")
-assert_eq "$(printf '%s\n' "$GL_THREAD" | wc -l | tr -d ' ')" 3
+assert_eq "$(printf '%s\n' "$GL_THREAD" | wc -l | tr -d ' ')" 4
+
+t "gitlab thread: claude summary note is surface=issue"
+assert_eq "$(jq -r 'select(.id==202) | "\(.surface) \(.iter) \(.tag)"' <<<"$GL_THREAD")" \
+          "issue 3 ai-loop:claude-implementer"
 
 t "gitlab thread: summary note is surface=issue with its discussion id"
 assert_eq "$(jq -r 'select(.id==201) | "\(.surface) \(.discussion_id) \(.iter) \(.tag)"' <<<"$GL_THREAD")" \
@@ -806,6 +904,81 @@ else
   bad "re-run on the owning slug was rejected"
 fi
 
+# Forge/host identity: same-slug repos on different forges/hosts must never
+# share state, checkouts, or clones.
+
+t "state dir: gitlab identity is namespaced by host"
+GLSD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
+  "set -euo pipefail; LOOP_HOME='$WORK/sd-home' FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p PR_NUMBER=2; . '$ROOT/lib/common.sh'; ensure_state_dir; printf '%s' \"\$STATE_DIR\"")
+assert_eq "$GLSD" "$WORK/sd-home/state/gl.example__g__p/pr-2"
+
+t "state dir: marker records the full gitlab identity"
+assert_eq "$(cat "$WORK/sd-home/state/gl.example__g__p/pr-2/.repo-slug" 2>/dev/null)" "gitlab gl.example g/p"
+
+t "state dir: github keeps the legacy layout and marker format"
+GHSD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
+  "set -euo pipefail; LOOP_HOME='$WORK/sd-home' FORGE=github FORGE_HOST=github.com REPO_SLUG=o/r PR_NUMBER=1; . '$ROOT/lib/common.sh'; ensure_state_dir; printf '%s' \"\$STATE_DIR\"")
+assert_eq "$GHSD" "$WORK/sd-home/state/o__r/pr-1"
+assert_eq "$(cat "$WORK/sd-home/state/o__r/pr-1/.repo-slug" 2>/dev/null)" "o/r"
+
+CLONE_FIX="$WORK/clone-host"
+git init -q "$CLONE_FIX" >/dev/null 2>&1
+git -C "$CLONE_FIX" remote add origin https://github.com/g/r.git
+
+t "clone guard: same slug on a different forge/host is rejected"
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/r REPO_DIR='$CLONE_FIX'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "github.com clone accepted for a gl.example repo of the same slug"
+else
+  ok
+fi
+
+t "clone guard: matching host re-enters its own clone"
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_FIX'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "matching-host clone rejected"
+fi
+
+t "clone guard: port-qualified FORGE_HOST re-enters its own clone"
+CLONE_PORT="$WORK/clone-port"
+git init -q "$CLONE_PORT" >/dev/null 2>&1
+git -C "$CLONE_PORT" remote add origin http://gitlab.lab:8929/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:8929 REPO_SLUG=g/p REPO_DIR='$CLONE_PORT'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "resume on a port-qualified host rejected its own clone"
+fi
+
+t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
+CLONE_SSHGH="$WORK/clone-sshgh"
+git init -q "$CLONE_SSHGH" >/dev/null 2>&1
+git -C "$CLONE_SSHGH" remote add origin 'ssh://git@ssh.github.com:443/g/r.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_SSHGH'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "documented alternate ssh endpoint rejected"
+fi
+
+t "clone guard: dotless ssh-alias origin is allowed (unverifiable, slug check holds)"
+CLONE_ALIAS="$WORK/clone-alias"
+git init -q "$CLONE_ALIAS" >/dev/null 2>&1
+git -C "$CLONE_ALIAS" remote add origin 'git@github-work:g/r.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_ALIAS'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "pre-existing ssh-alias --dir checkout rejected"
+fi
+
 t "gitlab post_ai_comment: POSTs a JSON note via curl with the marker"
 PC_LOG="$WORK/post-comment.log"
 env -i PATH="$STUBS:/usr/bin:/bin" CURL_LOG="$PC_LOG" "$BASH_BIN" -c \
@@ -833,6 +1006,16 @@ if grep -q 'glab api' "$GL_PROMPT" 2>/dev/null; then ok; else bad "missing glab 
 t "codex gitlab: model knobs unchanged on the gitlab path"
 assert_pair "$ARGV" -m gpt-5.6-sol
 
+t "codex gitlab: http scheme renders into the prompt API base"
+new_case codex-gitlab-http
+run_turn codex FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=http PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
+assert_rc0
+if grep -q 'http://gl.example/api/v4/projects/g%2Fr' "$CASE_DIR/state/iter-01/codex.prompt.md" 2>/dev/null; then
+  ok
+else
+  bad "prompt API base not rendered with the http scheme"
+fi
+
 t "claude gitlab: renders the gitlab prompt and extracts discussion_id"
 new_case claude-gitlab
 run_turn claude FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
@@ -851,6 +1034,16 @@ else
 fi
 t "claude gitlab: inline finding carries its discussion_id"
 assert_eq "$(jq -r '.discussion_id' "$CASE_DIR/state/iter-01/codex-inline.ndjson" 2>/dev/null)" disc-inline
+
+t "claude gitlab: http scheme renders into the prompt API base"
+new_case claude-gitlab-http
+run_turn claude FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=http PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
+assert_rc0
+if grep -q 'http://gl.example/api/v4/projects/g%2Fr' "$CASE_DIR/state/iter-01/claude.prompt.md" 2>/dev/null; then
+  ok
+else
+  bad "claude prompt API base not rendered with the http scheme"
+fi
 
 # --- run.sh flag validation ----------------------------------------------
 
@@ -902,31 +1095,31 @@ assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 
 t "run.sh: github PR URL pins forge, repo, and number"
 run_run_sh https://github.com/foo/bar/pull/42 --print-config
-assert_prints 'forge: github host=github.com repo=foo/bar pr=42'
+assert_prints 'forge: github host=github.com scheme=https repo=foo/bar pr=42'
 
 t "run.sh: gitlab.com MR URL selects the gitlab forge (subgroups kept)"
 run_run_sh https://gitlab.com/group/sub/proj/-/merge_requests/7 --print-config
-assert_prints 'forge: gitlab host=gitlab.com repo=group/sub/proj pr=7'
+assert_prints 'forge: gitlab host=gitlab.com scheme=https repo=group/sub/proj pr=7'
 
 t "run.sh: self-hosted MR URL keeps its host"
 run_run_sh https://gitlab-master.example.com/omniverse/kit/-/merge_requests/123 --print-config
-assert_prints 'forge: gitlab host=gitlab-master.example.com repo=omniverse/kit pr=123'
+assert_prints 'forge: gitlab host=gitlab-master.example.com scheme=https repo=omniverse/kit pr=123'
 
 t "run.sh: MR URL with a trailing tab path still parses"
 run_run_sh https://gitlab.com/g/p/-/merge_requests/5/diffs --print-config
-assert_prints 'forge: gitlab host=gitlab.com repo=g/p pr=5'
+assert_prints 'forge: gitlab host=gitlab.com scheme=https repo=g/p pr=5'
 
 t "run.sh: legacy MR URL (no /-/) parses"
 run_run_sh https://gitlab.example.com/g/p/merge_requests/6 --print-config
-assert_prints 'forge: gitlab host=gitlab.example.com repo=g/p pr=6'
+assert_prints 'forge: gitlab host=gitlab.example.com scheme=https repo=g/p pr=6'
 
 t "run.sh: --host other than github.com implies gitlab"
 run_run_sh 3 --repo g/sub/p --host gitlab.example.com --print-config
-assert_prints 'forge: gitlab host=gitlab.example.com repo=g/sub/p pr=3'
+assert_prints 'forge: gitlab host=gitlab.example.com scheme=https repo=g/sub/p pr=3'
 
 t "run.sh: bare number + --repo stays github on github.com"
 run_run_sh 1 --repo o/n --print-config
-assert_prints 'forge: github host=github.com repo=o/n pr=1'
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
 
 t "run.sh: --repo conflicting with the URL repo dies"
 run_run_sh https://github.com/foo/bar/pull/42 --repo other/name --print-config
@@ -955,6 +1148,48 @@ assert_dies_with "no GitLab token for gitlab.com"
 t "run.sh: gitlab preflight resolves the token via glab and reaches MR fetch"
 run_run_sh 1 --repo g/p --forge gitlab --dir "$WORK/glclone"
 assert_dies_with "MR is not open"
+
+t "run.sh: OAuth-backed glab session is rejected with guidance"
+run_run_sh STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab
+assert_dies_with "OAuth-backed"
+
+t "run.sh: explicit GITLAB_TOKEN bypasses the glab OAuth check"
+run_run_sh GITLAB_TOKEN=pat STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab --dir "$WORK/glclone-oauth"
+assert_dies_with "MR is not open"
+
+t "run.sh: http MR URL preserves the scheme"
+run_run_sh http://gl.example/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gl.example scheme=http repo=g/p pr=9'
+
+t "run.sh: scheme-qualified --host implies gitlab and keeps http"
+run_run_sh 3 --repo g/p --host http://gitlab.lab --print-config
+assert_prints 'forge: gitlab host=gitlab.lab scheme=http repo=g/p pr=3'
+
+t "run.sh: --host scheme conflicting with the URL scheme dies"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --host http://gl.example --print-config
+assert_dies_with "conflicts with the URL scheme"
+
+t "run.sh: http URL reaches the API on http (actual curl target)"
+HTTP_CURL_LOG="$WORK/http-curl.log"
+GLHTTP="$WORK/glclone-http"
+git init -q "$GLHTTP" >/dev/null 2>&1
+git -C "$GLHTTP" remote add origin http://gl.example/g/p.git
+run_run_sh CURL_LOG="$HTTP_CURL_LOG" http://gl.example/g/p/-/merge_requests/9 --dir "$GLHTTP"
+assert_dies_with "MR is not open"
+t "run.sh: preflight /user call went over http"
+if grep -q '^GET http://gl.example/api/v4/user' "$HTTP_CURL_LOG" 2>/dev/null; then
+  ok
+else
+  bad "no http GET to /user recorded (log: $(head -3 "$HTTP_CURL_LOG" 2>/dev/null | tr '\n' ' '))"
+fi
+
+t "run.sh: managed gitlab checkout is namespaced by host"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+assert_prints "dir: $ROOT/checkouts/gl.example__g__p"
+
+t "run.sh: managed github checkout keeps the legacy layout"
+run_run_sh 1 --repo o/n --print-config
+assert_prints "dir: $ROOT/checkouts/o__n"
 
 # --print-config exposes run.sh's own resolution (not just the helper's), so
 # these have teeth against run.sh regressing to a forced level.

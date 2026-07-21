@@ -32,9 +32,10 @@ Requirements on the host:
 
 - For GitHub repos: `gh` CLI authenticated (`gh auth login` or
   `GH_TOKEN`/`GITHUB_TOKEN` with `repo` scope on the target repo).
-- For GitLab repos: `glab` CLI + `curl`, with `GITLAB_TOKEN` set or
-  `glab auth login --hostname <host>` done for the target host (the token
-  needs `api` scope; see [GitLab support](#gitlab-support)).
+- For GitLab repos: `glab` CLI + `curl`, with `GITLAB_TOKEN` set or a
+  PAT-backed `glab auth login --hostname <host>` done for the target host
+  (the token needs `api` scope; OAuth web/device glab sessions are
+  rejected — see [GitLab support](#gitlab-support)).
 - `codex` CLI installed and logged in.
 - `claude` CLI installed and logged in.
 - `git`, `jq` available on `$PATH`.
@@ -118,8 +119,12 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
 - `--repo` takes the **full project path**, subgroups included
   (`group/subgroup/project`).
 - Auth: `GITLAB_TOKEN` env var wins; otherwise the token is read from the
-  glab config for that host (`glab auth login --hostname <host>`). The
-  token needs `api` scope, plus push access to the MR's source branch.
+  glab config for that host (`glab auth login --hostname <host>`,
+  authenticated **with a personal access token** — OAuth web/device glab
+  sessions are rejected at preflight, because their tokens are only valid
+  as a `Bearer` header and expire mid-loop while everything here sends
+  `PRIVATE-TOKEN`). The token needs `api` scope, plus push access to the
+  MR's source branch.
 - All GitLab REST calls — the orchestrator's and the agents' — go through
   `curl` with a `PRIVATE-TOKEN` header, **not** `glab api`: `glab api`
   silently drops `position[...]` payloads when posting inline (line-anchored)
@@ -141,9 +146,24 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
 - The GitLab token is exported into both agents' environments as
   `GITLAB_TOKEN` (they post their own comments with it), same trust model
   as `GH_TOKEN` on the GitHub path.
+- HTTP-only self-hosts work: the scheme of the MR URL (or of
+  `--host http://gitlab.lab`) is preserved through every orchestrator API
+  call and both agents' prompts; the default is https. Pass the URL (or the
+  scheme-qualified `--host`) on re-runs too — the scheme isn't persisted.
+  First-use managed clones of an HTTP-only host use plain
+  `git clone http://…` (glab can't be steered to HTTP), so a private repo
+  needs ambient git credentials for that host — the same requirement as
+  the loop's headless pushes. A glab `api_host`/`api_protocol` config
+  pointing the API at a *different* host than the web UI is not supported;
+  the API is always `<scheme>://<MR host>/api/v4`.
 
 Terminology mapping, everywhere in state paths and logs: PR == MR, the PR
-number == the MR iid. State lives at `state/<group>__<subgroup>__<project>/pr-<iid>/`.
+number == the MR iid. State lives at
+`state/<host>__<group>__<subgroup>__<project>/pr-<iid>/` and managed clones
+at `checkouts/<host>__<group>__<subgroup>__<project>/` — GitLab identities
+are namespaced by host so a same-slug repo on another forge/host can never
+share a checkout, state, or agent sessions (GitHub keeps the legacy
+`<owner>__<name>` layout).
 
 ## Additional context (web links, notes, files)
 
@@ -342,9 +362,16 @@ comments and continues from the high-water mark:
 | Codex iter K but no Claude reply | Run claude at iter K first, then continue from K+1. |
 | Codex APPROVED at iter K, new commits since | Plain re-run is a no-op. Pass `--restart` to start a new round at iter K+1, codex first. |
 
+Only each bot's **summary** comment counts toward the high-water mark: the
+summary is a turn's completion contract (posted last, after every inline
+comment, and re-verified by the orchestrator after each turn), so a turn
+that died after inline-only posts — or whose summary POST failed — is
+re-run at the same iteration instead of being skipped past.
+
 Per-PR session ids for both agents are stored under
-`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`,
-so resumed runs also restore the agents' internal memory.
+`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`
+(GitLab: `state/<host>__<slug...>/...`), so resumed runs also restore the
+agents' internal memory.
 
 ## Direct CLI (advanced)
 

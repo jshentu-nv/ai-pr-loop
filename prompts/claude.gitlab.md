@@ -27,7 +27,7 @@ All GitLab REST calls go through `curl` with the `PRIVATE-TOKEN` header;
 `$GITLAB_TOKEN` is exported in your environment. Use this base URL:
 
 ```bash
-API="https://{{FORGE_HOST}}/api/v4/projects/{{PROJECT_ENC}}"
+API="{{FORGE_SCHEME}}://{{FORGE_HOST}}/api/v4/projects/{{PROJECT_ENC}}"
 ```
 
 **Never post comments through `glab api`.** It silently drops bracketed
@@ -35,6 +35,11 @@ payload fields (HTTP 200, wrong result) and rejects `--input` JSON bodies
 with HTTP 400. Every POST must be `curl` exactly as shown below. Build JSON
 bodies with `jq -n --arg` (it handles quoting/newlines correctly); never
 hand-assemble JSON strings.
+
+**Always pass `-f` to curl** (as every recipe below does): an HTTP error
+then fails the command instead of printing an error body that looks like
+success. If a POST fails, fix the payload and retry it — never continue
+past a failed mutation as if it landed.
 
 ## What you must do
 
@@ -96,7 +101,7 @@ hand-assemble JSON strings.
    Fixed in <commit-sha>: <what changed>
    BODY
    )" '{body: $body}' \
-   | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+   | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        -H 'Content-Type: application/json' --data @- \
        "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes"
    ```
@@ -134,7 +139,7 @@ hand-assemble JSON strings.
    <sub>— end of automated Claude Implementer comment (iteration {{ITER}})</sub>
    BODY
    )" '{body: $body}' \
-   | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+   | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        -H 'Content-Type: application/json' --data @- \
        "$API/merge_requests/{{PR_NUMBER}}/notes"
    ```
@@ -143,7 +148,10 @@ hand-assemble JSON strings.
 
    Post the summary note **last**, after the inline replies — the
    orchestrator treats the summary note as the completion marker for
-   this iteration.
+   this iteration. It independently refetches the MR after your turn and
+   **fails the whole turn if this iteration's summary note is not found**,
+   even when your stdout printed the completion marker. If the summary POST
+   fails, fix it and retry until it lands.
 
 6. **Structure the summary body** like this:
 

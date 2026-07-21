@@ -79,7 +79,16 @@ preflight() {
       # A raw token is required: every GitLab REST call — orchestrator and
       # agents alike — goes through curl (see the forge note above). Env
       # wins; otherwise pull the host's token out of the glab config.
+      # The glab fallback only works for PAT-backed sessions: a web/device
+      # OAuth login stores an OAuth access token, which the REST API accepts
+      # only as "Authorization: Bearer" (PRIVATE-TOKEN reads it as a PAT →
+      # 401) and which expires mid-loop unless glab's own refresh runs.
+      # Detect that configuration and reject it with instructions rather
+      # than failing obscurely on /user (or hours later on token expiry).
       if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+        if [[ "$(glab config get is_oauth2 --host "$FORGE_HOST" 2>/dev/null)" == "true" ]]; then
+          die "glab session for $FORGE_HOST is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
+        fi
         GITLAB_TOKEN=$(glab config get token --host "$FORGE_HOST" 2>/dev/null) \
           || GITLAB_TOKEN=''
       fi
@@ -96,7 +105,7 @@ preflight() {
       GH_USER=$(gl_api_get user 2>/dev/null | jq -r '.username // empty') \
         || GH_USER=''
       [[ -n "$GH_USER" ]] \
-        || die "GitLab auth failed against https://$FORGE_HOST/api/v4/user (token invalid or wrong host?)"
+        || die "GitLab auth failed against ${FORGE_SCHEME:-https}://$FORGE_HOST/api/v4/user (token invalid or wrong host?)"
       ;;
     *) die "unknown forge: $FORGE (expected github or gitlab)" ;;
   esac
@@ -111,6 +120,38 @@ normalize_remote_slug() {
   sed -E 's#^ssh://git@[^/]+/##; s#^git@[^:/]+:##; s#^https?://[^/]+/##; s#\.git$##; s#^/##' <<<"$1"
 }
 
+# Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
+# their address). This is the comparable form normalize_remote_host emits.
+host_sans_port() {
+  local h="$1"
+  if [[ "$h" == \[* ]]; then
+    h="${h#[}"; h="${h%%]*}"
+  else
+    h="${h%%:*}"
+  fi
+  printf '%s\n' "$h"
+}
+
+# Hostname of a git remote URL: scheme://[user@]host[:port]/path and the
+# scp-style user@host:path both reduce to host (:port stripped — an ssh
+# remote's port legitimately differs from the web port). Prints nothing when
+# no host can be parsed (local path, exotic remote) — callers treat that as
+# unknown.
+normalize_remote_host() {
+  local url="$1"
+  case "$url" in
+    ssh://*|git://*|http://*|https://*)
+      url="${url#*://}"; url="${url%%/*}"; url="${url#*@}"
+      host_sans_port "$url"
+      ;;
+    *@*:*)
+      url="${url#*@}"; printf '%s\n' "${url%%:*}"
+      ;;
+    *)
+      : ;;
+  esac
+}
+
 # Ensure $REPO_DIR contains a clone of $REPO_SLUG. If it doesn't exist (or is
 # an empty directory), clone via the forge CLI (`gh repo clone` /
 # `glab repo clone`) so the loop is self-contained — the caller never has to
@@ -118,12 +159,35 @@ normalize_remote_slug() {
 # than mangle it.
 ensure_repo_clone() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    local origin_url remote_slug
+    local origin_url remote_slug remote_host want_host
     origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)
     remote_slug=$(normalize_remote_slug "$origin_url")
+    remote_host=$(normalize_remote_host "$origin_url")
     if [[ -n "$remote_slug" && "$remote_slug" != "$REPO_SLUG" ]]; then
       die "REPO_DIR=$REPO_DIR is a clone of '$remote_slug', not '$REPO_SLUG'"
     fi
+    # Same-slug projects on different forges/hosts are different repositories
+    # (github.com/g/p vs gitlab.example/g/p); fetching/pushing this checkout
+    # while posting to the other host's PR would mangle both. Hosts compare
+    # with ports stripped (an instance's ssh port differs from its web port),
+    # and the forges' documented alternate ssh endpoints (ssh.github.com,
+    # altssh.gitlab.com) count as their host. A parsed host without a dot is
+    # almost certainly a ~/.ssh/config alias — unverifiable, so the slug
+    # check above has to carry it alone. A dotted mismatch dies: if origin
+    # reaches the right host through an alias or URL rewrite, point it at
+    # the canonical hostname, or use a fresh --dir and let the loop clone
+    # canonically itself.
+    want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
+    case "$remote_host" in
+      ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
+        : ;;
+      *.*)
+        die "REPO_DIR=$REPO_DIR origin points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
+        ;;
+      *)
+        log "origin host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
+        ;;
+    esac
     log "using existing clone at $REPO_DIR"
     return
   fi
@@ -137,8 +201,19 @@ ensure_repo_clone() {
   log "cloning $REPO_SLUG into $REPO_DIR"
   case "$FORGE" in
     gitlab)
-      GITLAB_HOST="$FORGE_HOST" glab repo clone "$REPO_SLUG" "$REPO_DIR" >&2 \
-        || die "failed to clone $REPO_SLUG from $FORGE_HOST"
+      if [[ "${FORGE_SCHEME:-https}" == "http" ]]; then
+        # glab can't be steered to plain HTTP without per-host config (a
+        # scheme inside GITLAB_HOST is stripped and it still speaks https),
+        # so clone with git directly. Auth for a private repo — and for the
+        # pushes this remote will take later — comes from the ambient git
+        # credential setup, the same non-interactive push-path requirement
+        # the loop already documents.
+        git clone "http://${FORGE_HOST}/${REPO_SLUG}.git" "$REPO_DIR" >&2 \
+          || die "failed to clone $REPO_SLUG from http://$FORGE_HOST"
+      else
+        GITLAB_HOST="$FORGE_HOST" glab repo clone "$REPO_SLUG" "$REPO_DIR" >&2 \
+          || die "failed to clone $REPO_SLUG from $FORGE_HOST"
+      fi
       ;;
     *)
       gh repo clone "$REPO_SLUG" "$REPO_DIR" >&2 \
@@ -149,11 +224,13 @@ ensure_repo_clone() {
 
 # --- GitLab API helper ----------------------------------------------------------
 
-# GET a path (with optional query) under https://$FORGE_HOST/api/v4/.
+# GET a path (with optional query) under $FORGE_SCHEME://$FORGE_HOST/api/v4/.
+# $FORGE_SCHEME (default https) comes from the MR URL / --host, so an
+# HTTP-only self-hosted GitLab is reached on the scheme it actually serves.
 # curl -f: HTTP >= 400 exits non-zero so callers can `|| die`.
 gl_api_get() {
   curl -sSf -H "PRIVATE-TOKEN: ${GITLAB_TOKEN:-}" \
-    "https://${FORGE_HOST:-gitlab.com}/api/v4/$1"
+    "${FORGE_SCHEME:-https}://${FORGE_HOST:-gitlab.com}/api/v4/$1"
 }
 
 # --- Forge helpers --------------------------------------------------------------
@@ -254,7 +331,7 @@ post_ai_comment() {
       jq -n --arg body "$wrapped" '{body: $body}' \
       | curl -sSf -X POST -H "PRIVATE-TOKEN: ${GITLAB_TOKEN:-}" \
           -H 'Content-Type: application/json' --data @- \
-          "https://${FORGE_HOST}/api/v4/projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/notes" \
+          "${FORGE_SCHEME:-https}://${FORGE_HOST}/api/v4/projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/notes" \
           >/dev/null
       ;;
     *)
@@ -263,7 +340,13 @@ post_ai_comment() {
   esac
 }
 
-# Returns the most recent comment with the given tag (codex|claude) on PR.
+# Highest iteration for which the bot's SUMMARY comment exists on the PR.
+# Only issue-surface thread ROOTS count: the summary is each turn's
+# completion contract (posted last, after every inline note), so a turn that
+# crashed after inline-only posts — or whose summary POST was rejected —
+# must not advance the resume high-water. Counting inline notes here would
+# make run.sh skip the codex turn of an incomplete review (and claude would
+# then have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
   local marker
@@ -273,8 +356,37 @@ latest_ai_comment_iter() {
     *) die "unknown tag: $tag" ;;
   esac
   fetch_ai_thread \
-    | jq -r --arg t "$marker" 'select(.tag==$t) | .iter' \
+    | jq -r --arg t "$marker" \
+        'select(.tag==$t and .surface=="issue" and .in_reply_to_id==null) | .iter' \
     | sort -n | tail -1
+}
+
+# True iff the bot's iteration-$2 summary comment exists on the PR right now
+# (same summary definition as latest_ai_comment_iter). The turn scripts call
+# this after each turn instead of trusting the agent's stdout markers alone:
+# an agent can print its verdict/completion marker even though the summary
+# POST failed, or die after posting only inline notes. A failed thread fetch
+# (or an empty thread) returns non-zero — fail closed.
+ai_summary_posted() {
+  local who="$1" iter="$2" marker
+  case "$who" in
+    codex)  marker="$CODEX_MARKER_TAG"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG" ;;
+    *) die "unknown bot tag: $who" ;;
+  esac
+  fetch_ai_thread \
+    | jq -es --arg t "$marker" --argjson it "$iter" \
+        'any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)' \
+    >/dev/null
+}
+
+# Post-turn completion check with one short retry, absorbing forge
+# read-after-write lag on the comment list endpoints just after the POST.
+verify_ai_summary() {
+  local who="$1" iter="$2"
+  ai_summary_posted "$who" "$iter" && return 0
+  sleep 5
+  ai_summary_posted "$who" "$iter"
 }
 
 # --- Portable watchdog ----------------------------------------------------------
@@ -328,25 +440,48 @@ resolve_codex_effort() {
   esac
 }
 
-# --- State dirs ---------------------------------------------------------------
+# --- Repo identity / state dirs -------------------------------------------------
+
+# Canonical directory name for the repo's managed checkout and state: path
+# components join with __, and any non-github.com forge prefixes its host so
+# same-slug repositories on different forges/hosts (github.com/g/p,
+# gitlab.com/g/p, gitlab.internal/g/p) can never share a checkout, state, or
+# sessions. GitHub keeps the legacy <owner>__<name> layout so existing
+# checkouts/state keep working. The flat name is still NOT injective in
+# corner cases (a GitLab path with a literal "__" component; a dotless
+# intranet hostname colliding with a GitHub owner), so the state marker and
+# the clone origin check both validate the full identity and fail loudly
+# rather than silently share.
+repo_ident_name() {
+  if [[ "${FORGE:-github}" == "github" ]]; then
+    printf '%s\n' "${REPO_SLUG//\//__}"
+  else
+    printf '%s__%s\n' "$FORGE_HOST" "${REPO_SLUG//\//__}"
+  fi
+}
+
+# Full repo identity for marker files. GitHub keeps the bare slug (the
+# pre-gitlab marker format, so existing state dirs validate unchanged);
+# other forges record forge + host + slug.
+repo_ident() {
+  if [[ "${FORGE:-github}" == "github" ]]; then
+    printf '%s\n' "$REPO_SLUG"
+  else
+    printf '%s %s %s\n' "$FORGE" "$FORGE_HOST" "$REPO_SLUG"
+  fi
+}
 
 ensure_state_dir() {
-  # Slug-derived name: path components join with __. Identical to the old
-  # <owner>__<name> layout for two-component GitHub slugs. The flat name is
-  # NOT injective for GitLab paths containing a literal "__"
-  # (group/sub__proj and group/sub/proj both map to group__sub__proj), so a
-  # slug marker guards the dir the same way ensure_repo_clone guards the
-  # clone: fail loudly rather than silently share sessions/state between
-  # two different projects.
-  STATE_DIR="$LOOP_HOME/state/${REPO_SLUG//\//__}/pr-${PR_NUMBER}"
+  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
   mkdir -p "$STATE_DIR"
-  local marker="$STATE_DIR/.repo-slug" owner
+  local marker="$STATE_DIR/.repo-slug" owner want
+  want=$(repo_ident)
   if [[ -s "$marker" ]]; then
     owner=$(<"$marker")
-    [[ "$owner" == "$REPO_SLUG" ]] \
-      || die "state dir $STATE_DIR belongs to '$owner', not '$REPO_SLUG' (flat-name collision — use distinct project paths or clean the state dir)"
+    [[ "$owner" == "$want" ]] \
+      || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
   else
-    printf '%s\n' "$REPO_SLUG" > "$marker"
+    printf '%s\n' "$want" > "$marker"
   fi
 }
 

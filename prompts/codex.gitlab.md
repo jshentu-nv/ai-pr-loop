@@ -17,8 +17,8 @@ All GitLab REST calls go through `curl` with the `PRIVATE-TOKEN` header;
 `$GITLAB_TOKEN` is exported in your environment. Use this base URL:
 
 ```bash
-API="https://{{FORGE_HOST}}/api/v4/projects/{{PROJECT_ENC}}"
-curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"
+API="{{FORGE_SCHEME}}://{{FORGE_HOST}}/api/v4/projects/{{PROJECT_ENC}}"
+curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"
 ```
 
 **Never post comments through `glab api`.** It silently drops
@@ -27,6 +27,11 @@ curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"
 400. `glab` is fine for read-only views (`glab mr view`); every POST must
 be `curl` exactly as shown below. Build JSON bodies with `jq -n --arg` (it
 handles quoting/newlines correctly); never hand-assemble JSON strings.
+
+**Always pass `-f` to curl** (as every recipe below does): an HTTP error
+then fails the command instead of printing an error body that looks like
+success. If a mutation (POST/DELETE) fails, fix the payload and retry it —
+never continue past a failed mutation as if it landed.
 
 ## What you must do
 
@@ -40,8 +45,8 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
    - `glab mr view {{PR_NUMBER}}` (run inside `{{REPO_DIR}}`; glab resolves
      the host and project from the git remote) for title, description,
      labels, linked issues — or
-     `curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"`.
-   - `curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/discussions?per_page=100"`
+     `curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"`.
+   - `curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/discussions?per_page=100"`
      for **all** comment threads (includes any human comments; page through
      with `&page=2`, `&page=3`, … if a page comes back full).
    The MR description states intent and constraints — design choices that
@@ -142,7 +147,7 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
    First fetch the MR's diff SHAs (once per turn):
 
    ```bash
-   REFS=$(curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+   REFS=$(curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
      "$API/merge_requests/{{PR_NUMBER}}" | jq .diff_refs)
    ```
 
@@ -166,7 +171,7 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
                       head_sha: $refs.head_sha,
                       start_sha: $refs.start_sha,
                       new_path: $path, new_line: $line}}' \
-   | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+   | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        -H 'Content-Type: application/json' --data @- \
        "$API/merge_requests/{{PR_NUMBER}}/discussions"
    ```
@@ -189,7 +194,7 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
    - **Verify each POST landed inline**: the response's
      `.notes[0].position` must be non-null. A null `position` means it
      landed as a general note — delete that note
-     (`curl -sS -X DELETE -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes/<note_id>"`,
+     (`curl -sSf -X DELETE -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes/<note_id>"`,
      allowed only for a note you just mis-posted this turn) and retry with
      a corrected payload.
    - **Don't restate a still-valid prior inline finding.** If the diff
@@ -203,14 +208,14 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
      # General reply (e.g. to a pushback)
      jq -n --arg body "$(printf '<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]**\n\n<reply>')" \
            '{body: $body}' \
-     | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+     | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
          -H 'Content-Type: application/json' --data @- \
          "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes"
 
      # Resolved acknowledgement on a fully-addressed prior thread
      jq -n --arg body "$(printf '<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]** Resolved.')" \
            '{body: $body}' \
-     | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+     | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
          -H 'Content-Type: application/json' --data @- \
          "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes"
      ```
@@ -242,7 +247,7 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
    <sub>— end of automated Codex Reviewer comment (iteration {{ITER}})</sub>
    BODY
    )" '{body: $body}' \
-   | curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+   | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        -H 'Content-Type: application/json' --data @- \
        "$API/merge_requests/{{PR_NUMBER}}/notes"
    ```
@@ -253,7 +258,11 @@ handles quoting/newlines correctly); never hand-assemble JSON strings.
 
    Post the summary note **last**, after the inline notes succeed — the
    orchestrator treats the summary note as the completion marker for this
-   iteration.
+   iteration. It independently refetches the MR after your turn and **fails
+   the whole turn if this iteration's summary note is not found**, no matter
+   what your stdout verdict says. If the summary POST fails, fix it and
+   retry until it lands before printing the step-8 lines; never print a
+   verdict for a summary that didn't post.
 
 7. **Structure the summary body** like this:
 

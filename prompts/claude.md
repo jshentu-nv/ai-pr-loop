@@ -125,7 +125,10 @@ null on GitHub).
 
    Post the summary issue-comment **last**, after the inline replies — the
    orchestrator treats the summary comment as the completion marker for
-   this iteration.
+   this iteration. It independently refetches the PR after your turn and
+   **fails the whole turn if this iteration's summary comment is not
+   found**, even when your stdout printed the completion marker. If the
+   summary POST fails, fix it and retry until it lands.
 
 6. **Structure the summary body** like this:
 

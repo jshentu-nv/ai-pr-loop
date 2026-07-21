@@ -53,7 +53,8 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--converge N` — stop after N consecutive BLOCKER=0 MAJOR=0 codex iters.
   Default 3. Pass `0` to disable convergence-based termination.
 - `--dir DIR` — use an existing local clone. Omit to let the loop manage
-  its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/`.
+  its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/` (GitLab repos:
+  `checkouts/<host>__<slug with / -> __>/`).
 - `--restart` — force a new review round even if codex previously
   APPROVED. Use after new commits land past a prior approval ("pull
   latest and review again", "new commits were pushed, run another round").
@@ -166,6 +167,11 @@ curl -sS -H "PRIVATE-TOKEN: $TOKEN" \
   | jq '{state, source_branch, title, web_url}'
 ```
 
+(Use `http://` in the curl if the MR URL itself is plain-HTTP. If
+`GITLAB_TOKEN` is unset and `glab config get is_oauth2 --host <HOST>`
+prints `true`, stop: the loop rejects OAuth-backed glab sessions — the
+user must set `GITLAB_TOKEN` to a personal access token.)
+
 Bail if forge auth is bad, either CLI is missing, or the PR/MR isn't open
 (GitHub `OPEN` / GitLab `opened`).
 
@@ -227,7 +233,8 @@ When the background `run.sh` completes, summarize:
 
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
-(prompts, agent stdout/stderr, fetched thread, codex verdict file).
+(GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
+stdout/stderr, fetched thread, codex verdict file).
 
 ## Resumability
 

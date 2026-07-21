@@ -38,10 +38,16 @@
 #   --host        Forge hostname, for self-hosted GitLab (e.g.
 #                 gitlab-master.nvidia.com). Defaults: github.com /
 #                 gitlab.com. Implies --forge gitlab when not github.com.
+#                 May carry a scheme for HTTP-only self-hosts
+#                 (--host http://gitlab.lab); default scheme is https, and
+#                 an MR URL positional pins the scheme too.
 #   --dir         Local checkout to use. If omitted, the loop manages its own
-#                 clone at $LOOP_HOME/checkouts/<slug with / -> __>, cloning
-#                 on first use via the forge CLI (`gh repo clone` /
-#                 `glab repo clone`) and reusing it thereafter.
+#                 clone at $LOOP_HOME/checkouts/<slug with / -> __> (GitLab
+#                 checkouts are additionally prefixed with the host:
+#                 <host>__<slug...>, so same-slug repos on different
+#                 forges/hosts never share a clone), cloning on first use via
+#                 the forge CLI (`gh repo clone` / `glab repo clone`) and
+#                 reusing it thereafter.
 #   --max         6 iterations this invocation; pass 0 for uncapped (ceiling 50).
 #   --converge    3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
 #   --restart     Force a new review round even if codex previously APPROVED.
@@ -126,9 +132,13 @@
 #   GitHub: GH_TOKEN/GITHUB_TOKEN (the gh CLI must be logged in). Works on
 #           any GitHub repo the authenticated user can push + comment on.
 #   GitLab: GITLAB_TOKEN, or a `glab auth login --hostname <host>` session
-#           (the token is read from the glab config). The token is exported
-#           to both agents — all GitLab REST calls go through curl, because
-#           `glab api` silently drops position payloads on inline comments.
+#           backed by a personal access token (the token is read from the
+#           glab config). OAuth web/device glab sessions are rejected at
+#           preflight: their tokens can only be sent as a Bearer header and
+#           expire mid-loop, while every call here uses PRIVATE-TOKEN. The
+#           token is exported to both agents — all GitLab REST calls go
+#           through curl, because `glab api` silently drops position
+#           payloads on inline comments.
 
 set -euo pipefail
 
@@ -200,22 +210,33 @@ done
 
 # --- forge resolution -----------------------------------------------------------
 #
-# A URL positional pins forge, host, repo, and number all at once; explicit
-# --forge/--host/--repo may accompany it but must agree. Without a URL, the
-# forge defaults to github unless --forge says otherwise or --host names a
-# non-github host (self-hosted GitHub is not supported, so any other host
-# must be GitLab).
+# A URL positional pins forge, host, repo, number, and scheme all at once;
+# explicit --forge/--host/--repo may accompany it but must agree. Without a
+# URL, the forge defaults to github unless --forge says otherwise or --host
+# names a non-github host (self-hosted GitHub is not supported, so any other
+# host must be GitLab).
+#
+# The scheme (https default) is preserved end-to-end — orchestrator API
+# calls and both rendered prompts — so an HTTP-only self-hosted GitLab is
+# reached on the scheme it actually serves. --host may carry it explicitly
+# (--host http://gitlab.lab) for slug+number invocations without a URL.
+FORGE_SCHEME=""
+if [[ "$FORGE_HOST" =~ ^(https?)://(.+)$ ]]; then
+  FORGE_SCHEME="${BASH_REMATCH[1]}"
+  FORGE_HOST="${BASH_REMATCH[2]%/}"
+fi
 if [[ -n "$URL_ARG" ]]; then
   if [[ "$URL_ARG" =~ ^https?://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
-    URL_FORGE=github; URL_HOST=github.com
+    # gh always speaks https to github.com; an http:// link is just a link.
+    URL_FORGE=github; URL_HOST=github.com; URL_SCHEME=https
     URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
-  elif [[ "$URL_ARG" =~ ^https?://([^/]+)/(.+)/-/merge_requests/([0-9]+) ]]; then
-    URL_FORGE=gitlab; URL_HOST="${BASH_REMATCH[1]}"
-    URL_SLUG="${BASH_REMATCH[2]}"; URL_PR="${BASH_REMATCH[3]}"
-  elif [[ "$URL_ARG" =~ ^https?://([^/]+)/(.+)/merge_requests/([0-9]+) ]]; then
+  elif [[ "$URL_ARG" =~ ^(https?)://([^/]+)/(.+)/-/merge_requests/([0-9]+) ]]; then
+    URL_FORGE=gitlab; URL_SCHEME="${BASH_REMATCH[1]}"; URL_HOST="${BASH_REMATCH[2]}"
+    URL_SLUG="${BASH_REMATCH[3]}"; URL_PR="${BASH_REMATCH[4]}"
+  elif [[ "$URL_ARG" =~ ^(https?)://([^/]+)/(.+)/merge_requests/([0-9]+) ]]; then
     # Legacy GitLab URL form (pre-13.0, no /-/ separator).
-    URL_FORGE=gitlab; URL_HOST="${BASH_REMATCH[1]}"
-    URL_SLUG="${BASH_REMATCH[2]}"; URL_PR="${BASH_REMATCH[3]}"
+    URL_FORGE=gitlab; URL_SCHEME="${BASH_REMATCH[1]}"; URL_HOST="${BASH_REMATCH[2]}"
+    URL_SLUG="${BASH_REMATCH[3]}"; URL_PR="${BASH_REMATCH[4]}"
   else
     die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
   fi
@@ -223,9 +244,11 @@ if [[ -n "$URL_ARG" ]]; then
     || die "--forge $FORGE conflicts with the URL (a $URL_FORGE link)"
   [[ -z "$FORGE_HOST" || "$FORGE_HOST" == "$URL_HOST" ]] \
     || die "--host $FORGE_HOST conflicts with the URL host ($URL_HOST)"
+  [[ -z "$FORGE_SCHEME" || "$FORGE_SCHEME" == "$URL_SCHEME" ]] \
+    || die "--host scheme ${FORGE_SCHEME}:// conflicts with the URL scheme (${URL_SCHEME}://)"
   [[ -z "$REPO_SLUG" || "$REPO_SLUG" == "$URL_SLUG" ]] \
     || die "--repo $REPO_SLUG conflicts with the URL repo ($URL_SLUG)"
-  FORGE="$URL_FORGE"; FORGE_HOST="$URL_HOST"
+  FORGE="$URL_FORGE"; FORGE_HOST="$URL_HOST"; FORGE_SCHEME="$URL_SCHEME"
   REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
 fi
 if [[ -z "$FORGE" ]]; then
@@ -240,12 +263,17 @@ case "$FORGE" in
     FORGE_HOST="${FORGE_HOST:-github.com}"
     [[ "$FORGE_HOST" == "github.com" ]] \
       || die "self-hosted GitHub is not supported (--host $FORGE_HOST)"
+    FORGE_SCHEME=https
     ;;
   gitlab)
     FORGE_HOST="${FORGE_HOST:-gitlab.com}"
+    FORGE_SCHEME="${FORGE_SCHEME:-https}"
     ;;
   *) die "--forge must be github or gitlab (got: $FORGE)" ;;
 esac
+if [[ "$FORGE_SCHEME" == "http" ]]; then
+  log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
+fi
 
 [[ -n "$REPO_SLUG" ]] || die "--repo OWNER/NAME is required (see --help)"
 [[ "$REPO_SLUG" == */* ]] || die "--repo must be in OWNER/NAME form, got: $REPO_SLUG"
@@ -292,11 +320,24 @@ esac
 [[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
 [[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
 
+# Default checkout location when --dir not given: one managed clone per repo
+# identity, shared across PRs of that repo. (Concurrent loops on the same
+# repo should pass --dir to point at separate clones.) repo_ident_name keeps
+# the legacy <owner>__<name> layout for GitHub and prefixes the host for
+# GitLab, so same-slug repos on different forges/hosts never share a clone;
+# residual flat-name aliases (literal "__" path components, dotless intranet
+# hostnames) are caught by ensure_repo_clone's origin slug+host check and
+# ensure_state_dir's identity marker, which die rather than share.
+if [[ -z "$REPO_DIR" ]]; then
+  REPO_DIR="$LOOP_HOME/checkouts/$(repo_ident_name)"
+fi
+
 # --print-config: report the resolved knobs and exit before any forge access.
-# Lets tests (and humans) observe adaptive-default and URL/forge resolution
-# directly.
+# Lets tests (and humans) observe adaptive-default and URL/forge/scheme/dir
+# resolution directly.
 if (( PRINT_CONFIG == 1 )); then
-  printf 'forge: %s host=%s repo=%s pr=%s\n' "$FORGE" "$FORGE_HOST" "$REPO_SLUG" "${PR_NUMBER:--}"
+  printf 'forge: %s host=%s scheme=%s repo=%s pr=%s\n' "$FORGE" "$FORGE_HOST" "$FORGE_SCHEME" "$REPO_SLUG" "${PR_NUMBER:--}"
+  printf 'dir: %s\n' "$REPO_DIR"
   printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
@@ -318,17 +359,7 @@ done
 REPO_OWNER="${REPO_SLUG%%/*}"
 REPO_NAME="${REPO_SLUG##*/}"
 
-# Default checkout location when --dir not given: one managed clone per repo,
-# shared across PRs of that repo. (Concurrent loops on the same repo should
-# pass --dir to point at separate clones.) Slug-derived name: identical to
-# the old <owner>__<name> layout for GitHub. A GitLab path with a literal
-# "__" component can alias another path's flat name; ensure_repo_clone and
-# ensure_state_dir both detect that and die rather than share.
-if [[ -z "$REPO_DIR" ]]; then
-  REPO_DIR="$LOOP_HOME/checkouts/${REPO_SLUG//\//__}"
-fi
-
-export FORGE FORGE_HOST REPO_SLUG \
+export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
        CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
@@ -428,7 +459,7 @@ export CONTEXT_FILE HAS_CONTEXT
 log "------------------------------------------------------------"
 log "AI PR loop starting"
 log "  PR:    $PR_URL"
-log "  forge: $FORGE ($FORGE_HOST)"
+log "  forge: $FORGE ($FORGE_SCHEME://$FORGE_HOST)"
 log "  base:  $BASE_REF"
 log "  head:  $HEAD_REF"
 log "  dir:   $REPO_DIR"

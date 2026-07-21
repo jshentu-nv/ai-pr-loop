@@ -33,17 +33,15 @@ jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
     | {id, discussion_id, path, line, body}' \
     "$THREAD_FILE" > "$LATEST_INLINE_FILE"
 
+# No fallback to an older summary here. Reaching this turn means codex's
+# iter-$ITER summary exists (codex_turn verifies it after posting, and the
+# resume high-water counts only summaries), so failing to extract it means
+# the fetch is broken or the thread is inconsistent — and answering a stale
+# review would advance the loop past an incomplete one. Die instead; the
+# next invocation resumes at this same iteration.
+# (Missing inline is different: no inline findings is a valid outcome.)
 if [[ ! -s "$LATEST_REVIEW_FILE" ]]; then
-  # Summary missing for this iter — fall back to the latest codex summary so
-  # Claude has *something*. (Doesn't affect inline; missing inline = no inline
-  # findings this iter, which is a valid outcome.)
-  jq -r --arg t "$CODEX_MARKER_TAG" '
-      select(.tag==$t and .surface=="issue") | .body' "$THREAD_FILE" \
-    | tail -n 200 > "$LATEST_REVIEW_FILE"
-fi
-
-if [[ ! -s "$LATEST_REVIEW_FILE" ]]; then
-  die "no codex review found on PR — cannot run claude turn"
+  die "codex summary for iter $ITER not found on the PR — cannot run claude turn"
 fi
 
 # Optional human-supplied reference material (web links / notes / files),
@@ -66,6 +64,7 @@ sed \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
   -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
   -e "s|{{FORGE_HOST}}|${FORGE_HOST:-github.com}|g" \
+  -e "s|{{FORGE_SCHEME}}|${FORGE_SCHEME:-https}|g" \
   -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
@@ -306,10 +305,19 @@ if [[ $RC -ne 0 ]]; then
   exit 1
 fi
 
-if grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
-  log "claude: turn complete"
-  exit 0
-else
+if ! grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
   log "claude: missing [CLAUDE_TURN: COMPLETE] marker — assuming partial"
   exit 1
 fi
+
+# The stdout marker alone isn't proof of completion: the summary comment is
+# the turn's contract (posted last, after every inline reply), and a failed
+# POST or a crash after inline-only replies would otherwise advance the loop
+# past a half-posted response. Refetch and require this iteration's summary.
+if ! verify_ai_summary claude "$ITER"; then
+  log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
+  exit 1
+fi
+
+log "claude: turn complete"
+exit 0
