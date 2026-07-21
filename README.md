@@ -158,10 +158,15 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
   `git clone http://…` (glab can't be steered to HTTP), so a private repo
   needs ambient git credentials for that host — the same requirement as
   the loop's headless pushes. For HTTP(S) origins the checkout guard
-  matches the **full authority** (`host:port`, default ports collapsed):
-  a `--dir` clone whose origin uses a different name for the same instance
-  (e.g. a search-domain short name like `http://gitlab/…`) is rejected —
-  point the remote at the canonical authority the MR URL uses. A glab `api_host`/`api_protocol` config
+  matches the **full endpoint** (`scheme://host:port`, default ports
+  collapsed — `http://gl.example` and `https://gl.example` are different
+  endpoints), and it validates **every fetch and push URL** of `origin`
+  (a divergent `remote.origin.pushurl` would otherwise deliver the
+  implementer's commits elsewhere). A `--dir` clone whose origin uses a
+  different name for the same instance (e.g. a search-domain short name
+  like `http://gitlab/…`) is rejected — point the remote at the canonical
+  authority the MR URL uses. The scheme is part of the stored per-PR
+  identity marker too. A glab `api_host`/`api_protocol` config
   pointing the API at a *different* host than the web UI is not supported;
   the API is always `<scheme>://<MR host>/api/v4`.
 
@@ -371,10 +376,12 @@ comments and continues from the high-water mark:
 | Codex APPROVED at iter K, new commits since | Plain re-run is a no-op. Pass `--restart` to start a new round at iter K+1, codex first. |
 
 Only each bot's **summary** comment counts toward the high-water mark,
-identified by its exact banner line (not just the hidden marker — a tagged
-note without the banner, e.g. an inline finding that lost its diff
-position and landed as a general note, doesn't count): the summary is a
-turn's completion contract (posted last, after every inline comment, and
+identified **structurally**: the hidden marker must be the entire first
+line and the alert opener + banner line the first visible content. Neither
+the marker alone nor a banner *quoted in prose* counts — a tagged general
+note (e.g. an inline finding that lost its diff position, or a restatement
+that cites the banner text) is not a summary. The summary is a turn's
+completion contract (posted last, after every inline comment, and
 re-verified by the orchestrator after each turn), so a turn that died
 after inline-only posts — or whose summary POST failed — is re-run at the
 same iteration instead of being skipped past.

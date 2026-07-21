@@ -155,7 +155,8 @@ never continue past a failed mutation as if it landed.
 
    ```bash
    jq -n --argjson refs "$REFS" \
-         --arg path "path/to/file.ext" --argjson line 42 \
+         --arg old_path "path/to/file.ext" --arg new_path "path/to/file.ext" \
+         --argjson line 42 \
          --arg body "$(cat <<'BODY'
    <!-- ai-loop:codex-reviewer iter={{ITER}} -->
    **[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**
@@ -170,7 +171,8 @@ never continue past a failed mutation as if it landed.
                       base_sha: $refs.base_sha,
                       head_sha: $refs.head_sha,
                       start_sha: $refs.start_sha,
-                      new_path: $path, new_line: $line}}' \
+                      old_path: $old_path, new_path: $new_path,
+                      new_line: $line}}' \
    | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        -H 'Content-Type: application/json' --data @- \
        "$API/merge_requests/{{PR_NUMBER}}/discussions"
@@ -181,13 +183,17 @@ never continue past a failed mutation as if it landed.
      the first line of every inline body. The orchestrator filters on it.
    - The `**[AI · Codex Reviewer · iter N] [SEVERITY]**` header should be
      the first visible line — humans use it to spot bot comments at a glance.
-   - Position fields select the diff side: **added/modified lines** →
-     `new_path` + `new_line` only (as above). **Deleted lines** →
-     `old_path` + `old_line` only. **Unchanged (context) lines shown in the
-     diff** → both pairs (`new_path`+`new_line` *and* `old_path`+`old_line`),
-     where `old_line` is the line's number on the BASE side — it differs
-     from `new_line` whenever earlier hunks in the file added or removed
-     lines, so read it off the diff, don't reuse `new_line`.
+   - **Send BOTH `old_path` and `new_path` on every text position** — the
+     GitLab Discussions API requires both; only the LINE fields are
+     side-specific. The two paths are identical unless the file was renamed
+     in the MR; for a renamed file read the old name off the diff header.
+   - Line fields select the diff side: **added/modified lines** →
+     `new_line` only (as above). **Deleted lines** → `old_line` only.
+     **Unchanged (context) lines shown in the diff** → both `new_line`
+     *and* `old_line`, where `old_line` is the line's number on the BASE
+     side — it differs from `new_line` whenever earlier hunks in the file
+     added or removed lines, so read it off the diff, don't reuse
+     `new_line`.
    - The line must be part of the MR's diff. Lines outside the diff are
      rejected (HTTP 400) — if you need to reference unchanged code, comment
      on the nearest changed line.
@@ -260,9 +266,11 @@ never continue past a failed mutation as if it landed.
    orchestrator treats the summary note as the completion marker for this
    iteration. It independently refetches the MR after your turn and **fails
    the whole turn if this iteration's summary note is not found**, no matter
-   what your stdout verdict says. The summary is identified by its exact
-   banner line (`**AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration
-   {{ITER}}.**`) — a further reason the banner must not be reworded. If the
+   what your stdout verdict says. The summary is identified structurally: the
+   hidden marker must be the ENTIRE first line, and the `> [!IMPORTANT]`
+   opener plus the banner line (`> **AUTOMATED REVIEW — AI agent (Codex
+   Reviewer), iteration {{ITER}}.**`) must be the first visible lines — a
+   further reason not to reword or reorder that block. If the
    summary POST fails, fix it and retry until it lands before printing the
    step-8 lines; never print a verdict for a summary that didn't post.
 

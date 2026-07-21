@@ -161,19 +161,28 @@ GitLab (self-hosted: substitute the host):
 glab auth status --hostname <HOST> 2>&1 | head -3
 command -v codex && codex --version 2>&1 | head -1
 command -v claude && claude --version 2>&1 | head -1
-TOKEN="${GITLAB_TOKEN:-$(glab config get token --host <HOST>)}"
-curl -sS -H "PRIVATE-TOKEN: $TOKEN" \
-  "https://<HOST>/api/v4/projects/<URL-ENCODED-SLUG>/merge_requests/<IID>" \
-  | jq '{state, source_branch, title, web_url}'
+# Validate and resolve the target through the orchestrator itself — this
+# rejects malformed or hostile inputs (e.g. userinfo smuggled into the MR
+# URL's authority) before any credential is used anywhere:
+"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --print-config
 ```
 
-(Use `http://` in the curl if the MR URL itself is plain-HTTP. If
-`GITLAB_TOKEN` is unset and `glab config get is_oauth2 --host <HOST>`
-prints `true`, stop: the loop rejects OAuth-backed glab sessions — the
-user must set `GITLAB_TOKEN` to a personal access token.)
+**Never build your own PAT-bearing curl (or raw `glab config get token`
+lookup) in this preflight.** Hand-rolling the request would bypass the
+orchestrator's safeguards: `validate_forge_authority` (a crafted MR URL
+like `https://good.host@attacker.invalid/…` would send the token to the
+attacker's host) and `glab_config_get` (an ambient `OAUTH_TOKEN` /
+`GITLAB_ACCESS_TOKEN` in the environment would shadow the host's
+configured PAT). `run.sh` performs the full validated preflight itself the
+moment it starts — token resolution (env-isolated, host-scoped, rejecting
+OAuth-backed glab sessions with instructions to set a `GITLAB_TOKEN` PAT)
+and the MR fetch — and dies immediately with a clear message on any
+failure, which the monitor in step 5 surfaces.
 
-Bail if forge auth is bad, either CLI is missing, or the PR/MR isn't open
-(GitHub `OPEN` / GitLab `opened`).
+Bail if forge auth is bad, either CLI is missing, or `--print-config`
+rejects the target. MR state (must be `opened`) is enforced by `run.sh`
+itself at launch — treat an immediate exit with "MR is not open" /
+"GitLab auth failed" / "OAuth-backed" as the preflight failure to report.
 
 ### 3. Confirm before posting
 

@@ -19,10 +19,11 @@
 #     legacy no-/-/ form), --host implying gitlab, URL-vs-flag conflicts,
 #     scheme preservation (http MR URLs / scheme-qualified --host),
 #     authority validation (userinfo/path rejection, port + IPv6 acceptance)
-#   - summary-as-completion: resume high-water counts only banner-validated
-#     summary roots (inline notes, replies, and bannerless general notes are
-#     excluded); both turn scripts fail when their iteration summary never
-#     landed
+#   - summary-as-completion: resume high-water counts only STRUCTURAL
+#     summary roots (marker first line, alert + banner first visible);
+#     inline notes, replies, banner-quoting prose, and misplaced markers
+#     are excluded; both turn scripts fail when their iteration summary
+#     never landed
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -162,16 +163,18 @@ case "$*" in
       # Stale-thread shape: only an OLDER iteration's codex summary exists
       # (the current iter's summary POST never landed).
       [[ "${STUB_STALE_CODEX_SUMMARY:-0}" == "1" ]] && CX_ITER=0
-      printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration %s.**\\nStub codex review."}\n' "$CX_ITER" "$CX_ITER"
+      printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration %s.**\\nStub codex review."}\n' "$CX_ITER" "$CX_ITER"
     fi
-    # A tagged top-level note WITHOUT the summary banner — the shape an
+    # A tagged top-level note WITHOUT the summary wrapper — the shape an
     # inline finding takes when it loses its diff position and lands as a
-    # general note. Must never be mistaken for a completed summary.
+    # general note. Its prose QUOTES the banner (as restatements do), so a
+    # substring predicate would wrongly accept it; the structural predicate
+    # must not.
     if [[ "${STUB_BANNERLESS_CODEX_SUMMARY:-0}" == "1" ]]; then
-      printf '{"surface":"issue","id":103,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n**[AI · Codex Reviewer · iter %s] [BLOCKER]**\\nOrphaned inline finding (lost its position)."}\n' "${ITER:-1}" "${ITER:-1}"
+      printf '{"surface":"issue","id":103,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n**[AI · Codex Reviewer · iter %s] [BLOCKER]**\\nOrphaned finding; the summary must open with > [!IMPORTANT] and **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration %s.** as its banner."}\n' "${ITER:-1}" "${ITER:-1}" "${ITER:-1}"
     fi
     if [[ "${STUB_NO_CLAUDE_SUMMARY:-0}" != "1" ]]; then
-      printf '{"surface":"issue","id":102,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:10Z","body":"<!-- ai-loop:claude-implementer iter=%s -->\\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration %s.**\\nStub claude reply."}\n' "${ITER:-1}" "${ITER:-1}"
+      printf '{"surface":"issue","id":102,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:10Z","body":"<!-- ai-loop:claude-implementer iter=%s -->\\n\\n> [!NOTE]\\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration %s.**\\nStub claude reply."}\n' "${ITER:-1}" "${ITER:-1}"
     fi
     ;;
 esac
@@ -229,11 +232,11 @@ case "$method $url" in
     # short (<100), so the pagination loop stops after one fetch.
     cat <<PAYLOAD
 [
- {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration ${ITER:-1}.**\nStub codex review.","position":null}]},
- {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration ${ITER:-1}.**\nStub claude reply.","position":null}]},
+ {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\n\n> [!IMPORTANT]\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration ${ITER:-1}.**\nStub codex review.","position":null}]},
+ {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\n\n> [!NOTE]\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration ${ITER:-1}.**\nStub claude reply.","position":null}]},
  {"id":"disc-inline","notes":[
    {"id":301,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nInline finding.","position":{"new_path":"src/a.c","new_line":12}},
-   {"id":302,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:02Z","body":"<!-- ai-loop:claude-implementer iter=0 -->\nOld reply.","position":{"new_path":"src/a.c","new_line":12}}]},
+   {"id":302,"type":"DiscussionNote","system":false,"created_at":"2026-01-01T00:00:02Z","body":"<!-- ai-loop:claude-implementer iter=0 -->\nOld reply.","position":null}]},
  {"id":"disc-sys","notes":[{"id":401,"type":null,"system":true,"created_at":"2026-01-01T00:00:03Z","body":"added 1 commit"}]},
  {"id":"disc-human","notes":[{"id":501,"type":null,"system":false,"created_at":"2026-01-01T00:00:04Z","body":"human comment"}]}
 ]
@@ -823,19 +826,23 @@ assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafe-cdpath-se
 # a crash after inline-only posts, or a rejected summary POST, must fail the
 # turn instead of advancing the loop past an incomplete review/response.
 
-t "resume high-water: only banner-validated summary roots advance it"
-# iter 1: real summary (issue root + banner) — counts. iter 2: inline note
-# carrying banner text — surface excludes it. iter 3: banner'd reply in a
-# summary thread — root filter excludes it. iter 5: tagged issue ROOT with
-# an inline-style body and no banner (a positioned note that degraded into
-# a general note) — the banner predicate excludes it.
+t "resume high-water: only structural summary roots advance it"
+# iter 1: real summary (issue root, marker first, alert + banner as first
+# visible lines) — counts. iter 2: structurally perfect body but inline
+# surface — excluded. iter 3: structurally perfect body but a reply in a
+# summary thread — excluded. iter 5: tagged issue ROOT whose inline-style
+# prose QUOTES the banner (the shape of a restatement that lost its diff
+# position) — the structural predicate excludes what a substring check
+# would have accepted. iter 6: alert+banner present but the marker is not
+# the first line — excluded.
 HW=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
   . '$ROOT/lib/common.sh'
   fetch_ai_thread() {
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.** y\"}'
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":2,\"surface\":\"inline\",\"in_reply_to_id\":null,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 2.** y\"}'
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":3,\"surface\":\"issue\",\"in_reply_to_id\":201,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 3.** y\"}'
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":5,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"**[AI · Codex Reviewer · iter 5] [BLOCKER]** orphaned inline finding\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=1 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.**\\nSummary text.\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":2,\"surface\":\"inline\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=2 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 2.**\\nSummary text.\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":3,\"surface\":\"issue\",\"in_reply_to_id\":201,\"body\":\"<!-- ai-loop:codex-reviewer iter=3 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 3.**\\nSummary text.\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":5,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=5 -->\\n**[AI · Codex Reviewer · iter 5] [BLOCKER]**\\nRestating: the summary must open with > [!IMPORTANT] and **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 5.** as its banner.\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":6,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"preamble\\n<!-- ai-loop:codex-reviewer iter=6 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 6.**\\nSummary text.\"}'
   }
   latest_ai_comment_iter codex")
 assert_eq "$HW" 1
@@ -919,6 +926,13 @@ t "gitlab thread: reply note chains to the thread root"
 assert_eq "$(jq -r 'select(.id==302) | "\(.in_reply_to_id) \(.tag)"' <<<"$GL_THREAD")" \
           "301 ai-loop:claude-implementer"
 
+t "gitlab thread: unpositioned DiscussionNote reply inherits the root's inline context"
+# GitLab diff-thread replies are DiscussionNote objects with no position of
+# their own; surface/path/line must come from the DiffNote root, or every
+# inline reply degrades to a context-less issue note.
+assert_eq "$(jq -r 'select(.id==302) | "\(.surface) \(.path) \(.line)"' <<<"$GL_THREAD")" \
+          "inline src/a.c 12"
+
 t "gitlab thread: API failure propagates instead of faking an empty thread"
 FAILBIN="$WORK/failcurl"
 mkdir -p "$FAILBIN"
@@ -960,8 +974,31 @@ GLSD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
   "set -euo pipefail; LOOP_HOME='$WORK/sd-home' FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p PR_NUMBER=2; . '$ROOT/lib/common.sh'; ensure_state_dir; printf '%s' \"\$STATE_DIR\"")
 assert_eq "$GLSD" "$WORK/sd-home/state/gl.example__g__p/pr-2"
 
-t "state dir: marker records the full gitlab identity"
-assert_eq "$(cat "$WORK/sd-home/state/gl.example__g__p/pr-2/.repo-slug" 2>/dev/null)" "gitlab gl.example g/p"
+t "state dir: marker records the full gitlab identity (scheme included)"
+assert_eq "$(cat "$WORK/sd-home/state/gl.example__g__p/pr-2/.repo-slug" 2>/dev/null)" "gitlab https://gl.example g/p"
+
+t "state dir: pre-scheme gitlab marker migrates in place (sessions preserved)"
+SD_MIG="$WORK/sd-migrate"
+mkdir -p "$SD_MIG/state/gl.example__g__p/pr-9"
+printf 'gitlab gl.example g/p\n' > "$SD_MIG/state/gl.example__g__p/pr-9/.repo-slug"
+if env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
+  "set -euo pipefail; LOOP_HOME='$SD_MIG' FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=https REPO_SLUG=g/p PR_NUMBER=9; . '$ROOT/lib/common.sh'; ensure_state_dir" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "resume with a pre-scheme marker was rejected instead of migrated"
+fi
+t "state dir: migrated marker carries the scheme-qualified identity"
+assert_eq "$(cat "$SD_MIG/state/gl.example__g__p/pr-9/.repo-slug" 2>/dev/null)" "gitlab https://gl.example g/p"
+
+t "state dir: same host under a different scheme dies (different endpoint)"
+if env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
+  "set -euo pipefail; LOOP_HOME='$WORK/sd-home' FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=http REPO_SLUG=g/p PR_NUMBER=2; . '$ROOT/lib/common.sh'; ensure_state_dir" \
+  >/dev/null 2>&1; then
+  bad "http target silently reused the https target's state dir"
+else
+  ok
+fi
 
 t "state dir: github keeps the legacy layout and marker format"
 GHSD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
@@ -996,11 +1033,43 @@ CLONE_PORT="$WORK/clone-port"
 git init -q "$CLONE_PORT" >/dev/null 2>&1
 git -C "$CLONE_PORT" remote add origin http://gitlab.lab:8929/g/p.git
 if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
-  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:8929 REPO_SLUG=g/p REPO_DIR='$CLONE_PORT'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:8929 FORGE_SCHEME=http REPO_SLUG=g/p REPO_DIR='$CLONE_PORT'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
   >/dev/null 2>&1; then
   ok
 else
   bad "resume on a port-qualified host rejected its own clone"
+fi
+
+t "clone guard: http origin for an https target is a different endpoint"
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:8929 REPO_SLUG=g/p REPO_DIR='$CLONE_PORT'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "http:// origin accepted for an https:// target on the same authority"
+else
+  ok
+fi
+
+t "clone guard: a divergent pushurl is rejected even when the fetch URL matches"
+CLONE_PUSH="$WORK/clone-pushurl"
+git init -q "$CLONE_PUSH" >/dev/null 2>&1
+git -C "$CLONE_PUSH" remote add origin https://github.com/g/r.git
+git -C "$CLONE_PUSH" remote set-url --push origin https://evil.example/g/r.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_PUSH'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "checkout with pushurl to evil.example accepted (push would deliver commits there)"
+else
+  ok
+fi
+
+t "clone guard: a matching explicit pushurl passes"
+git -C "$CLONE_PUSH" remote set-url --push origin https://github.com/g/r.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_PUSH'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "matching explicit pushurl rejected"
 fi
 
 t "clone guard: same hostname on a different HTTP port is a different instance"

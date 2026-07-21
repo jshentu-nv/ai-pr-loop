@@ -39,18 +39,35 @@ FORGE="${FORGE:-github}"
 CODEX_MARKER_TAG="ai-loop:codex-reviewer"
 CLAUDE_MARKER_TAG="ai-loop:claude-implementer"
 
-# Exact banner line every summary comment must carry (see prompts/*: the
-# "> [!IMPORTANT]/[!NOTE]" block right under the marker; the iteration
-# number and closing ".**" complete it per comment). The banner — not just
-# the hidden marker — is what distinguishes a summary from any other tagged
-# top-level note: on GitLab an attempted inline finding that loses its
-# position lands as a general (issue-surface, root) note carrying the same
-# marker, and counting that as a summary would let a turn that crashed
-# before its real summary advance the resume high-water. All three summary
-# consumers (high-water, post-turn verification, claude_turn's extraction)
-# share these prefixes as their predicate.
+# Exact summary wrapper every summary comment must open with (see
+# prompts/*): the bot's marker as the ENTIRE first line, then — blank lines
+# aside — the alert opener and the banner line as the first visible
+# content. The wrapper, not just the hidden marker, is what distinguishes a
+# summary from any other tagged top-level note: on GitLab an attempted
+# inline finding that loses its position lands as a general (issue-surface,
+# root) note carrying the same marker, and counting that as a summary would
+# let a turn that crashed before its real summary advance the resume
+# high-water. All three summary consumers (high-water, post-turn
+# verification, claude_turn's extraction) share the is_summary predicate
+# below.
+CODEX_SUMMARY_ALERT='> [!IMPORTANT]'
+CLAUDE_SUMMARY_ALERT='> [!NOTE]'
 CODEX_SUMMARY_BANNER_PFX='**AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration '
 CLAUDE_SUMMARY_BANNER_PFX='**AUTOMATED REPLY — AI agent (Claude Implementer), iteration '
+
+# jq prelude: the structural summary predicate. Deliberately NOT a
+# substring check — restatement comments legitimately QUOTE the banner in
+# their prose (Codex's own do), so contains() would let a quoted banner in
+# a tagged general note pass as a completed summary. Structure is enforced
+# instead: marker line first, alert + exact banner line as the first
+# visible lines. \r and trailing whitespace are normalized; nothing else.
+AI_SUMMARY_JQ_DEF='
+  def is_summary($m; $alert; $bpfx; $it):
+    (((.body // "") | gsub("\r"; "") | split("\n")) | map(sub("[[:space:]]+$"; ""))) as $l
+    | ($l[0] == "<!-- " + $m + " iter=" + ($it|tostring) + " -->")
+      and (([ $l[1:][] | select(. != "") ])[0:2] ==
+           [$alert, "> " + $bpfx + ($it|tostring) + ".**"]);
+'
 
 CODEX_LABEL="AI · Codex Reviewer"
 CLAUDE_LABEL="AI · Claude Implementer"
@@ -231,49 +248,69 @@ forge_http_authority() {
 # `glab repo clone`) so the loop is self-contained — the caller never has to
 # pre-clone the repo. If $REPO_DIR already holds a different repo, fail rather
 # than mangle it.
+# Validate ONE remote URL of the checkout against the loop's target repo.
+# $1 = the URL, $2 = its role (fetch|push, for messages). Same-slug projects
+# on different forges/hosts are different repositories (github.com/g/p vs
+# gitlab.example/g/p); fetching or pushing this checkout while posting to
+# the other host's PR would mangle both. The comparison is scheme-aware:
+#   - http(s) URL → scheme AND full authority must match (default ports
+#     dropped per scheme on both sides): an HTTP(S) endpoint is identified
+#     by scheme://host:port, so gitlab.lab:8929 vs gitlab.lab:9999 — and
+#     http://gl.example (port 80) vs https://gl.example (port 443) — never
+#     pass as each other.
+#   - ssh/scp/git URL → hostnames only (a transport port is unrelated to
+#     the web port), with the forges' documented alternate ssh endpoints
+#     (ssh.github.com, altssh.gitlab.com) counting as their host, and a
+#     dotless parsed host treated as a ~/.ssh/config alias — unverifiable,
+#     so the slug check has to carry it alone.
+# A mismatch dies: if the URL reaches the right host through an alias or
+# rewrite, point it at the canonical authority, or use a fresh --dir and
+# let the loop clone canonically itself.
+validate_origin_url() {
+  local url="$1" kind="$2"
+  local remote_slug remote_host remote_auth remote_scheme want_host want_auth
+  remote_slug=$(normalize_remote_slug "$url")
+  if [[ -n "$remote_slug" && "$remote_slug" != "$REPO_SLUG" ]]; then
+    die "REPO_DIR=$REPO_DIR origin $kind URL is a clone of '$remote_slug', not '$REPO_SLUG'"
+  fi
+  remote_auth=$(normalize_remote_http_authority "$url")
+  if [[ -n "$remote_auth" ]]; then
+    remote_scheme="${url%%://*}"
+    want_auth=$(forge_http_authority)
+    [[ "${remote_scheme}://${remote_auth}" == "${FORGE_SCHEME:-https}://${want_auth}" ]] \
+      || die "REPO_DIR=$REPO_DIR origin $kind URL points at '${remote_scheme}://${remote_auth}', not '${FORGE_SCHEME:-https}://${want_auth}' — same slug on a different forge/scheme/host/port is a different repository (same instance under another name, e.g. a search-domain short name? point origin at the canonical authority, or use a fresh --dir)"
+  else
+    remote_host=$(normalize_remote_host "$url")
+    want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
+    case "$remote_host" in
+      ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
+        : ;;
+      *.*)
+        die "REPO_DIR=$REPO_DIR origin $kind URL points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
+        ;;
+      *)
+        log "origin $kind host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
+        ;;
+    esac
+  fi
+}
+
 ensure_repo_clone() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    local origin_url remote_slug remote_host remote_auth want_host want_auth
-    origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)
-    remote_slug=$(normalize_remote_slug "$origin_url")
-    if [[ -n "$remote_slug" && "$remote_slug" != "$REPO_SLUG" ]]; then
-      die "REPO_DIR=$REPO_DIR is a clone of '$remote_slug', not '$REPO_SLUG'"
-    fi
-    # Same-slug projects on different forges/hosts are different repositories
-    # (github.com/g/p vs gitlab.example/g/p); fetching/pushing this checkout
-    # while posting to the other host's PR would mangle both. The comparison
-    # is scheme-aware:
-    #   - http(s) origin → the full authority must match (default ports
-    #     dropped on both sides): an HTTP(S) port is part of the instance
-    #     identity, so gitlab.lab:8929 and gitlab.lab:9999 never pass as
-    #     each other.
-    #   - ssh/scp/git origin → hostnames only (a transport port is unrelated
-    #     to the web port), with the forges' documented alternate ssh
-    #     endpoints (ssh.github.com, altssh.gitlab.com) counting as their
-    #     host, and a dotless parsed host treated as a ~/.ssh/config alias —
-    #     unverifiable, so the slug check above has to carry it alone.
-    # A mismatch dies: if origin reaches the right host through an alias or
-    # URL rewrite, point it at the canonical hostname, or use a fresh --dir
-    # and let the loop clone canonically itself.
-    remote_auth=$(normalize_remote_http_authority "$origin_url")
-    if [[ -n "$remote_auth" ]]; then
-      want_auth=$(forge_http_authority)
-      [[ "$remote_auth" == "$want_auth" ]] \
-        || die "REPO_DIR=$REPO_DIR origin points at '$remote_auth', not '$want_auth' — same slug on a different forge/host/port is a different repository (same instance under another name, e.g. a search-domain short name? point origin at the canonical authority, or use a fresh --dir)"
-    else
-      remote_host=$(normalize_remote_host "$origin_url")
-      want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
-      case "$remote_host" in
-        ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
-          : ;;
-        *.*)
-          die "REPO_DIR=$REPO_DIR origin points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
-          ;;
-        *)
-          log "origin host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
-          ;;
-      esac
-    fi
+    local url
+    # Validate every fetch AND push URL of origin: the loop's `git push
+    # origin` honors remote.origin.pushurl (which can differ arbitrarily
+    # from the fetch URL, and can be multi-valued), so a checkout fetching
+    # the right repo but pushing elsewhere would pass a fetch-only check
+    # and then deliver the implementer's commits to the wrong server.
+    # `get-url --push` falls back to the fetch URL when no pushurl is set —
+    # a harmless double-validation.
+    while IFS= read -r url; do
+      [[ -n "$url" ]] && validate_origin_url "$url" fetch
+    done < <(git -C "$REPO_DIR" remote get-url --all origin 2>/dev/null || true)
+    while IFS= read -r url; do
+      [[ -n "$url" ]] && validate_origin_url "$url" push
+    done < <(git -C "$REPO_DIR" remote get-url --push --all origin 2>/dev/null || true)
     log "using existing clone at $REPO_DIR"
     return
   fi
@@ -366,15 +403,21 @@ fetch_ai_thread_github() {
 }
 
 # GitLab: one endpoint carries both surfaces. /discussions groups notes into
-# threads; a DiffNote (has a position) is an inline finding, anything else a
-# top-level MR note. System notes (push/merge events) are skipped. The first
-# note of a thread is its root; later notes map to in_reply_to_id=<root id>.
-# Pagination is manual (curl has no --paginate): fetch 100-per-page until a
-# short page. API failures (curl non-2xx, non-array body) RETURN NON-ZERO
-# rather than ending the loop quietly: a swallowed failure here would make
-# resume detection see an empty thread and restart a live MR at iter 1
-# (double-posting), or silently truncate a >100-note thread mid-pagination —
-# the GitHub path aborts on the equivalent gh failure, and this must too.
+# threads; a thread whose ROOT is a DiffNote (has a position) is an inline
+# discussion, anything else a top-level MR note. Surface, path, and line are
+# computed once from the root and INHERITED by every note in the thread:
+# replies in a diff discussion arrive as unpositioned DiscussionNote objects
+# (and some servers echo DiffNote replies), so classifying each note by its
+# own type/position would strip inline replies of their diff context and
+# misfile them as issue-surface notes. System notes (push/merge events) are
+# skipped. The first note of a thread is its root; later notes map to
+# in_reply_to_id=<root id>. Pagination is manual (curl has no --paginate):
+# fetch 100-per-page until a short page. API failures (curl non-2xx,
+# non-array body) RETURN NON-ZERO rather than ending the loop quietly: a
+# swallowed failure here would make resume detection see an empty thread and
+# restart a live MR at iter 1 (double-posting), or silently truncate a
+# >100-note thread mid-pagination — the GitHub path aborts on the equivalent
+# gh failure, and this must too.
 fetch_ai_thread_gitlab() {
   local page=1 chunk
   while :; do
@@ -384,15 +427,19 @@ fetch_ai_thread_gitlab() {
     jq -c '
       .[]
       | .id as $did
-      | (.notes[0].id) as $root
+      | (.notes[0]) as $rootnote
+      | ($rootnote.id) as $root
+      | (if $rootnote.type == "DiffNote" then "inline" else "issue" end) as $surface
+      | ($rootnote.position.new_path // $rootnote.position.old_path // null) as $path
+      | ($rootnote.position.new_line // $rootnote.position.old_line // null) as $line
       | .notes[]?
       | select((.system // false) | not)
       | select(.body | test("<!-- ai-loop:"))
-      | { surface: (if .type == "DiffNote" then "inline" else "issue" end),
+      | { surface: $surface,
           id: .id,
           discussion_id: $did,
-          path: (.position.new_path // .position.old_path // null),
-          line: (.position.new_line // .position.old_line // null),
+          path: $path,
+          line: $line,
           in_reply_to_id: (if .id == $root then null else $root end),
           created_at, body }' <<<"$chunk"
     (( $(jq 'length' <<<"$chunk") < 100 )) && break
@@ -427,47 +474,49 @@ post_ai_comment() {
 }
 
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
-# A summary is an issue-surface thread ROOT whose body carries the bot's
-# exact summary banner for its own iteration: the summary is each turn's
-# completion contract (posted last, after every inline note), so a turn
-# that crashed after inline-only posts — or whose summary POST was rejected,
-# or whose inline note degraded into a bannerless general note — must not
-# advance the resume high-water. run.sh would otherwise skip the codex turn
-# of an incomplete review (and claude would have no summary to answer).
+# A summary is an issue-surface thread ROOT whose body opens with the bot's
+# structural summary wrapper for its own iteration (is_summary above): the
+# summary is each turn's completion contract (posted last, after every
+# inline note), so a turn that crashed after inline-only posts — or whose
+# summary POST was rejected, or whose inline note degraded into a general
+# note (even one QUOTING the banner in its prose) — must not advance the
+# resume high-water. run.sh would otherwise skip the codex turn of an
+# incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local marker banner
+  local marker alert banner
   case "$tag" in
-    codex)  marker="$CODEX_MARKER_TAG";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown tag: $tag" ;;
   esac
   fetch_ai_thread \
-    | jq -r --arg t "$marker" --arg b "$banner" \
-        'select(.tag==$t and .surface=="issue" and .in_reply_to_id==null)
-         | ($b + (.iter|tostring) + ".**") as $needle
-         | select((.body // "") | contains($needle))
+    | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+        "$AI_SUMMARY_JQ_DEF"'
+         select(.tag==$t and .surface=="issue" and .in_reply_to_id==null)
+         | select(is_summary($t; $a; $b; .iter))
          | .iter' \
     | sort -n | tail -1
 }
 
 # True iff the bot's iteration-$2 summary comment exists on the PR right now
-# (same banner-validated definition as latest_ai_comment_iter). The turn
-# scripts call this after each turn instead of trusting the agent's stdout
-# markers alone: an agent can print its verdict/completion marker even
-# though the summary POST failed, or die after posting only inline notes.
-# A failed thread fetch (or an empty thread) returns non-zero — fail closed.
+# (same structural definition as latest_ai_comment_iter). The turn scripts
+# call this after each turn instead of trusting the agent's stdout markers
+# alone: an agent can print its verdict/completion marker even though the
+# summary POST failed, or die after posting only inline notes. A failed
+# thread fetch (or an empty thread) returns non-zero — fail closed.
 ai_summary_posted() {
-  local who="$1" iter="$2" marker banner
+  local who="$1" iter="$2" marker alert banner
   case "$who" in
-    codex)  marker="$CODEX_MARKER_TAG";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown bot tag: $who" ;;
   esac
   fetch_ai_thread \
-    | jq -es --arg t "$marker" --argjson it "$iter" --arg b "$banner" \
-        'any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
-                  and ((.body // "") | contains($b + ($it|tostring) + ".**")))' \
+    | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
+        "$AI_SUMMARY_JQ_DEF"'
+         any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
+                  and is_summary($t; $a; $b; $it))' \
     >/dev/null
 }
 
@@ -553,12 +602,15 @@ repo_ident_name() {
 
 # Full repo identity for marker files. GitHub keeps the bare slug (the
 # pre-gitlab marker format, so existing state dirs validate unchanged);
-# other forges record forge + host + slug.
+# other forges record forge + scheme://host + slug. The scheme is part of
+# the canonical identity: http://gl.example (port 80) and https://gl.example
+# (port 443) are different endpoints, and the flat directory name alone
+# cannot tell them apart.
 repo_ident() {
   if [[ "${FORGE:-github}" == "github" ]]; then
     printf '%s\n' "$REPO_SLUG"
   else
-    printf '%s %s %s\n' "$FORGE" "$FORGE_HOST" "$REPO_SLUG"
+    printf '%s %s://%s %s\n' "$FORGE" "${FORGE_SCHEME:-https}" "$FORGE_HOST" "$REPO_SLUG"
   fi
 }
 
@@ -569,6 +621,17 @@ ensure_state_dir() {
   want=$(repo_ident)
   if [[ -s "$marker" ]]; then
     owner=$(<"$marker")
+    # Migrate a scheme-less gitlab marker ('gitlab <host> <slug>', written
+    # before the scheme joined the identity) in place when forge, host, and
+    # slug all match: that marker was scheme-blind by construction, so
+    # adopting the current run's scheme is exactly as safe as the code that
+    # wrote it — and preserves the per-PR sessions, context, and history
+    # that cleaning the state dir would discard.
+    if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
+      log "state dir $STATE_DIR: migrating pre-scheme identity marker to '$want'"
+      printf '%s\n' "$want" > "$marker"
+      owner="$want"
+    fi
     [[ "$owner" == "$want" ]] \
       || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
   else
