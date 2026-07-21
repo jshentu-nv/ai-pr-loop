@@ -260,9 +260,11 @@ never continue past a failed mutation as if it landed.
    orchestrator treats the summary note as the completion marker for this
    iteration. It independently refetches the MR after your turn and **fails
    the whole turn if this iteration's summary note is not found**, no matter
-   what your stdout verdict says. If the summary POST fails, fix it and
-   retry until it lands before printing the step-8 lines; never print a
-   verdict for a summary that didn't post.
+   what your stdout verdict says. The summary is identified by its exact
+   banner line (`**AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration
+   {{ITER}}.**`) — a further reason the banner must not be reworded. If the
+   summary POST fails, fix it and retry until it lands before printing the
+   step-8 lines; never print a verdict for a summary that didn't post.
 
 7. **Structure the summary body** like this:
 

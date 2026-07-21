@@ -124,7 +124,11 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
   sessions are rejected at preflight, because their tokens are only valid
   as a `Bearer` header and expire mid-loop while everything here sends
   `PRIVATE-TOKEN`). The token needs `api` scope, plus push access to the
-  MR's source branch.
+  MR's source branch. `GITLAB_TOKEN` is the **only** environment credential
+  honored: glab's other token env vars (`GITLAB_ACCESS_TOKEN`,
+  `OAUTH_TOKEN`) are explicitly cleared when reading the glab config, so an
+  ambient token minted for some other host can't masquerade as this host's
+  PAT.
 - All GitLab REST calls — the orchestrator's and the agents' — go through
   `curl` with a `PRIVATE-TOKEN` header, **not** `glab api`: `glab api`
   silently drops `position[...]` payloads when posting inline (line-anchored)
@@ -153,7 +157,11 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
   First-use managed clones of an HTTP-only host use plain
   `git clone http://…` (glab can't be steered to HTTP), so a private repo
   needs ambient git credentials for that host — the same requirement as
-  the loop's headless pushes. A glab `api_host`/`api_protocol` config
+  the loop's headless pushes. For HTTP(S) origins the checkout guard
+  matches the **full authority** (`host:port`, default ports collapsed):
+  a `--dir` clone whose origin uses a different name for the same instance
+  (e.g. a search-domain short name like `http://gitlab/…`) is rejected —
+  point the remote at the canonical authority the MR URL uses. A glab `api_host`/`api_protocol` config
   pointing the API at a *different* host than the web UI is not supported;
   the API is always `<scheme>://<MR host>/api/v4`.
 
@@ -362,11 +370,14 @@ comments and continues from the high-water mark:
 | Codex iter K but no Claude reply | Run claude at iter K first, then continue from K+1. |
 | Codex APPROVED at iter K, new commits since | Plain re-run is a no-op. Pass `--restart` to start a new round at iter K+1, codex first. |
 
-Only each bot's **summary** comment counts toward the high-water mark: the
-summary is a turn's completion contract (posted last, after every inline
-comment, and re-verified by the orchestrator after each turn), so a turn
-that died after inline-only posts — or whose summary POST failed — is
-re-run at the same iteration instead of being skipped past.
+Only each bot's **summary** comment counts toward the high-water mark,
+identified by its exact banner line (not just the hidden marker — a tagged
+note without the banner, e.g. an inline finding that lost its diff
+position and landed as a general note, doesn't count): the summary is a
+turn's completion contract (posted last, after every inline comment, and
+re-verified by the orchestrator after each turn), so a turn that died
+after inline-only posts — or whose summary POST failed — is re-run at the
+same iteration instead of being skipped past.
 
 Per-PR session ids for both agents are stored under
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`

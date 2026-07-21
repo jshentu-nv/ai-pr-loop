@@ -271,6 +271,10 @@ case "$FORGE" in
     ;;
   *) die "--forge must be github or gitlab (got: $FORGE)" ;;
 esac
+# The resolved authority goes verbatim into every API URL both here and in
+# the agents' prompts — reject anything that isn't host[:port] (userinfo in
+# a crafted MR link would redirect PAT-bearing calls to another server).
+validate_forge_authority "$FORGE_HOST"
 if [[ "$FORGE_SCHEME" == "http" ]]; then
   log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
 fi

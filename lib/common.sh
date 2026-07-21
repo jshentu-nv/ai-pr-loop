@@ -39,6 +39,19 @@ FORGE="${FORGE:-github}"
 CODEX_MARKER_TAG="ai-loop:codex-reviewer"
 CLAUDE_MARKER_TAG="ai-loop:claude-implementer"
 
+# Exact banner line every summary comment must carry (see prompts/*: the
+# "> [!IMPORTANT]/[!NOTE]" block right under the marker; the iteration
+# number and closing ".**" complete it per comment). The banner — not just
+# the hidden marker — is what distinguishes a summary from any other tagged
+# top-level note: on GitLab an attempted inline finding that loses its
+# position lands as a general (issue-surface, root) note carrying the same
+# marker, and counting that as a summary would let a turn that crashed
+# before its real summary advance the resume high-water. All three summary
+# consumers (high-water, post-turn verification, claude_turn's extraction)
+# share these prefixes as their predicate.
+CODEX_SUMMARY_BANNER_PFX='**AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration '
+CLAUDE_SUMMARY_BANNER_PFX='**AUTOMATED REPLY — AI agent (Claude Implementer), iteration '
+
 CODEX_LABEL="AI · Codex Reviewer"
 CLAUDE_LABEL="AI · Claude Implementer"
 
@@ -54,6 +67,19 @@ die()  { log "ERROR: $*"; exit 1; }
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# Read a host-scoped glab config value with glab's token environment
+# overrides (GITLAB_TOKEN / GITLAB_ACCESS_TOKEN / OAUTH_TOKEN) cleared: glab
+# lets any of those shadow every host's configured token, so an ambient
+# OAUTH_TOKEN minted for some other host would otherwise be returned as this
+# host's "token" — sailing past the is_oauth2 guard (whose config value says
+# false) and then being sent as a PRIVATE-TOKEN it was never meant to be.
+# The loop's only supported environment credential is GITLAB_TOKEN, which
+# preflight consumes before ever reaching the glab-config fallback.
+glab_config_get() {
+  env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN \
+    glab config get "$1" --host "$FORGE_HOST" 2>/dev/null
 }
 
 preflight() {
@@ -86,11 +112,10 @@ preflight() {
       # Detect that configuration and reject it with instructions rather
       # than failing obscurely on /user (or hours later on token expiry).
       if [[ -z "${GITLAB_TOKEN:-}" ]]; then
-        if [[ "$(glab config get is_oauth2 --host "$FORGE_HOST" 2>/dev/null)" == "true" ]]; then
+        if [[ "$(glab_config_get is_oauth2)" == "true" ]]; then
           die "glab session for $FORGE_HOST is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
         fi
-        GITLAB_TOKEN=$(glab config get token --host "$FORGE_HOST" 2>/dev/null) \
-          || GITLAB_TOKEN=''
+        GITLAB_TOKEN=$(glab_config_get token) || GITLAB_TOKEN=''
       fi
       [[ -n "${GITLAB_TOKEN:-}" ]] \
         || die "no GitLab token for $FORGE_HOST: set GITLAB_TOKEN or run 'glab auth login --hostname $FORGE_HOST'"
@@ -118,6 +143,24 @@ preflight() {
 # strips through the first :.
 normalize_remote_slug() {
   sed -E 's#^ssh://git@[^/]+/##; s#^git@[^:/]+:##; s#^https?://[^/]+/##; s#\.git$##; s#^/##' <<<"$1"
+}
+
+# Validate a forge authority before it is ever embedded in an API URL: a
+# bare hostname (dot-separated alphanumeric/hyphen labels) or a bracketed
+# IPv6 literal, plus an optional numeric port — nothing else. The authority
+# is captured from a user-supplied MR URL / --host and pasted verbatim into
+# every curl target, so URL-grammar tricks must die here: in
+# https://gitlab.example.com@attacker.invalid/g/p/-/merge_requests/1 the
+# "host" segment parses as gitlab.example.com@attacker.invalid, which curl
+# reads as userinfo@attacker.invalid — a crafted MR link would send the
+# PRIVATE-TOKEN header (the PAT) to the attacker's server.
+validate_forge_authority() {
+  local a="$1"
+  # Labels admit underscores (common on intranet DNS, harmless here) and a
+  # single trailing dot (an absolute FQDN) — neither can smuggle userinfo
+  # or path characters.
+  [[ "$a" =~ ^([A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?)*\.?|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$ ]] \
+    || die "invalid forge host '$a' — expected host[:port] (userinfo, paths, or other URL characters are not allowed)"
 }
 
 # Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
@@ -152,6 +195,37 @@ normalize_remote_host() {
   esac
 }
 
+# Authority (host[:port], userinfo stripped, the scheme's default port
+# dropped) of an http(s) git remote; prints nothing for any other transport.
+# Unlike ssh — where the transport port is unrelated to the web port — an
+# HTTP(S) port is part of the instance identity: gitlab.lab:8929 and
+# gitlab.lab:9999 are different GitLabs.
+normalize_remote_http_authority() {
+  local url="$1" scheme authority
+  case "$url" in
+    http://*)  scheme=http  ;;
+    https://*) scheme=https ;;
+    *) return 0 ;;
+  esac
+  authority="${url#*://}"; authority="${authority%%/*}"; authority="${authority#*@}"
+  case "$scheme" in
+    http)  authority="${authority%:80}"  ;;
+    https) authority="${authority%:443}" ;;
+  esac
+  printf '%s\n' "$authority"
+}
+
+# $FORGE_HOST normalized the same way (the $FORGE_SCHEME default port
+# dropped), so the two sides of the http(s) authority comparison agree.
+forge_http_authority() {
+  local a="$FORGE_HOST"
+  case "${FORGE_SCHEME:-https}" in
+    http)  a="${a%:80}"  ;;
+    https) a="${a%:443}" ;;
+  esac
+  printf '%s\n' "$a"
+}
+
 # Ensure $REPO_DIR contains a clone of $REPO_SLUG. If it doesn't exist (or is
 # an empty directory), clone via the forge CLI (`gh repo clone` /
 # `glab repo clone`) so the loop is self-contained — the caller never has to
@@ -159,35 +233,47 @@ normalize_remote_host() {
 # than mangle it.
 ensure_repo_clone() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    local origin_url remote_slug remote_host want_host
+    local origin_url remote_slug remote_host remote_auth want_host want_auth
     origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)
     remote_slug=$(normalize_remote_slug "$origin_url")
-    remote_host=$(normalize_remote_host "$origin_url")
     if [[ -n "$remote_slug" && "$remote_slug" != "$REPO_SLUG" ]]; then
       die "REPO_DIR=$REPO_DIR is a clone of '$remote_slug', not '$REPO_SLUG'"
     fi
     # Same-slug projects on different forges/hosts are different repositories
     # (github.com/g/p vs gitlab.example/g/p); fetching/pushing this checkout
-    # while posting to the other host's PR would mangle both. Hosts compare
-    # with ports stripped (an instance's ssh port differs from its web port),
-    # and the forges' documented alternate ssh endpoints (ssh.github.com,
-    # altssh.gitlab.com) count as their host. A parsed host without a dot is
-    # almost certainly a ~/.ssh/config alias — unverifiable, so the slug
-    # check above has to carry it alone. A dotted mismatch dies: if origin
-    # reaches the right host through an alias or URL rewrite, point it at
-    # the canonical hostname, or use a fresh --dir and let the loop clone
-    # canonically itself.
-    want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
-    case "$remote_host" in
-      ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
-        : ;;
-      *.*)
-        die "REPO_DIR=$REPO_DIR origin points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
-        ;;
-      *)
-        log "origin host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
-        ;;
-    esac
+    # while posting to the other host's PR would mangle both. The comparison
+    # is scheme-aware:
+    #   - http(s) origin → the full authority must match (default ports
+    #     dropped on both sides): an HTTP(S) port is part of the instance
+    #     identity, so gitlab.lab:8929 and gitlab.lab:9999 never pass as
+    #     each other.
+    #   - ssh/scp/git origin → hostnames only (a transport port is unrelated
+    #     to the web port), with the forges' documented alternate ssh
+    #     endpoints (ssh.github.com, altssh.gitlab.com) counting as their
+    #     host, and a dotless parsed host treated as a ~/.ssh/config alias —
+    #     unverifiable, so the slug check above has to carry it alone.
+    # A mismatch dies: if origin reaches the right host through an alias or
+    # URL rewrite, point it at the canonical hostname, or use a fresh --dir
+    # and let the loop clone canonically itself.
+    remote_auth=$(normalize_remote_http_authority "$origin_url")
+    if [[ -n "$remote_auth" ]]; then
+      want_auth=$(forge_http_authority)
+      [[ "$remote_auth" == "$want_auth" ]] \
+        || die "REPO_DIR=$REPO_DIR origin points at '$remote_auth', not '$want_auth' — same slug on a different forge/host/port is a different repository (same instance under another name, e.g. a search-domain short name? point origin at the canonical authority, or use a fresh --dir)"
+    else
+      remote_host=$(normalize_remote_host "$origin_url")
+      want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
+      case "$remote_host" in
+        ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
+          : ;;
+        *.*)
+          die "REPO_DIR=$REPO_DIR origin points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
+          ;;
+        *)
+          log "origin host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
+          ;;
+      esac
+    fi
     log "using existing clone at $REPO_DIR"
     return
   fi
@@ -341,42 +427,47 @@ post_ai_comment() {
 }
 
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
-# Only issue-surface thread ROOTS count: the summary is each turn's
-# completion contract (posted last, after every inline note), so a turn that
-# crashed after inline-only posts — or whose summary POST was rejected —
-# must not advance the resume high-water. Counting inline notes here would
-# make run.sh skip the codex turn of an incomplete review (and claude would
-# then have no summary to answer).
+# A summary is an issue-surface thread ROOT whose body carries the bot's
+# exact summary banner for its own iteration: the summary is each turn's
+# completion contract (posted last, after every inline note), so a turn
+# that crashed after inline-only posts — or whose summary POST was rejected,
+# or whose inline note degraded into a bannerless general note — must not
+# advance the resume high-water. run.sh would otherwise skip the codex turn
+# of an incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local marker
+  local marker banner
   case "$tag" in
-    codex)  marker="$CODEX_MARKER_TAG"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG" ;;
+    codex)  marker="$CODEX_MARKER_TAG";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown tag: $tag" ;;
   esac
   fetch_ai_thread \
-    | jq -r --arg t "$marker" \
-        'select(.tag==$t and .surface=="issue" and .in_reply_to_id==null) | .iter' \
+    | jq -r --arg t "$marker" --arg b "$banner" \
+        'select(.tag==$t and .surface=="issue" and .in_reply_to_id==null)
+         | ($b + (.iter|tostring) + ".**") as $needle
+         | select((.body // "") | contains($needle))
+         | .iter' \
     | sort -n | tail -1
 }
 
 # True iff the bot's iteration-$2 summary comment exists on the PR right now
-# (same summary definition as latest_ai_comment_iter). The turn scripts call
-# this after each turn instead of trusting the agent's stdout markers alone:
-# an agent can print its verdict/completion marker even though the summary
-# POST failed, or die after posting only inline notes. A failed thread fetch
-# (or an empty thread) returns non-zero — fail closed.
+# (same banner-validated definition as latest_ai_comment_iter). The turn
+# scripts call this after each turn instead of trusting the agent's stdout
+# markers alone: an agent can print its verdict/completion marker even
+# though the summary POST failed, or die after posting only inline notes.
+# A failed thread fetch (or an empty thread) returns non-zero — fail closed.
 ai_summary_posted() {
-  local who="$1" iter="$2" marker
+  local who="$1" iter="$2" marker banner
   case "$who" in
-    codex)  marker="$CODEX_MARKER_TAG"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG" ;;
+    codex)  marker="$CODEX_MARKER_TAG";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown bot tag: $who" ;;
   esac
   fetch_ai_thread \
-    | jq -es --arg t "$marker" --argjson it "$iter" \
-        'any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)' \
+    | jq -es --arg t "$marker" --argjson it "$iter" --arg b "$banner" \
+        'any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
+                  and ((.body // "") | contains($b + ($it|tostring) + ".**")))' \
     >/dev/null
 }
 

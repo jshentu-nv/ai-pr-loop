@@ -217,9 +217,11 @@ of the loop (max {{MAX_ITER}}).
    succeeds — the orchestrator treats the summary comment as the
    completion marker for this iteration. It independently refetches the PR
    after your turn and **fails the whole turn if this iteration's summary
-   comment is not found**, no matter what your stdout verdict says. If the
-   summary POST fails, fix it and retry until it lands before printing the
-   verdict lines.
+   comment is not found**, no matter what your stdout verdict says. The
+   summary is identified by its exact banner line (`**AUTOMATED REVIEW —
+   AI agent (Codex Reviewer), iteration {{ITER}}.**`) — a further reason
+   the banner must not be reworded. If the summary POST fails, fix it and
+   retry until it lands before printing the verdict lines.
 
 7. **Structure the summary body** like this:
 

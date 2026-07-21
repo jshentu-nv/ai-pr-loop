@@ -24,8 +24,15 @@ fetch_ai_thread > "$THREAD_FILE" || true
 LATEST_REVIEW_FILE="$ID/codex-review.md"
 LATEST_INLINE_FILE="$ID/codex-inline.ndjson"
 
-jq -r --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
-    select(.tag==$t and .iter==$it and .surface=="issue") | .body' \
+# Same banner-validated summary predicate as latest_ai_comment_iter /
+# ai_summary_posted: a tagged general note without the summary banner (e.g.
+# an inline finding that lost its position) must not be mistaken for the
+# review to answer.
+jq -r --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" \
+   --arg b "$CODEX_SUMMARY_BANNER_PFX" '
+    select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
+    | select((.body // "") | contains($b + ($it|tostring) + ".**"))
+    | .body' \
     "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
 
 jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '

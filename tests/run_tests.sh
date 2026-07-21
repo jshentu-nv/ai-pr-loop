@@ -17,9 +17,12 @@
 #     precedence)
 #   - forge resolution: PR/MR URL parsing (github / gitlab.com / self-hosted /
 #     legacy no-/-/ form), --host implying gitlab, URL-vs-flag conflicts,
-#     scheme preservation (http MR URLs / scheme-qualified --host)
-#   - summary-as-completion: resume high-water ignores inline-only iters;
-#     both turn scripts fail when their iteration summary never landed
+#     scheme preservation (http MR URLs / scheme-qualified --host),
+#     authority validation (userinfo/path rejection, port + IPv6 acceptance)
+#   - summary-as-completion: resume high-water counts only banner-validated
+#     summary roots (inline notes, replies, and bannerless general notes are
+#     excluded); both turn scripts fail when their iteration summary never
+#     landed
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -159,10 +162,16 @@ case "$*" in
       # Stale-thread shape: only an OLDER iteration's codex summary exists
       # (the current iter's summary POST never landed).
       [[ "${STUB_STALE_CODEX_SUMMARY:-0}" == "1" ]] && CX_ITER=0
-      printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\nStub codex review."}\n' "$CX_ITER"
+      printf '{"surface":"issue","id":101,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration %s.**\\nStub codex review."}\n' "$CX_ITER" "$CX_ITER"
+    fi
+    # A tagged top-level note WITHOUT the summary banner — the shape an
+    # inline finding takes when it loses its diff position and lands as a
+    # general note. Must never be mistaken for a completed summary.
+    if [[ "${STUB_BANNERLESS_CODEX_SUMMARY:-0}" == "1" ]]; then
+      printf '{"surface":"issue","id":103,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=%s -->\\n**[AI · Codex Reviewer · iter %s] [BLOCKER]**\\nOrphaned inline finding (lost its position)."}\n' "${ITER:-1}" "${ITER:-1}"
     fi
     if [[ "${STUB_NO_CLAUDE_SUMMARY:-0}" != "1" ]]; then
-      printf '{"surface":"issue","id":102,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:10Z","body":"<!-- ai-loop:claude-implementer iter=%s -->\\nStub claude reply."}\n' "${ITER:-1}"
+      printf '{"surface":"issue","id":102,"path":null,"line":null,"in_reply_to_id":null,"created_at":"2026-01-01T00:00:10Z","body":"<!-- ai-loop:claude-implementer iter=%s -->\\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration %s.**\\nStub claude reply."}\n' "${ITER:-1}" "${ITER:-1}"
     fi
     ;;
 esac
@@ -173,6 +182,13 @@ cat > "$STUBS/glab" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
   "config get token --host "*)
+    # Emulate glab's env precedence: any ambient token env var shadows the
+    # host-scoped config value (the exact behavior glab_config_get defuses
+    # by clearing these before invoking glab).
+    if [[ -n "${GITLAB_TOKEN:-}${GITLAB_ACCESS_TOKEN:-}${OAUTH_TOKEN:-}" ]]; then
+      echo "${GITLAB_TOKEN:-${GITLAB_ACCESS_TOKEN:-$OAUTH_TOKEN}}"
+      exit 0
+    fi
     if [[ "${STUB_GLAB_NO_TOKEN:-0}" == "1" ]]; then exit 1; fi
     echo "stub-glab-token"
     ;;
@@ -189,17 +205,19 @@ EOF
 # $CURL_LOG when set ("METHOD URL BODY", body read from --data @-).
 cat > "$STUBS/curl" <<'EOF'
 #!/usr/bin/env bash
-url=''; method=GET; body=''; prev=''
+url=''; method=GET; body=''; prev=''; hdrs=()
 for a in "$@"; do
   case "$prev" in
     -X)     method="$a" ;;
     --data) body="$a" ;;
+    -H)     hdrs+=("$a") ;;
   esac
   [[ "$a" == http://* || "$a" == https://* ]] && url="$a"
   prev="$a"
 done
 if [[ "$body" == "@-" || "$body" == "-" ]]; then body="$(cat)"; fi
 [[ -n "${CURL_LOG:-}" ]] && printf '%s %s %s\n' "$method" "$url" "$body" >> "$CURL_LOG"
+[[ -n "${CURL_HDR_LOG:-}" ]] && printf '%s\n' ${hdrs[@]+"${hdrs[@]}"} >> "$CURL_HDR_LOG"
 case "$method $url" in
   "GET "*"/api/v4/user")
     echo '{"username":"testuser"}'
@@ -211,8 +229,8 @@ case "$method $url" in
     # short (<100), so the pagination loop stops after one fetch.
     cat <<PAYLOAD
 [
- {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nStub codex review.","position":null}]},
- {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\nStub claude reply.","position":null}]},
+ {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration ${ITER:-1}.**\nStub codex review.","position":null}]},
+ {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration ${ITER:-1}.**\nStub claude reply.","position":null}]},
  {"id":"disc-inline","notes":[
    {"id":301,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nInline finding.","position":{"new_path":"src/a.c","new_line":12}},
    {"id":302,"type":"DiffNote","system":false,"created_at":"2026-01-01T00:00:02Z","body":"<!-- ai-loop:claude-implementer iter=0 -->\nOld reply.","position":{"new_path":"src/a.c","new_line":12}}]},
@@ -331,6 +349,15 @@ t "host: local path yields nothing (unknown, not validated)"
 assert_eq "$(normalize_remote_host '/srv/git/mirror.git')" ""
 t "host: port stripped from a plain host string"
 assert_eq "$(host_sans_port 'gitlab.lab:8929')" gitlab.lab
+
+t "authority: http remote keeps its non-default port"
+assert_eq "$(normalize_remote_http_authority 'http://gitlab.lab:8929/g/p.git')" gitlab.lab:8929
+t "authority: https remote drops an explicit default port"
+assert_eq "$(normalize_remote_http_authority 'https://gl.example:443/g/p.git')" gl.example
+t "authority: userinfo is stripped"
+assert_eq "$(normalize_remote_http_authority 'https://user@gl.example/g/p.git')" gl.example
+t "authority: ssh remote yields nothing (hostname comparison instead)"
+assert_eq "$(normalize_remote_http_authority 'ssh://git@gl.example:2222/g/p.git')" ""
 
 # --- run_with_timeout -------------------------------------------------------
 # The probe watchdog must be portable: GNU timeout, gtimeout (brew coreutils
@@ -796,13 +823,19 @@ assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafe-cdpath-se
 # a crash after inline-only posts, or a rejected summary POST, must fail the
 # turn instead of advancing the loop past an incomplete review/response.
 
-t "resume high-water: inline-only iterations don't advance it"
+t "resume high-water: only banner-validated summary roots advance it"
+# iter 1: real summary (issue root + banner) — counts. iter 2: inline note
+# carrying banner text — surface excludes it. iter 3: banner'd reply in a
+# summary thread — root filter excludes it. iter 5: tagged issue ROOT with
+# an inline-style body and no banner (a positioned note that degraded into
+# a general note) — the banner predicate excludes it.
 HW=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
   . '$ROOT/lib/common.sh'
   fetch_ai_thread() {
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null}'
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":2,\"surface\":\"inline\",\"in_reply_to_id\":null}'
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":3,\"surface\":\"issue\",\"in_reply_to_id\":201}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.** y\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":2,\"surface\":\"inline\",\"in_reply_to_id\":null,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 2.** y\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":3,\"surface\":\"issue\",\"in_reply_to_id\":201,\"body\":\"x **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 3.** y\"}'
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":5,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"**[AI · Codex Reviewer · iter 5] [BLOCKER]** orphaned inline finding\"}'
   }
   latest_ai_comment_iter codex")
 assert_eq "$HW" 1
@@ -810,6 +843,11 @@ assert_eq "$HW" 1
 t "codex: turn fails when its summary never landed despite an APPROVED stdout"
 new_case codex-no-summary
 run_turn codex STUB_NO_CODEX_SUMMARY=1
+assert_eq "$TURN_RC" 1
+
+t "codex: a tagged general note without the summary banner is not a completed turn"
+new_case codex-bannerless
+run_turn codex STUB_NO_CODEX_SUMMARY=1 STUB_BANNERLESS_CODEX_SUMMARY=1
 assert_eq "$TURN_RC" 1
 t "codex: no verdict is recorded for a summary-less turn"
 if [[ -e "$CASE_DIR/state/iter-01/verdict" ]]; then
@@ -840,6 +878,16 @@ assert_eq "$TURN_RC" 1
 t "claude: the stale-review die happens before any claude invocation"
 if [[ -e "$ARGV" ]]; then
   bad "claude was invoked despite only a stale (iter-0) codex summary being present"
+else
+  ok
+fi
+
+t "claude: a bannerless codex general note is not answered as the review"
+new_case claude-bannerless-review
+run_turn claude STUB_NO_CODEX_SUMMARY=1 STUB_BANNERLESS_CODEX_SUMMARY=1
+assert_eq "$TURN_RC" 1
+if [[ -e "$ARGV" ]]; then
+  bad "claude was invoked with an orphaned inline note as its review"
 else
   ok
 fi
@@ -953,6 +1001,30 @@ if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
   ok
 else
   bad "resume on a port-qualified host rejected its own clone"
+fi
+
+t "clone guard: same hostname on a different HTTP port is a different instance"
+CLONE_PORT2="$WORK/clone-port2"
+git init -q "$CLONE_PORT2" >/dev/null 2>&1
+git -C "$CLONE_PORT2" remote add origin http://gitlab.lab:8929/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:9999 FORGE_SCHEME=http REPO_SLUG=g/p REPO_DIR='$CLONE_PORT2'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "clone of gitlab.lab:8929 accepted for the gitlab.lab:9999 instance"
+else
+  ok
+fi
+
+t "clone guard: explicit https default port equals the bare host"
+CLONE_443="$WORK/clone-443"
+git init -q "$CLONE_443" >/dev/null 2>&1
+git -C "$CLONE_443" remote add origin https://gl.example:443/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_443'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "https origin with explicit :443 rejected for the bare host"
 fi
 
 t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
@@ -1157,6 +1229,18 @@ t "run.sh: explicit GITLAB_TOKEN bypasses the glab OAuth check"
 run_run_sh GITLAB_TOKEN=pat STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab --dir "$WORK/glclone-oauth"
 assert_dies_with "MR is not open"
 
+t "run.sh: ambient OAUTH_TOKEN cannot shadow the host's configured PAT"
+OAUTH_HDR_LOG="$WORK/oauth-hdr.log"
+run_run_sh OAUTH_TOKEN=oauth-foreign CURL_HDR_LOG="$OAUTH_HDR_LOG" 1 --repo g/p --forge gitlab --dir "$WORK/glclone-shadow"
+assert_dies_with "MR is not open"
+t "run.sh: the PRIVATE-TOKEN sent is the config PAT, not the ambient OAuth token"
+if grep -q 'PRIVATE-TOKEN: stub-glab-token' "$OAUTH_HDR_LOG" 2>/dev/null \
+   && ! grep -q 'oauth-foreign' "$OAUTH_HDR_LOG" 2>/dev/null; then
+  ok
+else
+  bad "ambient OAUTH_TOKEN leaked into the API calls (hdrs: $(sort -u "$OAUTH_HDR_LOG" 2>/dev/null | tr '\n' ' '))"
+fi
+
 t "run.sh: http MR URL preserves the scheme"
 run_run_sh http://gl.example/g/p/-/merge_requests/9 --print-config
 assert_prints 'forge: gitlab host=gl.example scheme=http repo=g/p pr=9'
@@ -1168,6 +1252,38 @@ assert_prints 'forge: gitlab host=gitlab.lab scheme=http repo=g/p pr=3'
 t "run.sh: --host scheme conflicting with the URL scheme dies"
 run_run_sh https://gl.example/g/p/-/merge_requests/9 --host http://gl.example --print-config
 assert_dies_with "conflicts with the URL scheme"
+
+# Authority validation: the resolved host goes verbatim into every curl
+# target, so URL-grammar tricks (userinfo, paths) must die before any use —
+# https://good.host@attacker.invalid/... would otherwise send the PAT to
+# attacker.invalid.
+t "run.sh: MR URL with userinfo in the authority is rejected (PAT exfiltration)"
+run_run_sh 'https://gitlab.example.com@attacker.invalid/g/p/-/merge_requests/1' --print-config
+assert_dies_with "invalid forge host"
+
+t "run.sh: --host with userinfo is rejected"
+run_run_sh 1 --repo g/p --host 'good.host@attacker.invalid' --print-config
+assert_dies_with "invalid forge host"
+
+t "run.sh: --host with a path is rejected"
+run_run_sh 1 --repo g/p --host 'gl.example/evil' --print-config
+assert_dies_with "invalid forge host"
+
+t "run.sh: port-qualified --host passes validation"
+run_run_sh 3 --repo g/p --host gitlab.lab:8929 --print-config
+assert_prints 'forge: gitlab host=gitlab.lab:8929 scheme=https repo=g/p pr=3'
+
+t "run.sh: bracketed IPv6 --host passes validation"
+run_run_sh 3 --repo g/p --host '[::1]:8443' --print-config
+assert_prints 'forge: gitlab host=[::1]:8443 scheme=https repo=g/p pr=3'
+
+t "run.sh: underscore intranet hostname passes validation"
+run_run_sh 3 --repo g/p --host gitlab_master.corp --print-config
+assert_prints 'forge: gitlab host=gitlab_master.corp scheme=https repo=g/p pr=3'
+
+t "run.sh: trailing-dot absolute FQDN passes validation"
+run_run_sh 3 --repo g/p --host gitlab.example.com. --print-config
+assert_prints 'forge: gitlab host=gitlab.example.com. scheme=https repo=g/p pr=3'
 
 t "run.sh: http URL reaches the API on http (actual curl target)"
 HTTP_CURL_LOG="$WORK/http-curl.log"

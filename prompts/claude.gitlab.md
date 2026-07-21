@@ -150,8 +150,11 @@ past a failed mutation as if it landed.
    orchestrator treats the summary note as the completion marker for
    this iteration. It independently refetches the MR after your turn and
    **fails the whole turn if this iteration's summary note is not found**,
-   even when your stdout printed the completion marker. If the summary POST
-   fails, fix it and retry until it lands.
+   even when your stdout printed the completion marker. The summary is
+   identified by its exact banner line (`**AUTOMATED REPLY — AI agent
+   (Claude Implementer), iteration {{ITER}}.**`) — a further reason the
+   banner must not be reworded. If the summary POST fails, fix it and retry
+   until it lands.
 
 6. **Structure the summary body** like this:
 
