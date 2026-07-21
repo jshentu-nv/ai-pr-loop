@@ -188,15 +188,18 @@ case "$*" in
     # Emulate glab's env precedence: any ambient token env var shadows the
     # host-scoped config value (the exact behavior glab_config_get defuses
     # by clearing these before invoking glab).
-    if [[ -n "${GITLAB_TOKEN:-}${GITLAB_ACCESS_TOKEN:-}${OAUTH_TOKEN:-}" ]]; then
-      echo "${GITLAB_TOKEN:-${GITLAB_ACCESS_TOKEN:-$OAUTH_TOKEN}}"
+    if [[ -n "${GITLAB_TOKEN:-}${GITLAB_ACCESS_TOKEN:-}${OAUTH_TOKEN:-}${GLAB_TOKEN:-}" ]]; then
+      echo "${GITLAB_TOKEN:-${GITLAB_ACCESS_TOKEN:-${OAUTH_TOKEN:-$GLAB_TOKEN}}}"
       exit 0
     fi
     if [[ "${STUB_GLAB_NO_TOKEN:-0}" == "1" ]]; then exit 1; fi
     echo "stub-glab-token"
     ;;
   "config get is_oauth2 --host "*)
-    echo "${STUB_GLAB_OAUTH:-false}"
+    # Emulate glab's generic env-override precedence for config keys:
+    # GLAB_IS_OAUTH2 / GITLAB_IS_OAUTH2 shadow the stored per-host value
+    # unless cleared.
+    echo "${GLAB_IS_OAUTH2:-${GITLAB_IS_OAUTH2:-${STUB_GLAB_OAUTH:-false}}}"
     ;;
   "repo clone "*)
     :
@@ -334,6 +337,16 @@ t "slug: ssh:// remote with a port"
 assert_eq "$(normalize_remote_slug 'ssh://git@gitlab.example.com:2222/g/p.git')" g/p
 t "slug: scp-style gitlab remote with subgroups"
 assert_eq "$(normalize_remote_slug 'git@gitlab-master.example.com:group/sub/proj.git')" group/sub/proj
+t "slug: userless scp-style remote"
+assert_eq "$(normalize_remote_slug 'github.com:o/r.git')" o/r
+t "slug: scp-style remote with a non-git user"
+assert_eq "$(normalize_remote_slug 'alice@gitlab.example.com:g/p.git')" g/p
+t "slug: ssh:// remote without a user"
+assert_eq "$(normalize_remote_slug 'ssh://gitlab.example.com/g/p.git')" g/p
+t "slug: file:// URL keeps its scheme (mismatch caught by slug check)"
+assert_eq "$(normalize_remote_slug 'file:///g/p.git')" "file:///g/p"
+t "slug: relative local path keeps its path (mismatch caught by slug check)"
+assert_eq "$(normalize_remote_slug 'dir/sub:odd.git')" dir/sub:odd
 
 # --- normalize_remote_host --------------------------------------------------
 # Host extraction for the clone guard's forge/host identity check.
@@ -348,8 +361,14 @@ t "host: https remote with a port"
 assert_eq "$(normalize_remote_host 'https://gl.example:8443/g/p.git')" gl.example
 t "host: ssh:// remote with a port"
 assert_eq "$(normalize_remote_host 'ssh://git@gitlab.example.com:2222/g/p.git')" gitlab.example.com
-t "host: local path yields nothing (unknown, not validated)"
+t "host: local path yields nothing (rejected by the clone guard)"
 assert_eq "$(normalize_remote_host '/srv/git/mirror.git')" ""
+t "host: userless scp-style remote parses its host"
+assert_eq "$(normalize_remote_host 'github.com:o/r.git')" github.com
+t "host: relative local path with a slash before the colon yields nothing"
+assert_eq "$(normalize_remote_host 'dir/sub:odd.git')" ""
+t "host: file:// URL yields nothing (not a forge endpoint)"
+assert_eq "$(normalize_remote_host 'file:///srv/git/g/p.git')" ""
 t "host: port stripped from a plain host string"
 assert_eq "$(host_sans_port 'gitlab.lab:8929')" gitlab.lab
 
@@ -977,19 +996,22 @@ assert_eq "$GLSD" "$WORK/sd-home/state/gl.example__g__p/pr-2"
 t "state dir: marker records the full gitlab identity (scheme included)"
 assert_eq "$(cat "$WORK/sd-home/state/gl.example__g__p/pr-2/.repo-slug" 2>/dev/null)" "gitlab https://gl.example g/p"
 
-t "state dir: pre-scheme gitlab marker migrates in place (sessions preserved)"
+t "state dir: ambiguous pre-scheme gitlab marker is refused with explicit migration guidance"
+# The old marker could belong to either the http or the https endpoint —
+# nothing persisted proves which — so the run must not adopt the current
+# invocation's scheme; the operator migrates explicitly.
 SD_MIG="$WORK/sd-migrate"
 mkdir -p "$SD_MIG/state/gl.example__g__p/pr-9"
 printf 'gitlab gl.example g/p\n' > "$SD_MIG/state/gl.example__g__p/pr-9/.repo-slug"
 if env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
   "set -euo pipefail; LOOP_HOME='$SD_MIG' FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=https REPO_SLUG=g/p PR_NUMBER=9; . '$ROOT/lib/common.sh'; ensure_state_dir" \
-  >/dev/null 2>&1; then
-  ok
+  >"$WORK/sd-mig.out" 2>&1; then
+  bad "pre-scheme marker silently adopted the invocation's scheme"
 else
-  bad "resume with a pre-scheme marker was rejected instead of migrated"
+  if grep -q "migrate it explicitly" "$WORK/sd-mig.out"; then ok; else bad "refusal lacks migration guidance"; fi
 fi
-t "state dir: migrated marker carries the scheme-qualified identity"
-assert_eq "$(cat "$SD_MIG/state/gl.example__g__p/pr-9/.repo-slug" 2>/dev/null)" "gitlab https://gl.example g/p"
+t "state dir: refused pre-scheme marker is left untouched"
+assert_eq "$(cat "$SD_MIG/state/gl.example__g__p/pr-9/.repo-slug" 2>/dev/null)" "gitlab gl.example g/p"
 
 t "state dir: same host under a different scheme dies (different endpoint)"
 if env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c \
@@ -1106,6 +1128,70 @@ if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
   ok
 else
   bad "documented alternate ssh endpoint rejected"
+fi
+
+t "clone guard: relative local-path origin with a matching slug is rejected"
+# Codex's reproduction: origin 'g/p.git' normalizes to slug g/p but is a
+# local mirror — the loop would push there while commenting on the MR.
+CLONE_LOCAL="$WORK/clone-local"
+git init -q "$CLONE_LOCAL" >/dev/null 2>&1
+git -C "$CLONE_LOCAL" remote add origin g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_LOCAL'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "local-path origin accepted — pushes would go to the mirror, comments to the MR"
+else
+  ok
+fi
+
+t "clone guard: absolute local-path origin with a matching slug is rejected"
+# Origin /g/p.git normalizes to slug g/p (leading slash stripped), so ONLY
+# the no-forge-endpoint check stands between this mirror and the push —
+# this pins the empty-host die, not the slug comparison.
+CLONE_ABS="$WORK/clone-abs"
+git init -q "$CLONE_ABS" >/dev/null 2>&1
+git -C "$CLONE_ABS" remote add origin /g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_ABS'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "absolute local-path origin accepted"
+else
+  ok
+fi
+
+t "clone guard: file:// origin is rejected"
+CLONE_FILE="$WORK/clone-file"
+git init -q "$CLONE_FILE" >/dev/null 2>&1
+git -C "$CLONE_FILE" remote add origin file:///srv/git/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_FILE'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "file:// origin accepted"
+else
+  ok
+fi
+
+t "clone guard: a checkout with no origin remote is rejected"
+CLONE_NOREMOTE="$WORK/clone-noremote"
+git init -q "$CLONE_NOREMOTE" >/dev/null 2>&1
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_NOREMOTE'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "origin-less checkout accepted despite nothing to fetch/push"
+else
+  ok
+fi
+
+t "clone guard: userless scp-style origin validates its host"
+CLONE_SCP="$WORK/clone-scp"
+git init -q "$CLONE_SCP" >/dev/null 2>&1
+git -C "$CLONE_SCP" remote add origin github.com:g/r.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=github FORGE_HOST=github.com REPO_SLUG=g/r REPO_DIR='$CLONE_SCP'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "userless scp-style origin for the right host rejected"
 fi
 
 t "clone guard: dotless ssh-alias origin is allowed (unverifiable, slug check holds)"
@@ -1297,6 +1383,26 @@ assert_dies_with "OAuth-backed"
 t "run.sh: explicit GITLAB_TOKEN bypasses the glab OAuth check"
 run_run_sh GITLAB_TOKEN=pat STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab --dir "$WORK/glclone-oauth"
 assert_dies_with "MR is not open"
+
+t "run.sh: ambient GLAB_IS_OAUTH2 cannot mask a stored OAuth session"
+run_run_sh GLAB_IS_OAUTH2=false STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab
+assert_dies_with "OAuth-backed"
+
+t "run.sh: ambient GITLAB_IS_OAUTH2 cannot mask a stored OAuth session"
+run_run_sh GITLAB_IS_OAUTH2=false STUB_GLAB_OAUTH=true 1 --repo g/p --forge gitlab
+assert_dies_with "OAuth-backed"
+
+t "run.sh: ambient GLAB_TOKEN cannot shadow the host's configured PAT"
+GLABTOK_HDR_LOG="$WORK/glabtok-hdr.log"
+run_run_sh GLAB_TOKEN=glab-ambient CURL_HDR_LOG="$GLABTOK_HDR_LOG" 1 --repo g/p --forge gitlab --dir "$WORK/glclone-glabtok"
+assert_dies_with "MR is not open"
+t "run.sh: the PRIVATE-TOKEN sent is the config PAT, not the ambient GLAB_TOKEN"
+if grep -q 'PRIVATE-TOKEN: stub-glab-token' "$GLABTOK_HDR_LOG" 2>/dev/null \
+   && ! grep -q 'glab-ambient' "$GLABTOK_HDR_LOG" 2>/dev/null; then
+  ok
+else
+  bad "ambient GLAB_TOKEN leaked into the API calls (hdrs: $(sort -u "$GLABTOK_HDR_LOG" 2>/dev/null | tr '\n' ' '))"
+fi
 
 t "run.sh: ambient OAUTH_TOKEN cannot shadow the host's configured PAT"
 OAUTH_HDR_LOG="$WORK/oauth-hdr.log"

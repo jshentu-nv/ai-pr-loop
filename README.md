@@ -126,9 +126,11 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
   `PRIVATE-TOKEN`). The token needs `api` scope, plus push access to the
   MR's source branch. `GITLAB_TOKEN` is the **only** environment credential
   honored: glab's other token env vars (`GITLAB_ACCESS_TOKEN`,
-  `OAUTH_TOKEN`) are explicitly cleared when reading the glab config, so an
-  ambient token minted for some other host can't masquerade as this host's
-  PAT.
+  `OAUTH_TOKEN`, `GLAB_TOKEN`) and its config-override vars for the keys
+  the loop reads (`GLAB_IS_OAUTH2`, `GITLAB_IS_OAUTH2`) are explicitly
+  cleared when reading the glab config, so an ambient token minted for some
+  other host can't masquerade as this host's PAT and an ambient override
+  can't mask an OAuth session.
 - All GitLab REST calls — the orchestrator's and the agents' — go through
   `curl` with a `PRIVATE-TOKEN` header, **not** `glab api`: `glab api`
   silently drops `position[...]` payloads when posting inline (line-anchored)

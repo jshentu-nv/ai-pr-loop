@@ -86,16 +86,20 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-# Read a host-scoped glab config value with glab's token environment
-# overrides (GITLAB_TOKEN / GITLAB_ACCESS_TOKEN / OAUTH_TOKEN) cleared: glab
-# lets any of those shadow every host's configured token, so an ambient
-# OAUTH_TOKEN minted for some other host would otherwise be returned as this
-# host's "token" — sailing past the is_oauth2 guard (whose config value says
-# false) and then being sent as a PRIVATE-TOKEN it was never meant to be.
-# The loop's only supported environment credential is GITLAB_TOKEN, which
-# preflight consumes before ever reaching the glab-config fallback.
+# Read a host-scoped glab config value with glab's environment overrides
+# cleared — both the token vars (GITLAB_TOKEN / GITLAB_ACCESS_TOKEN /
+# OAUTH_TOKEN / GLAB_TOKEN: any of them shadows every host's configured
+# token, so an ambient OAUTH_TOKEN minted for some other host would be
+# returned as this host's "token", sail past the is_oauth2 guard, and be
+# sent as a PRIVATE-TOKEN it was never meant to be) and the generic
+# GLAB_<KEY>/GITLAB_<KEY> config overrides for the keys we read
+# (GLAB_IS_OAUTH2=false would otherwise mask a stored OAuth session right
+# before its token gets exported). The loop's only supported environment
+# credential is GITLAB_TOKEN, which preflight consumes before ever reaching
+# the glab-config fallback.
 glab_config_get() {
-  env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN \
+  env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN -u GLAB_TOKEN \
+      -u GLAB_IS_OAUTH2 -u GITLAB_IS_OAUTH2 \
     glab config get "$1" --host "$FORGE_HOST" 2>/dev/null
 }
 
@@ -154,12 +158,18 @@ preflight() {
 }
 
 # Normalize a git remote URL to its repo slug: ssh://git@host[:port]/PATH(.git),
-# git@host:PATH(.git), and https://host/PATH(.git) all reduce to PATH, which
-# may contain subgroups on GitLab (group/sub/proj). The ssh:// form strips
-# through the first / (the host part may carry :port); the scp-style form
-# strips through the first :.
+# [user@]host:PATH(.git), and https://host/PATH(.git) all reduce to PATH,
+# which may contain subgroups on GitLab (group/sub/proj). The ssh:// form
+# strips through the first / (the host part may carry :port); the scp-style
+# forms strip through the first : (the userless form only when nothing
+# before the colon contains a slash — i.e. it is a host, not a local path,
+# matching git's own interpretation).
 normalize_remote_slug() {
-  sed -E 's#^ssh://git@[^/]+/##; s#^git@[^:/]+:##; s#^https?://[^/]+/##; s#\.git$##; s#^/##' <<<"$1"
+  # In order: ssh://[user@]host[:port]/PATH; [user@]host:PATH (scp-style);
+  # http(s)://[cred@]host/PATH; userless host:PATH (scp-style — only when
+  # the char after the colon isn't '/', so scheme prefixes like file://
+  # and absolute scp paths are left intact for the mismatch report).
+  sed -E 's#^ssh://[^/]+/##; s#^[^/:@]+@[^:/]+:##; s#^https?://[^/]+/##; s#^[^/:@]+:([^/])#\1#; s#\.git$##; s#^/##' <<<"$1"
 }
 
 # Validate a forge authority before it is ever embedded in an API URL: a
@@ -193,19 +203,28 @@ host_sans_port() {
 }
 
 # Hostname of a git remote URL: scheme://[user@]host[:port]/path and the
-# scp-style user@host:path both reduce to host (:port stripped — an ssh
-# remote's port legitimately differs from the web port). Prints nothing when
-# no host can be parsed (local path, exotic remote) — callers treat that as
-# unknown.
+# scp-style [user@]host:path both reduce to host (:port stripped — an ssh
+# remote's port legitimately differs from the web port; a userless
+# host:path counts as scp-style only when no slash precedes the colon,
+# matching git's own URL interpretation). Prints nothing when no host can
+# be parsed (local path, file://, exotic transport) — callers must treat
+# that as NOT the forge, not as unknown-but-fine.
 normalize_remote_host() {
-  local url="$1"
+  local url="$1" head
   case "$url" in
     ssh://*|git://*|http://*|https://*)
       url="${url#*://}"; url="${url%%/*}"; url="${url#*@}"
       host_sans_port "$url"
       ;;
+    *://*)
+      # Unknown transport (file://, ftp://, ...) — not a forge endpoint.
+      : ;;
     *@*:*)
       url="${url#*@}"; printf '%s\n' "${url%%:*}"
+      ;;
+    [!/]*:*)
+      head="${url%%:*}"
+      if [[ "$head" != */* ]]; then printf '%s\n' "$head"; fi
       ;;
     *)
       : ;;
@@ -283,8 +302,15 @@ validate_origin_url() {
     remote_host=$(normalize_remote_host "$url")
     want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
     case "$remote_host" in
-      ''|"$want_host"|"ssh.$want_host"|"altssh.$want_host")
+      "$want_host"|"ssh.$want_host"|"altssh.$want_host")
         : ;;
+      '')
+        # No parseable endpoint at all: a local/relative path or file://
+        # mirror. That is definitively NOT the forge — a matching slug
+        # (e.g. origin 'g/p.git' for gl.example/g/p) would let the loop
+        # review and push a local mirror while its comments go to the MR.
+        die "REPO_DIR=$REPO_DIR origin $kind URL '$url' has no forge endpoint (local path or unsupported transport) — the loop must fetch/push the MR's repository; point origin at the forge, or use a fresh --dir"
+        ;;
       *.*)
         die "REPO_DIR=$REPO_DIR origin $kind URL points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
         ;;
@@ -297,7 +323,7 @@ validate_origin_url() {
 
 ensure_repo_clone() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    local url
+    local url n_urls=0
     # Validate every fetch AND push URL of origin: the loop's `git push
     # origin` honors remote.origin.pushurl (which can differ arbitrarily
     # from the fetch URL, and can be multi-valued), so a checkout fetching
@@ -306,11 +332,21 @@ ensure_repo_clone() {
     # `get-url --push` falls back to the fetch URL when no pushurl is set —
     # a harmless double-validation.
     while IFS= read -r url; do
-      [[ -n "$url" ]] && validate_origin_url "$url" fetch
+      if [[ -n "$url" ]]; then
+        validate_origin_url "$url" fetch
+        n_urls=$((n_urls + 1))
+      fi
     done < <(git -C "$REPO_DIR" remote get-url --all origin 2>/dev/null || true)
     while IFS= read -r url; do
-      [[ -n "$url" ]] && validate_origin_url "$url" push
+      if [[ -n "$url" ]]; then
+        validate_origin_url "$url" push
+        n_urls=$((n_urls + 1))
+      fi
     done < <(git -C "$REPO_DIR" remote get-url --push --all origin 2>/dev/null || true)
+    # A repo with no origin URL at all can't be validated — and can't serve
+    # the loop, which fetches and pushes origin to track the MR branch.
+    (( n_urls > 0 )) \
+      || die "REPO_DIR=$REPO_DIR has no origin remote URL — the loop fetches/pushes origin to reach the MR's source branch; clone the repository properly or use a fresh --dir"
     log "using existing clone at $REPO_DIR"
     return
   fi
@@ -621,16 +657,16 @@ ensure_state_dir() {
   want=$(repo_ident)
   if [[ -s "$marker" ]]; then
     owner=$(<"$marker")
-    # Migrate a scheme-less gitlab marker ('gitlab <host> <slug>', written
-    # before the scheme joined the identity) in place when forge, host, and
-    # slug all match: that marker was scheme-blind by construction, so
-    # adopting the current run's scheme is exactly as safe as the code that
-    # wrote it — and preserves the per-PR sessions, context, and history
-    # that cleaning the state dir would discard.
+    # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
+    # the scheme joined the identity) is AMBIGUOUS: it could belong to the
+    # host's http or https endpoint, and nothing persisted proves which.
+    # Refuse it rather than adopt the current invocation's scheme — silently
+    # attaching one endpoint's sessions/context/history to the other would
+    # recreate the very identity confusion the scheme exists to prevent.
+    # The operator, who knows which endpoint the old runs used, migrates
+    # explicitly (one command, preserving sessions) or cleans the dir.
     if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
-      log "state dir $STATE_DIR: migrating pre-scheme identity marker to '$want'"
-      printf '%s\n' "$want" > "$marker"
-      owner="$want"
+      die "state dir $STATE_DIR carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
     fi
     [[ "$owner" == "$want" ]] \
       || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"

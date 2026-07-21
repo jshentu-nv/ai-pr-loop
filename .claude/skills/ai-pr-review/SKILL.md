@@ -158,7 +158,13 @@ gh pr view <PR_NUMBER> --repo <REPO_SLUG> --json state,headRefName,title,url
 GitLab (self-hosted: substitute the host):
 
 ```bash
-glab auth status --hostname <HOST> 2>&1 | head -3
+# env -u matters: a raw `glab auth status` would send an ambient
+# OAUTH_TOKEN / GITLAB_ACCESS_TOKEN to the host as its credential and
+# report it as "logged in" — clear glab's token env overrides so the
+# status reflects the host-scoped config the loop will actually use
+# (an explicit GITLAB_TOKEN is fine to leave: it IS the supported path).
+env -u OAUTH_TOKEN -u GITLAB_ACCESS_TOKEN -u GLAB_TOKEN \
+  glab auth status --hostname <HOST> 2>&1 | head -3
 command -v codex && codex --version 2>&1 | head -1
 command -v claude && claude --version 2>&1 | head -1
 # Validate and resolve the target through the orchestrator itself — this
