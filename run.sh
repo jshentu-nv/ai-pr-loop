@@ -275,6 +275,30 @@ esac
 # the agents' prompts — reject anything that isn't host[:port] (userinfo in
 # a crafted MR link would redirect PAT-bearing calls to another server).
 validate_forge_authority "$FORGE_HOST"
+# Canonicalize an explicit default port away: https://gl.example:443 and
+# https://gl.example are the same endpoint, and every consumer of
+# FORGE_HOST — managed checkout/state naming, identity markers, API URLs,
+# prompts, the clone guard — must agree on ONE spelling, or re-invoking
+# the same MR in the equivalent form would split its state (losing
+# sessions, context, and the on-disk verdict that makes an approved
+# resume a no-op).
+CANON_HOST="$FORGE_HOST"
+case "$FORGE_SCHEME" in
+  http)  CANON_HOST="${FORGE_HOST%:80}"  ;;
+  https) CANON_HOST="${FORGE_HOST%:443}" ;;
+esac
+if [[ "$CANON_HOST" != "$FORGE_HOST" ]]; then
+  # One-time upgrade guard: managed dirs keyed by the pre-canonicalization
+  # spelling would be silently orphaned — losing sessions, context, and the
+  # approved-resume verdict — so refuse with explicit steps instead
+  # (mirroring the pre-scheme marker precedent in ensure_state_dir).
+  OLD_IDENT="${FORGE_HOST}__${REPO_SLUG//\//__}"
+  NEW_IDENT="${CANON_HOST}__${REPO_SLUG//\//__}"
+  if [[ -e "$LOOP_HOME/state/$OLD_IDENT" || -e "$LOOP_HOME/checkouts/$OLD_IDENT" ]]; then
+    die "state/checkout keyed by the pre-canonicalization spelling '$FORGE_HOST' exists under $LOOP_HOME/{state,checkouts}/$OLD_IDENT; the canonical identity is now '$CANON_HOST'. Rename each dir to .../$NEW_IDENT and update each state pr-*/.repo-slug marker to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', or remove the old dirs"
+  fi
+  FORGE_HOST="$CANON_HOST"
+fi
 if [[ "$FORGE_SCHEME" == "http" ]]; then
   log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
 fi

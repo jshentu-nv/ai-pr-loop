@@ -158,13 +158,7 @@ gh pr view <PR_NUMBER> --repo <REPO_SLUG> --json state,headRefName,title,url
 GitLab (self-hosted: substitute the host):
 
 ```bash
-# env -u matters: a raw `glab auth status` would send an ambient
-# OAUTH_TOKEN / GITLAB_ACCESS_TOKEN to the host as its credential and
-# report it as "logged in" — clear glab's token env overrides so the
-# status reflects the host-scoped config the loop will actually use
-# (an explicit GITLAB_TOKEN is fine to leave: it IS the supported path).
-env -u OAUTH_TOKEN -u GITLAB_ACCESS_TOKEN -u GLAB_TOKEN \
-  glab auth status --hostname <HOST> 2>&1 | head -3
+command -v glab && glab --version 2>&1 | head -1
 command -v codex && codex --version 2>&1 | head -1
 command -v claude && claude --version 2>&1 | head -1
 # Validate and resolve the target through the orchestrator itself — this
@@ -173,22 +167,29 @@ command -v claude && claude --version 2>&1 | head -1
 "$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --print-config
 ```
 
-**Never build your own PAT-bearing curl (or raw `glab config get token`
-lookup) in this preflight.** Hand-rolling the request would bypass the
-orchestrator's safeguards: `validate_forge_authority` (a crafted MR URL
-like `https://good.host@attacker.invalid/…` would send the token to the
-attacker's host) and `glab_config_get` (an ambient `OAUTH_TOKEN` /
-`GITLAB_ACCESS_TOKEN` in the environment would shadow the host's
-configured PAT). `run.sh` performs the full validated preflight itself the
-moment it starts — token resolution (env-isolated, host-scoped, rejecting
-OAuth-backed glab sessions with instructions to set a `GITLAB_TOKEN` PAT)
-and the MR fetch — and dies immediately with a clear message on any
-failure, which the monitor in step 5 surfaces.
+**Run no glab auth commands and no PAT-bearing curl (nor a raw
+`glab config get token` lookup) in this preflight.** Hand-rolled checks
+keep diverging from the orchestrator's auth model: `glab auth status`
+resolves its credential and OAuth-vs-PAT mode from ambient env and config
+overrides, so it can report success for a session `run.sh` rejects (stored
+OAuth masked by `GLAB_IS_OAUTH2=false`) or failure for one it supports
+(explicit `GITLAB_TOKEN` treated as OAuth because the stored config says
+`is_oauth2: true`). A hand-built curl would additionally bypass
+`validate_forge_authority` (a crafted MR URL like
+`https://good.host@attacker.invalid/…` would send the token to the
+attacker's host) and `glab_config_get` (ambient `OAUTH_TOKEN` /
+`GITLAB_ACCESS_TOKEN` shadowing the host's PAT). `run.sh` performs the one
+authoritative preflight the moment it starts — token resolution
+(env-isolated, host-scoped, rejecting OAuth-backed glab sessions with
+instructions to set a `GITLAB_TOKEN` PAT) and the MR fetch — and dies
+immediately with a clear message on any failure, which the monitor in
+step 5 surfaces.
 
-Bail if forge auth is bad, either CLI is missing, or `--print-config`
-rejects the target. MR state (must be `opened`) is enforced by `run.sh`
-itself at launch — treat an immediate exit with "MR is not open" /
-"GitLab auth failed" / "OAuth-backed" as the preflight failure to report.
+Bail if either CLI is missing or `--print-config` rejects the target.
+Auth and MR state (must be `opened`) are enforced by `run.sh` itself at
+launch — treat an immediate exit with "MR is not open" / "GitLab auth
+failed" / "no GitLab token" / "OAuth-backed" as the preflight failure to
+report.
 
 ### 3. Confirm before posting
 

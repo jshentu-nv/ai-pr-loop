@@ -1194,6 +1194,45 @@ else
   bad "userless scp-style origin for the right host rejected"
 fi
 
+t "clone guard: ssh.<self-host> is rejected (a prefix is not proof of the forge)"
+# The documented alternate ssh endpoints are literal public mappings
+# (ssh.github.com, altssh.gitlab.com) — on a self-host, ssh.gl.example is
+# just another DNS name that need not route to gl.example.
+CLONE_SSHSELF="$WORK/clone-sshself"
+git init -q "$CLONE_SSHSELF" >/dev/null 2>&1
+git -C "$CLONE_SSHSELF" remote add origin 'ssh://git@ssh.gl.example:443/g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_SSHSELF'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "ssh.gl.example accepted as gl.example on a self-host"
+else
+  ok
+fi
+
+t "clone guard: altssh.<self-host> scp form is rejected too"
+CLONE_ALTSELF="$WORK/clone-altself"
+git init -q "$CLONE_ALTSELF" >/dev/null 2>&1
+git -C "$CLONE_ALTSELF" remote add origin 'git@altssh.gl.example:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_ALTSELF'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "altssh.gl.example accepted as gl.example on a self-host"
+else
+  ok
+fi
+
+t "clone guard: altssh.gitlab.com counts as gitlab.com (documented mapping)"
+CLONE_ALTGL="$WORK/clone-altgl"
+git init -q "$CLONE_ALTGL" >/dev/null 2>&1
+git -C "$CLONE_ALTGL" remote add origin 'git@altssh.gitlab.com:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.com REPO_SLUG=g/p REPO_DIR='$CLONE_ALTGL'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "documented altssh.gitlab.com mapping rejected"
+fi
+
 t "clone guard: dotless ssh-alias origin is allowed (unverifiable, slug check holds)"
 CLONE_ALIAS="$WORK/clone-alias"
 git init -q "$CLONE_ALIAS" >/dev/null 2>&1
@@ -1477,6 +1516,33 @@ fi
 t "run.sh: managed gitlab checkout is namespaced by host"
 run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
 assert_prints "dir: $ROOT/checkouts/gl.example__g__p"
+
+# Default-port canonicalization: https://gl.example:443 IS https://gl.example
+# — both spellings must resolve to one identity (host, checkout, state,
+# marker), or re-invoking the same MR in the equivalent form would split
+# its sessions/context/verdict across two state dirs.
+t "run.sh: explicit https default port canonicalizes to the bare host"
+run_run_sh https://gl.example:443/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+assert_prints "dir: $ROOT/checkouts/gl.example__g__p"
+
+t "run.sh: explicit http default port canonicalizes to the bare host"
+run_run_sh 3 --repo g/p --host http://gitlab.lab:80 --print-config
+assert_prints 'forge: gitlab host=gitlab.lab scheme=http repo=g/p pr=3'
+
+t "run.sh: a non-default port is preserved in the identity"
+run_run_sh http://gitlab.lab:8929/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gitlab.lab:8929 scheme=http repo=g/p pr=9'
+assert_prints "dir: $ROOT/checkouts/gitlab.lab:8929__g__p"
+
+t "run.sh: pre-canonicalization port-spelled state refuses with rename guidance"
+# State written by an earlier build under the ':443' spelling must not be
+# silently orphaned (the approved-resume no-op depends on its verdict file).
+# $ROOT/state is gitignored; the fixture is removed right after.
+mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
+run_run_sh https://gl.example:443/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:443__g__p"
+assert_dies_with "pre-canonicalization spelling"
 
 t "run.sh: managed github checkout keeps the legacy layout"
 run_run_sh 1 --repo o/n --print-config

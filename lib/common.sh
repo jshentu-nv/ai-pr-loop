@@ -301,16 +301,28 @@ validate_origin_url() {
   else
     remote_host=$(normalize_remote_host "$url")
     want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
+    if [[ -z "$remote_host" ]]; then
+      # No parseable endpoint at all: a local/relative path or file://
+      # mirror. That is definitively NOT the forge — a matching slug
+      # (e.g. origin 'g/p.git' for gl.example/g/p) would let the loop
+      # review and push a local mirror while its comments go to the MR.
+      die "REPO_DIR=$REPO_DIR origin $kind URL '$url' has no forge endpoint (local path or unsupported transport) — the loop must fetch/push the MR's repository; point origin at the forge, or use a fresh --dir"
+    fi
+    # The public forges' documented alternate ssh endpoints are SPECIFIC
+    # literal mappings — ssh.github.com is github.com, altssh.gitlab.com is
+    # gitlab.com — not a general "<prefix>.<host>" rule: on a self-host,
+    # ssh.gl.example is just another DNS name that need not route to
+    # gl.example, so a prefixed form there is a different endpoint and must
+    # be rejected like any other mismatch. '/' is an impossible hostname,
+    # used as the no-alternate placeholder.
+    local alt_host='/'
+    case "$want_host" in
+      github.com) alt_host='ssh.github.com'    ;;
+      gitlab.com) alt_host='altssh.gitlab.com' ;;
+    esac
     case "$remote_host" in
-      "$want_host"|"ssh.$want_host"|"altssh.$want_host")
+      "$want_host"|"$alt_host")
         : ;;
-      '')
-        # No parseable endpoint at all: a local/relative path or file://
-        # mirror. That is definitively NOT the forge — a matching slug
-        # (e.g. origin 'g/p.git' for gl.example/g/p) would let the loop
-        # review and push a local mirror while its comments go to the MR.
-        die "REPO_DIR=$REPO_DIR origin $kind URL '$url' has no forge endpoint (local path or unsupported transport) — the loop must fetch/push the MR's repository; point origin at the forge, or use a fresh --dir"
-        ;;
       *.*)
         die "REPO_DIR=$REPO_DIR origin $kind URL points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
         ;;
