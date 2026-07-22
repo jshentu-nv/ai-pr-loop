@@ -1,6 +1,6 @@
 ---
 name: ai-pr-review
-description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments and pushes commits under the user's forge identity (gh PAT / GitLab token).
+description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account.
 argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
 allowed-tools: Bash, Read, Monitor
 ---
@@ -170,8 +170,13 @@ command -v claude && claude --version 2>&1 | head -1
 "$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --preflight-only
 ```
 
-The `identity:` line names the exact GitLab account the loop will post
-and push as — quote it verbatim in the step-3 confirmation.
+The `identity:` line names the exact GitLab account behind every **API
+call and comment**. Pushes are different: they go through the checkout's
+own git credential (SSH key or credential helper — the non-interactive
+push path the README requires), which can belong to another account.
+Quote the `identity:` line verbatim in the step-3 confirmation as the
+comment/API account, and say that pushes use the checkout's git
+credential, which may differ.
 
 **Run no glab auth commands and no PAT-bearing curl (nor a raw
 `glab config get token` lookup) in this preflight.** Hand-rolled checks
@@ -196,13 +201,16 @@ host", "MR is not open", "GitLab auth failed", "no GitLab token", and
 
 ### 3. Confirm before posting
 
-The loop writes to a live PR/MR: it will post comments and (via Claude)
-push commits using the user's forge identity (gh PAT on GitHub, GitLab
-token on GitLab). Always tell the user the exact identity (GitHub: from
-`gh auth status`; GitLab: the `identity:` line of `--preflight-only`) and
-the PR/MR URL, then ask for confirmation **unless they already authorized
-the run explicitly** in the same conversation (e.g. "start the review",
-"kick it off", "go", a previous run in this session). When in doubt, ask.
+The loop writes to a live PR/MR: it posts comments under the user's forge
+API identity (gh PAT on GitHub, GitLab token on GitLab), and (via Claude)
+pushes commits through the checkout's git credential. Always tell the
+user the exact **comment/API identity** (GitHub: from `gh auth status`;
+GitLab: the `identity:` line of `--preflight-only`) and the PR/MR URL,
+noting that **pushes use the checkout's git credential (SSH key or
+credential helper), which may belong to a different account** — then ask
+for confirmation **unless they already authorized the run explicitly** in
+the same conversation (e.g. "start the review", "kick it off", "go", a
+previous run in this session). When in doubt, ask.
 
 ### 4. Launch in the background
 

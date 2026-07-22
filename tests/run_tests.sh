@@ -1299,6 +1299,16 @@ else
   bad "prompt API base not rendered with the http scheme"
 fi
 
+t "codex gitlab: HEAD capture is path-free (safe for space-containing --dir)"
+# The recipe runs inside the checkout (step 1 cd's there); embedding the
+# rendered path unquoted would break 'git -C /tmp/my repo rev-parse HEAD'.
+if grep -qF 'EXPECTED_HEAD=$(git rev-parse HEAD)' "$CASE_DIR/state/iter-01/codex.prompt.md" 2>/dev/null \
+   && ! grep -q 'git -C .*rev-parse HEAD' "$CASE_DIR/state/iter-01/codex.prompt.md" 2>/dev/null; then
+  ok
+else
+  bad "rendered prompt embeds a path in the HEAD capture"
+fi
+
 t "claude gitlab: renders the gitlab prompt and extracts discussion_id"
 new_case claude-gitlab
 run_turn claude FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
@@ -1552,6 +1562,21 @@ run_run_sh http://gitlab.lab:8929/g/p/-/merge_requests/9 --print-config
 assert_prints 'forge: gitlab host=gitlab.lab:8929 scheme=http repo=g/p pr=9'
 assert_prints "dir: $ROOT/checkouts/gitlab.lab:8929__g__p"
 
+# Ports normalize NUMERICALLY: curl reaches the same endpoint for :0443
+# and :443, so a leading-zero spelling must not fork the identity.
+t "run.sh: leading-zero https default port canonicalizes to the bare host"
+run_run_sh https://gl.example:0443/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+assert_prints "dir: $ROOT/checkouts/gl.example__g__p"
+
+t "run.sh: leading-zero http default port canonicalizes to the bare host"
+run_run_sh 3 --repo g/p --host http://gitlab.lab:080 --print-config
+assert_prints 'forge: gitlab host=gitlab.lab scheme=http repo=g/p pr=3'
+
+t "run.sh: leading-zero NON-default port normalizes its digits"
+run_run_sh https://gl.example:08443/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gl.example:8443 scheme=https repo=g/p pr=9'
+
 t "run.sh: pre-canonicalization port-spelled state refuses with migration guidance"
 # State written by an earlier build under the ':443' spelling must not be
 # silently orphaned (the approved-resume no-op depends on its verdict file).
@@ -1570,6 +1595,16 @@ mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
 printf 'gitlab gl.example:443 g/p\n' > "$ROOT/state/gl.example:443__g__p/pr-9/.repo-slug"
 run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
 rm -rf "$ROOT/state/gl.example:443__g__p"
+assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: legacy state keyed by a leading-zero spelling also refuses"
+# A pre-normalization build keyed a ':0443'-spelled run verbatim; the
+# guard must probe this invocation's own original spelling too, or the
+# re-key silently orphans that tree.
+mkdir -p "$ROOT/state/gl.example:0443__g__p/pr-9"
+printf 'gitlab https://gl.example:0443 g/p\n' > "$ROOT/state/gl.example:0443__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example:0443/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:0443__g__p"
 assert_dies_with "pre-canonicalization spelling"
 
 t "run.sh: a canonical http-on-443 tree is NOT mistaken for legacy https state"

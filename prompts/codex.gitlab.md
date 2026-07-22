@@ -153,8 +153,9 @@ never continue past a failed mutation as if it landed.
    # this loop reviews immediately after Claude pushes). Null SHAs would
    # 400 every positioned discussion; stale refs would anchor findings to
    # the previous commit's diff. Poll until the refs are complete AND
-   # their head_sha matches the branch head you just checked out:
-   EXPECTED_HEAD=$(git -C {{REPO_DIR}} rev-parse HEAD)
+   # their head_sha matches the branch head you just checked out (you are
+   # already running inside the checkout — step 1 cd'd there):
+   EXPECTED_HEAD=$(git rev-parse HEAD)
    REFS=''
    for _try in 1 2 3 4 5 6; do
      REFS=$(curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \

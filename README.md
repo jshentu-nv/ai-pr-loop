@@ -451,8 +451,10 @@ flag validation.
 ## Notes
 
 - The authenticated user's token (gh PAT on GitHub, `GITLAB_TOKEN`/glab on
-  GitLab) is used for all forge mutations (comments + pushes). Don't run on
-  PRs/MRs you don't intend the bots to act on under that identity.
+  GitLab) is used for all API mutations (comments). Pushes go through the
+  checkout's own git credential — SSH key or credential helper — which may
+  belong to a different account. Don't run on PRs/MRs you don't intend the
+  bots to act on under those identities.
 - Claude never force-pushes, amends, or rebases — only adds new commits
   to the PR head ref.
 - Managed checkouts live at `~/ai-pr-loop/checkouts/<owner>__<name>/`

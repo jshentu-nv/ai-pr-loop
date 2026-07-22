@@ -129,8 +129,11 @@
 #                 OAuth-rejecting), /user lookup, PR/MR fetch + open check —
 #                 print the resolved identity, PR/MR URL, and branches, then
 #                 exit 0 WITHOUT cloning, posting, or looping. Side-effect
-#                 free: the skill uses it to name the exact posting identity
-#                 before asking the operator to confirm a run.
+#                 free: the skill uses it to name the exact API/comment
+#                 identity before asking the operator to confirm a run.
+#                 (Pushes are separate: they use the checkout's own git
+#                 credential — SSH key or helper — which may belong to a
+#                 different account.)
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -294,9 +297,23 @@ validate_forge_authority "$FORGE_HOST"
 # resume a no-op).
 CANON_HOST="$FORGE_HOST"; LEGACY_PORT=''
 case "$FORGE_SCHEME" in
-  http)  CANON_HOST="${FORGE_HOST%:80}";  LEGACY_PORT=80  ;;
-  https) CANON_HOST="${FORGE_HOST%:443}"; LEGACY_PORT=443 ;;
+  http)  LEGACY_PORT=80  ;;
+  https) LEGACY_PORT=443 ;;
 esac
+# Normalize the NUMERIC port, not just literal suffixes: curl reaches the
+# same endpoint for :0443 and :443, so a leading-zero spelling must not
+# fork the identity either (nor feed a nonsense host:0443:443 twin to the
+# glab config probe). The scheme's default port is dropped entirely; any
+# other port keeps its canonical digits.
+ORIG_HOST="$FORGE_HOST"
+if [[ -n "$LEGACY_PORT" && "$FORGE_HOST" =~ ^(.+):([0-9]+)$ ]]; then
+  CANON_PORT=$((10#${BASH_REMATCH[2]}))
+  if (( CANON_PORT == LEGACY_PORT )); then
+    CANON_HOST="${BASH_REMATCH[1]}"
+  else
+    CANON_HOST="${BASH_REMATCH[1]}:${CANON_PORT}"
+  fi
+fi
 FORGE_HOST="$CANON_HOST"
 # One-time upgrade guard, BOTH directions: a managed tree keyed by the
 # legacy default-port spelling must refuse loudly whether THIS invocation
@@ -306,9 +323,17 @@ FORGE_HOST="$CANON_HOST"
 # canonicalization exists to prevent. Mirrors the pre-scheme marker
 # precedent in ensure_state_dir.
 if [[ "$FORGE" == "gitlab" && -n "$LEGACY_PORT" ]]; then
-  LEGACY_IDENT="${CANON_HOST}:${LEGACY_PORT}__${REPO_SLUG//\//__}"
   NEW_IDENT="${CANON_HOST}__${REPO_SLUG//\//__}"
-  # Only its markers prove the port-named tree is OURS: the same directory
+  # Legacy spellings a pre-canonicalization build could have keyed trees
+  # under: the canonical-digit default port (literal ':443' runs), plus
+  # THIS invocation's own pre-normalization spelling when it differs
+  # (a ':0443' or ':08443' run was keyed verbatim by older builds).
+  # Hosts are validated (no whitespace), so word-splitting is safe.
+  LEGACY_CANDIDATES="${CANON_HOST}:${LEGACY_PORT}"
+  if [[ "$ORIG_HOST" != "$CANON_HOST" && "$ORIG_HOST" != "$LEGACY_CANDIDATES" ]]; then
+    LEGACY_CANDIDATES="$LEGACY_CANDIDATES $ORIG_HOST"
+  fi
+  # Only its markers prove a candidate tree is OURS: the same directory
   # name is legitimate CANONICAL state for the opposite scheme (443 is not
   # http's default port, 80 not https's), so match same-scheme markers and
   # the ambiguous pre-scheme form — a tree whose markers all name the other
@@ -316,13 +341,16 @@ if [[ "$FORGE" == "gitlab" && -n "$LEGACY_PORT" ]]; then
   # (never a whole-tree rename: with an existing $NEW_IDENT tree, mv would
   # NEST the legacy tree inside it, hiding the very sessions/verdicts this
   # guard protects).
-  if [[ -d "$LOOP_HOME/state/$LEGACY_IDENT" ]] \
-     && grep -qsxF \
-          -e "gitlab ${FORGE_SCHEME}://${CANON_HOST}:${LEGACY_PORT} ${REPO_SLUG}" \
-          -e "gitlab ${CANON_HOST}:${LEGACY_PORT} ${REPO_SLUG}" \
-          "$LOOP_HOME/state/$LEGACY_IDENT"/pr-*/.repo-slug; then
-    die "state keyed by the pre-canonicalization spelling '${CANON_HOST}:${LEGACY_PORT}' exists under $LOOP_HOME/state/$LEGACY_IDENT; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any $LOOP_HOME/checkouts/$LEGACY_IDENT) — or simply remove the legacy dirs to start fresh"
-  fi
+  for LEGACY_AUTH in $LEGACY_CANDIDATES; do
+    LEGACY_IDENT="${LEGACY_AUTH}__${REPO_SLUG//\//__}"
+    if [[ -d "$LOOP_HOME/state/$LEGACY_IDENT" ]] \
+       && grep -qsxF \
+            -e "gitlab ${FORGE_SCHEME}://${LEGACY_AUTH} ${REPO_SLUG}" \
+            -e "gitlab ${LEGACY_AUTH} ${REPO_SLUG}" \
+            "$LOOP_HOME/state/$LEGACY_IDENT"/pr-*/.repo-slug; then
+      die "state keyed by the pre-canonicalization spelling '${LEGACY_AUTH}' exists under $LOOP_HOME/state/$LEGACY_IDENT; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any $LOOP_HOME/checkouts/$LEGACY_IDENT) — or simply remove the legacy dirs to start fresh"
+    fi
+  done
 fi
 if [[ "$FORGE_SCHEME" == "http" ]]; then
   log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
@@ -450,8 +478,9 @@ case "$FORGE" in
 esac
 export HEAD_REF BASE_REF
 
-# --preflight-only: report what a real run would use — the posting identity
-# (resolved from the actual credential via /user or gh), the canonical
+# --preflight-only: report what a real run would use — the API/comment
+# identity (resolved from the actual credential via /user or gh; pushes
+# use the checkout's own git credential, which may differ), the canonical
 # PR/MR URL, and the branches — then stop. Reaching this line already
 # proves authority validation, credential resolution, and the open check
 # all passed; any failure died above with its specific message.
