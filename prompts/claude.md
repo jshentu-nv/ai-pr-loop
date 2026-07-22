@@ -4,7 +4,7 @@ You are the **Claude Implementer** in an automated review loop on PR
 `{{REPO_OWNER}}/{{REPO_NAME}}#{{PR_NUMBER}}`.
 
 The repository is checked out at `{{REPO_DIR}}` and is currently on the PR
-branch `{{HEAD_REF}}` (base: `{{BASE_REF}}`). This is iteration **{{ITER}}**
+branch `$HEAD_REF` (base: `$BASE_REF`) — both branch names are exported in your shell environment; use `"$HEAD_REF"`/`"$BASE_REF"` verbatim in git commands (never type the literal name, which may contain shell metacharacters). This is iteration **{{ITER}}**
 of the loop (max {{MAX_ITER}}).
 
 The Codex Reviewer just posted iteration {{ITER}} review across two surfaces:
@@ -67,7 +67,7 @@ null on GitHub).
          ai-loop: claude-implementer
          "
      ```
-   - Push: `git push origin {{HEAD_REF}}`
+   - Push: `git push origin "$HEAD_REF"`
    - One commit per iteration is preferred; if multiple logical fixes
      warrant multiple commits, that's fine.
 
@@ -180,7 +180,7 @@ null on GitHub).
   audit the full thread.
 - **Do not** force-push, rebase, amend, or rewrite history. Only add new
   commits.
-- **Do not** push to `{{BASE_REF}}` or any branch other than `{{HEAD_REF}}`.
+- **Do not** push to `$BASE_REF` or any branch other than `$HEAD_REF`.
 - **Do not** open new PRs, close this one, or change PR metadata
   (title, labels, assignees, reviewers).
 - If you cannot understand or address an issue, push back honestly with

@@ -4,7 +4,7 @@ You are the **Codex Reviewer** in an automated review loop on PR
 `{{REPO_OWNER}}/{{REPO_NAME}}#{{PR_NUMBER}}`.
 
 The repository is checked out at `{{REPO_DIR}}` and is currently on the PR
-branch `{{HEAD_REF}}` (base: `{{BASE_REF}}`). This is iteration **{{ITER}}**
+branch `$HEAD_REF` (base: `$BASE_REF`) — both branch names are exported in your shell environment; use `"$HEAD_REF"`/`"$BASE_REF"` verbatim in git commands (never type the literal name, which may contain shell metacharacters). This is iteration **{{ITER}}**
 of the loop (max {{MAX_ITER}}).
 
 {{MODE_NOTE}}
@@ -15,8 +15,8 @@ of the loop (max {{MAX_ITER}}).
 
 1. **Fetch latest state.**
    - `cd {{REPO_DIR}}`
-   - `git fetch origin {{BASE_REF}} {{HEAD_REF}}`
-   - `git checkout {{HEAD_REF}}` and `git pull --ff-only` so you see Claude's
+   - `git fetch origin "$BASE_REF" "$HEAD_REF"`
+   - `git checkout "$HEAD_REF"` and `git pull --ff-only` so you see Claude's
      most recent commits.
 
 2. **Read the PR's metadata and full discussion** — not just the bot thread:
@@ -75,7 +75,7 @@ of the loop (max {{MAX_ITER}}).
    - When in doubt about whether something is a real issue vs. a stylistic
      preference, **read more code** before flagging it.
 
-5. **Review the current diff** (`git diff origin/{{BASE_REF}}...HEAD`) with
+5. **Review the current diff** (`git diff "origin/$BASE_REF...HEAD"`) with
    that context in mind. Evaluate correctness, design, perf, docs, and
    consistency with the project's conventions. Apply these focused passes
    when the diff touches the relevant area (skip a pass cleanly if it

@@ -64,6 +64,11 @@ fi
 # Render the prompt. GitLab loops use the gitlab prompt variant — same
 # implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
 # instead of gh.
+#
+# BASE_REF/HEAD_REF are NOT sed-substituted (see codex_turn.sh): a
+# forge-supplied branch name can carry sed/shell metacharacters, so the
+# templates reference the exported $BASE_REF / $HEAD_REF shell variables
+# and the agent's shell expands them safely.
 PROMPT_TEMPLATE="$HERE/prompts/claude.md"
 [[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/claude.gitlab.md"
 PROMPT_FILE="$ID/claude.prompt.md"
@@ -76,8 +81,6 @@ sed \
   -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
-  -e "s|{{BASE_REF}}|${BASE_REF}|g" \
-  -e "s|{{HEAD_REF}}|${HEAD_REF}|g" \
   -e "s|{{ITER}}|${ITER}|g" \
   -e "s|{{MAX_ITER}}|${MAX_ITER}|g" \
   -e "s|{{LATEST_REVIEW_FILE}}|${LATEST_REVIEW_FILE}|g" \

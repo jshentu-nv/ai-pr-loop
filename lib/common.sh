@@ -614,16 +614,27 @@ fetch_ai_thread() {
           created_at: $c.created_at, body: $c.body }'
 }
 
+# The ai-loop marker is PUBLIC — anyone who can comment on the PR can post
+# a comment bearing an exact bot wrapper. Trusting it by marker alone lets
+# an attacker forge a summary at a high iteration (steering resume
+# high-water so the real bot turn is skipped) or a review body the
+# write-enabled implementer then acts on. So EVERY record is filtered to
+# the authenticated posting identity ($GH_USER, resolved from the token in
+# preflight) before any marker/summary parsing: on GitHub the comment
+# author is `.user.login`. `env.GH_USER` reads the exported value; if it
+# were empty the comparison excludes everything — fail closed.
 fetch_ai_thread_github() {
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
     --jq '.[]
+          | select(.user.login == env.GH_USER)
           | select(.body | test("<!-- ai-loop:"))
           | {surface:"issue", id:.id, path:null, line:null,
              in_reply_to_id:null, created_at, body}'
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments" \
     --jq '.[]
+          | select(.user.login == env.GH_USER)
           | select(.body | test("<!-- ai-loop:"))
           | {surface:"inline", id:.id, path:.path,
              line:(.line // .original_line),
@@ -639,7 +650,10 @@ fetch_ai_thread_github() {
 # (and some servers echo DiffNote replies), so classifying each note by its
 # own type/position would strip inline replies of their diff context and
 # misfile them as issue-surface notes. System notes (push/merge events) are
-# skipped. The first note of a thread is its root; later notes map to
+# skipped, and — like the GitHub reader — every note is filtered to the
+# authenticated posting identity (`.author.username == $GH_USER`) so a
+# forged bot marker from another commenter can't steer resume state or the
+# implementer. The first note of a thread is its root; later notes map to
 # in_reply_to_id=<root id>. Pagination is manual (curl has no --paginate):
 # fetch 100-per-page until a short page. API failures (curl non-2xx,
 # non-array body) RETURN NON-ZERO rather than ending the loop quietly: a
@@ -663,6 +677,7 @@ fetch_ai_thread_gitlab() {
       | ($rootnote.position.new_line // $rootnote.position.old_line // null) as $line
       | .notes[]?
       | select((.system // false) | not)
+      | select(.author.username == env.GH_USER)
       | select(.body | test("<!-- ai-loop:"))
       | { surface: $surface,
           id: .id,
