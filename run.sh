@@ -239,29 +239,42 @@ if [[ "$FORGE_HOST" =~ ^(https?)://(.+)$ ]]; then
   FORGE_HOST="${BASH_REMATCH[2]%/}"
 fi
 if [[ -n "$URL_ARG" ]]; then
-  if [[ "$URL_ARG" =~ ^https?://github\.com/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+  # Split scheme/authority/path FIRST, validate the authority (userinfo
+  # smuggling dies here, before any classification), then classify on the
+  # CANONICAL authority: https://GITHUB.COM/..., github.com./..., and
+  # github.com:443/... are all links to the supported GitHub endpoint.
+  # FORGE_HOST keeps the RAW spelling — the later canonicalization step
+  # normalizes it while preserving ORIG_HOST for glab's exact-key probe.
+  [[ "$URL_ARG" =~ ^(https?)://([^/]+)(/.+)$ ]] \
+    || die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
+  URL_SCHEME="${BASH_REMATCH[1]}"; URL_AUTH="${BASH_REMATCH[2]}"; URL_PATH="${BASH_REMATCH[3]}"
+  validate_forge_authority "$URL_AUTH"
+  URL_CANON=$(canon_authority "$URL_AUTH" "$URL_SCHEME")
+  if [[ "$URL_CANON" == "github.com" && "$URL_PATH" =~ ^/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
     # gh always speaks https to github.com; an http:// link is just a link.
-    URL_FORGE=github; URL_HOST=github.com; URL_SCHEME=https
+    URL_FORGE=github; URL_AUTH=github.com; URL_CANON=github.com; URL_SCHEME=https
     URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
-  elif [[ "$URL_ARG" =~ ^(https?)://([^/]+)/(.+)/-/merge_requests/([0-9]+) ]]; then
-    URL_FORGE=gitlab; URL_SCHEME="${BASH_REMATCH[1]}"; URL_HOST="${BASH_REMATCH[2]}"
-    URL_SLUG="${BASH_REMATCH[3]}"; URL_PR="${BASH_REMATCH[4]}"
-  elif [[ "$URL_ARG" =~ ^(https?)://([^/]+)/(.+)/merge_requests/([0-9]+) ]]; then
+  elif [[ "$URL_PATH" =~ ^/(.+)/-/merge_requests/([0-9]+) ]]; then
+    URL_FORGE=gitlab
+    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
+  elif [[ "$URL_PATH" =~ ^/(.+)/merge_requests/([0-9]+) ]]; then
     # Legacy GitLab URL form (pre-13.0, no /-/ separator).
-    URL_FORGE=gitlab; URL_SCHEME="${BASH_REMATCH[1]}"; URL_HOST="${BASH_REMATCH[2]}"
-    URL_SLUG="${BASH_REMATCH[3]}"; URL_PR="${BASH_REMATCH[4]}"
+    URL_FORGE=gitlab
+    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
   else
     die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
   fi
   [[ -z "$FORGE" || "$FORGE" == "$URL_FORGE" ]] \
     || die "--forge $FORGE conflicts with the URL (a $URL_FORGE link)"
-  [[ -z "$FORGE_HOST" || "$FORGE_HOST" == "$URL_HOST" ]] \
-    || die "--host $FORGE_HOST conflicts with the URL host ($URL_HOST)"
+  # Redundant flags may agree in ANY equivalent spelling (case, trailing
+  # dot, default port) — compare canonically.
+  [[ -z "$FORGE_HOST" || "$(canon_authority "$FORGE_HOST" "$URL_SCHEME")" == "$URL_CANON" ]] \
+    || die "--host $FORGE_HOST conflicts with the URL host ($URL_CANON)"
   [[ -z "$FORGE_SCHEME" || "$FORGE_SCHEME" == "$URL_SCHEME" ]] \
     || die "--host scheme ${FORGE_SCHEME}:// conflicts with the URL scheme (${URL_SCHEME}://)"
   [[ -z "$REPO_SLUG" || "$REPO_SLUG" == "$URL_SLUG" ]] \
     || die "--repo $REPO_SLUG conflicts with the URL repo ($URL_SLUG)"
-  FORGE="$URL_FORGE"; FORGE_HOST="$URL_HOST"; FORGE_SCHEME="$URL_SCHEME"
+  FORGE="$URL_FORGE"; FORGE_HOST="$URL_AUTH"; FORGE_SCHEME="$URL_SCHEME"
   REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
 fi
 # Forge inference and the GitHub host check compare CANONICAL authorities:

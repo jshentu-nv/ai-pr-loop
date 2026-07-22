@@ -1235,6 +1235,57 @@ else
   ok
 fi
 
+t "clone guard: dotless decimal-IPv4 origin is rejected (never an 'alias')"
+# 2130706433 == 127.0.0.1 — a resolvable endpoint in disguise, not a
+# ~/.ssh/config alias.
+CLONE_DEC="$WORK/clone-dec"
+git init -q "$CLONE_DEC" >/dev/null 2>&1
+git -C "$CLONE_DEC" remote add origin 'git@2130706433:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_DEC'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "decimal-IPv4 origin accepted as an ssh alias"
+else
+  ok
+fi
+
+t "clone guard: hex-IPv4 origin is rejected"
+CLONE_HEX="$WORK/clone-hex"
+git init -q "$CLONE_HEX" >/dev/null 2>&1
+git -C "$CLONE_HEX" remote add origin 'git@0x7f000001:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_HEX'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "hex-IPv4 origin accepted as an ssh alias"
+else
+  ok
+fi
+
+t "clone guard: octal-IPv4 pushurl is rejected even with a clean fetch URL"
+CLONE_OCT="$WORK/clone-oct"
+git init -q "$CLONE_OCT" >/dev/null 2>&1
+git -C "$CLONE_OCT" remote add origin https://gl.example/g/p.git
+git -C "$CLONE_OCT" remote set-url --push origin 'git@017700000001:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_OCT'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "octal-IPv4 pushurl accepted — commits would go to 127.0.0.1"
+else
+  ok
+fi
+
+t "clone guard: a numeric target matches its own numeric origin exactly"
+CLONE_NUM="$WORK/clone-num"
+git init -q "$CLONE_NUM" >/dev/null 2>&1
+git -C "$CLONE_NUM" remote add origin 'git@2130706433:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=2130706433 REPO_SLUG=g/p REPO_DIR='$CLONE_NUM'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "numeric origin rejected for its own numeric target"
+fi
+
 t "clone guard: a different ssh:// IPv6 origin is rejected too"
 CLONE_V6Y="$WORK/clone-v6y"
 git init -q "$CLONE_V6Y" >/dev/null 2>&1
@@ -1501,6 +1552,28 @@ assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: github PR URL pins forge, repo, and number"
 run_run_sh https://github.com/foo/bar/pull/42 --print-config
 assert_prints 'forge: github host=github.com scheme=https repo=foo/bar pr=42'
+
+# URL classification runs on the CANONICAL authority: equivalent spellings
+# of the GitHub endpoint are github links, not unrecognized/GitLab.
+t "run.sh: uppercase github URL classifies as github"
+run_run_sh https://GITHUB.COM/foo/bar/pull/42 --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=foo/bar pr=42'
+
+t "run.sh: default-port github URL classifies as github"
+run_run_sh https://github.com:443/foo/bar/pull/42 --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=foo/bar pr=42'
+
+t "run.sh: trailing-dot github URL classifies as github"
+run_run_sh https://github.com./foo/bar/pull/42 --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=foo/bar pr=42'
+
+t "run.sh: a redundant --host agreeing in another spelling is accepted"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --host GL.EXAMPLE:443 --print-config
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+
+t "run.sh: a genuinely different --host still conflicts with the URL"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --host other.example --print-config
+assert_dies_with "conflicts with the URL host"
 
 t "run.sh: gitlab.com MR URL selects the gitlab forge (subgroups kept)"
 run_run_sh https://gitlab.com/group/sub/proj/-/merge_requests/7 --print-config
@@ -1865,6 +1938,23 @@ t "config file: snap-installed glab reads its remapped HOME"
 assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" HOME=/h "$BASH_BIN" -c \
   ". '$ROOT/lib/common.sh'; command() { echo /snap/bin/glab; }; glab_config_file")" \
   "/h/snap/glab/current/.config/glab-cli/config.yml"
+
+t "config file: an existing legacy config wins over an XDG override (glab precedence)"
+LEGACY_HOME="$WORK/legacy-home"
+mkdir -p "$LEGACY_HOME/.config/glab-cli"
+printf 'hosts:\n    GL.EXAMPLE:\n        token: legacy\n' > "$LEGACY_HOME/.config/glab-cli/config.yml"
+assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" HOME="$LEGACY_HOME" XDG_CONFIG_HOME=/nonexistent-xdg "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; glab_config_file")" \
+  "$LEGACY_HOME/.config/glab-cli/config.yml"
+
+t "run.sh: discovery reads the legacy config when XDG points elsewhere"
+# HOME is $WORK inside run_run_sh; seed the legacy location there, then
+# remove it so later gitlab tests don't pick up its keys.
+mkdir -p "$WORK/.config/glab-cli"
+printf 'hosts:\n    GL.EXAMPLE:\n        token: legacy\n' > "$WORK/.config/glab-cli/config.yml"
+run_run_sh XDG_CONFIG_HOME=/nonexistent-xdg STUB_GLAB_TOKEN_HOST=GL.EXAMPLE https://gl.example/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk10"
+rm -rf "$WORK/.config/glab-cli"
+assert_dies_with "MR is not open"
 
 t "config keys: discovery unwraps YAML-quoted IPv6 keys"
 # glab serializes bracket keys quoted: '[ABCD::1]':

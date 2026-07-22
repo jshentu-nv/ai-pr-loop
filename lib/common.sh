@@ -111,14 +111,18 @@ glab_config_get() {
 # The config file the glab BINARY actually reads: $GLAB_CONFIG_DIR wins;
 # a Snap-installed glab is confined to its own remapped HOME
 # (~/snap/glab/current/.config/glab-cli), invisible at the caller's
-# default path; everything else uses the XDG default.
+# default path; then glab's legacy location ($HOME/.config/glab-cli) when
+# it EXISTS — glab prefers it over an XDG_CONFIG_HOME override — and the
+# XDG default last.
 glab_config_file() {
   if [[ -n "${GLAB_CONFIG_DIR:-}" ]]; then
     printf '%s/config.yml\n' "$GLAB_CONFIG_DIR"
   elif [[ "$(command -v glab 2>/dev/null)" == /snap/* ]]; then
-    printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "$HOME"
+    printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "${HOME:-}"
+  elif [[ -f "${HOME:-}/.config/glab-cli/config.yml" ]]; then
+    printf '%s/.config/glab-cli/config.yml\n' "${HOME:-}"
   else
-    printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+    printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-${HOME:-}/.config}"
   fi
 }
 
@@ -488,6 +492,14 @@ validate_origin_url() {
         die "REPO_DIR=$REPO_DIR origin $kind URL points at IPv6 host '[$remote_host]', not '[$want_host]' — same slug on a different host is a different repository (IPv6 literals compare textually: if this is the same address in another spelling, point origin at the target's exact spelling)"
         ;;
       *)
+        # A dotless ALL-NUMERIC name is an IP literal in disguise —
+        # decimal (2130706433), legacy octal (017700000001), or hex
+        # (0x7f000001) spellings of an IPv4 address that the resolver
+        # happily connects to. Those are endpoints, not ~/.ssh/config
+        # aliases, and must never ride the alias leniency below.
+        if [[ "$remote_host" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]]; then
+          die "REPO_DIR=$REPO_DIR origin $kind URL host '$remote_host' is a numeric IP spelling, not '$want_host' — same slug on a different host is a different repository"
+        fi
         log "origin $kind host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
         ;;
     esac
