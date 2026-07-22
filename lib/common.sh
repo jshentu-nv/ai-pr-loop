@@ -634,49 +634,60 @@ sync_repo_to_pr_head() {
     # staged/unstaged changes; clean -ffd drops untracked files including
     # embedded git repos (single -f leaves those, and `git add -A` would
     # publish one as a gitlink). Ignored files may stay — `git add -A`
-    # never commits them.
-    git -C "$d" checkout --quiet --force --detach "$target" \
+    # never commits them. core.hooksPath=/dev/null: no caller-installed
+    # hook may run (a post-checkout hook could recreate artifacts right
+    # after cleanup).
+    git -C "$d" -c core.hooksPath=/dev/null checkout --quiet --force --detach "$target" \
       || die "could not check out the PR head $target in $d"
     git -C "$d" clean -qffd \
       || die "could not remove untracked files in $d"
     # An initialized submodule left on a different commit would be staged
     # by `git add -A` as a changed gitlink; put every initialized one back
-    # on the recorded commit (no-op when there are none).
-    git -C "$d" submodule update --quiet --recursive --force \
+    # on the recorded commit, and drop untracked artifacts inside them —
+    # not publishable through a superproject commit, but they change
+    # builds, tests, and what the agents analyze. --checkout: the update
+    # strategy must never come from the just-checked-out .gitmodules
+    # (update=merge/rebase would create commits instead of detaching).
+    # (Both are no-ops when there are no submodules.)
+    git -C "$d" -c core.hooksPath=/dev/null submodule update --quiet --checkout --recursive --force \
       || die "could not reset initialized submodules in $d"
-    # Fail closed on anything the cleanup above did not cover. Submodule
-    # worktree dirt is ignored: it cannot be published through a
-    # superproject commit (only a moved submodule HEAD can, and that was
-    # just reset). One carve-out: a plain worktree-modification (' M') of a
-    # regular tracked file IMMEDIATELY after a forced checkout can only be
-    # non-round-tripping eol/filter content (e.g. a CRLF blob under an
-    # 'eol=lf' attribute committed without renormalizing) — no cleanup can
-    # ever make such a repo probe clean, so dying here would wedge the loop
-    # on legitimate PR content. Warn and continue for that class only;
-    # anything else (untracked, index changes, gitlink drift) still dies.
+    git -C "$d" submodule --quiet foreach --recursive git clean -qffd \
+      || die "could not clean initialized submodules in $d"
+    # Fail closed on anything the cleanup above did not cover.
+    # --ignore-submodules=dirty is config-independent where it matters: it
+    # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
+    # GITLINK (publishable via `git add -A`), while tolerating
+    # submodule-internal worktree state — which cannot be published through
+    # a superproject commit, and whose eol/filter non-idempotent variant no
+    # cleanup could ever silence (dying on it would wedge the loop). A
+    # top-level ' M' here includes checkout-non-idempotent eol/filter
+    # content: an agent's ordinary `git add -A` would stage that
+    # renormalization diff, publishing content the turn did not author —
+    # refusing to run is the only way to keep the commit invariant; the
+    # repo owner can fix the branch with `git add --renormalize . && git
+    # commit`.
     dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
       || die "git status failed in $d"
-    if [[ -n "$dirt" ]]; then
-      local line path benign=1
-      while IFS= read -r line; do
-        [[ "$line" == " M "* ]] || { benign=0; break; }
-        path=${line:3}
-        # Quoted (exotic) paths and gitlinks are not provably benign.
-        [[ "$path" == \"* ]] && { benign=0; break; }
-        [[ "$(git -C "$d" ls-files -s -- "$path" 2>/dev/null | awk '{print $1; exit}')" == "160000" ]] \
-          && { benign=0; break; }
-      done <<< "$dirt"
-      if [[ "$benign" == "1" ]]; then
-        log "warning: checkout-non-idempotent tracked content in $d (eol/filter renormalization; agents' git add -A may stage it): $dirt"
-      else
-        die "residual uncommitted state in $d survived cleanup — refusing to run agents on it: $dirt"
-      fi
-    fi
+    [[ -z "$dirt" ]] \
+      || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
   else
-    dirt=$(git -C "$d" status --porcelain --untracked-files=normal) \
+    # Probe config-independently: a caller's submodule.<name>.ignore=all
+    # would otherwise hide a drifted gitlink from this check, and a turn's
+    # `git add -A` would stage it.
+    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
-      || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, or untracked) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
+      || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
+    # Probe every initialized submodule's own worktree as well: the
+    # superproject probe recurses using EACH SUBMODULE's config, so a
+    # submodule-local status.showUntrackedFiles=no (or a nested
+    # submodule.<name>.ignore=all) could hide caller state that this
+    # invocation's later trusted syncs would clean away.
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             git -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git submodule status probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
     head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
     if [[ -n "$head" && "$head" != "$target" ]] \
        && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
@@ -686,9 +697,33 @@ sync_repo_to_pr_head() {
     # never advance a caller's local branch. --no-overwrite-ignore: an
     # ignored caller file whose path the PR head starts tracking must fail
     # the checkout (fail closed), not be silently replaced — the porcelain
-    # probe above cannot see ignored files.
-    git -C "$d" checkout --quiet --detach --no-overwrite-ignore "$target" \
+    # probe above cannot see ignored files. core.hooksPath=/dev/null: a
+    # caller-installed post-checkout hook must not run (it could create
+    # artifacts a turn's `git add -A` would publish).
+    git -C "$d" -c core.hooksPath=/dev/null checkout --quiet --detach --no-overwrite-ignore "$target" \
       || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
+    # Align initialized submodules with the just-checked-out head (the
+    # gitlink may have moved between the caller's commit and the head).
+    # --checkout: never honor an update=merge/rebase strategy from the
+    # PR-controlled .gitmodules — it would commit onto (or fast-forward)
+    # the caller's local submodule branch instead of detaching. The
+    # worktrees were verified clean above, so nothing of the caller's is
+    # lost.
+    git -C "$d" -c core.hooksPath=/dev/null submodule update --quiet --checkout --recursive --force \
+      || die "could not reset initialized submodules in $d"
+    # Config-independent post-check (superproject and submodule
+    # worktrees): nothing — hook output, submodule drift, filter effects —
+    # may have appeared between the pre-check and here. Caller-preserving:
+    # on failure we die without cleaning.
+    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git status failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d is not clean after checking out the PR head (a hook or filter may have produced state a turn could publish): $dirt"
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             git -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git submodule status probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has state inside initialized submodules after checking out the PR head: $dirt"
     # The caller's clone was verified clean; from here this invocation owns
     # it, and later syncs clean the loop's own turn artifacts (above).
     SYNC_DIR_TRUSTED=1

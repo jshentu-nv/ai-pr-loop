@@ -1807,7 +1807,7 @@ if sync_run feature/x \
    && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/ai-pr-loop/head)" == "$SYNC_HEAD" ]]; then ok
 else bad "a planted symref destination redirected the fetch onto a local branch"; fi
 
-t "sync: eol/filter non-idempotent tracked content warns instead of wedging the loop"
+t "sync: eol/filter non-idempotent content fails closed (a turn's add -A would stage it)"
 EOLN="eol$RANDOM$RANDOM"
 EOL_REMOTE="$WORK/$EOLN-up.git"; git init -q --bare -b main "$EOL_REMOTE"
 EOL_SEED="$WORK/$EOLN-seed"; git init -q -b main "$EOL_SEED"
@@ -1819,12 +1819,165 @@ printf 'w.txt text eol=lf\n' > "$EOL_SEED/.gitattributes"
 git -C "$EOL_SEED" add .gitattributes; git -C "$EOL_SEED" commit -qm attrs   # no renormalize
 git -C "$EOL_SEED" push -q "$EOL_REMOTE" HEAD:refs/heads/feature/x
 EOL_CLONE="$WORK/$EOLN-clone"; git clone -q "$EOL_REMOTE" "$EOL_CLONE"
-EOL_HEAD=$(git -C "$EOL_SEED" rev-parse HEAD)
 if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$EOL_CLONE" BASE_REF=main HEAD_REF=feature/x \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "sync accepted eol-renormalization dirt that git add -A would publish"
+elif git -C "$EOL_CLONE" diff --cached --quiet; then ok   # nothing ever staged
+else bad "sync failed but left staged content behind"; fi
+
+t "sync: --dir dirt guard sees a drifted gitlink despite submodule.<name>.ignore=all"
+SMIN="smi$RANDOM$RANDOM"
+SMI_REPO="$WORK/$SMIN-dep"; git init -q -b main "$SMI_REPO"
+git -C "$SMI_REPO" config user.email t@t; git -C "$SMI_REPO" config user.name t
+echo s1 > "$SMI_REPO/g"; git -C "$SMI_REPO" add g; git -C "$SMI_REPO" commit -qm s1
+SMI_S1=$(git -C "$SMI_REPO" rev-parse HEAD)
+echo s2 >> "$SMI_REPO/g"; git -C "$SMI_REPO" commit -qam s2
+SMI_S2=$(git -C "$SMI_REPO" rev-parse HEAD)
+SMI_REMOTE="$WORK/$SMIN-up.git"; git init -q --bare -b main "$SMI_REMOTE"
+SMI_SEED="$WORK/$SMIN-seed"; git init -q -b main "$SMI_SEED"
+git -C "$SMI_SEED" config user.email t@t; git -C "$SMI_SEED" config user.name t
+echo a > "$SMI_SEED/f"; git -C "$SMI_SEED" add f
+git -C "$SMI_SEED" -c protocol.file.allow=always submodule add -q "$SMI_REPO" dep 2>/dev/null
+git -C "$SMI_SEED/dep" checkout -q "$SMI_S1"
+git -C "$SMI_SEED" add dep .gitmodules; git -C "$SMI_SEED" commit -qm super
+git -C "$SMI_SEED" push -q "$SMI_REMOTE" HEAD:refs/heads/main
+git -C "$SMI_SEED" push -q "$SMI_REMOTE" HEAD:refs/heads/feature/x
+SMI_CLONE="$WORK/$SMIN-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SMI_REMOTE" "$SMI_CLONE"
+git -C "$SMI_CLONE/dep" checkout -q "$SMI_S2"          # caller drifted the gitlink
+git -C "$SMI_CLONE" config submodule.dep.ignore all    # ...and their config hides it
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SMI_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "submodule.<name>.ignore=all hid the drifted gitlink from the --dir dirt guard"
+elif [[ "$(git -C "$SMI_CLONE/dep" rev-parse HEAD)" == "$SMI_S2" ]]; then ok
+else bad "the guard fired but the caller's submodule state was changed"; fi
+
+t "sync: a caller post-checkout hook cannot inject artifacts during --dir sync"
+HKN="hk$RANDOM$RANDOM"
+HK_REMOTE="$WORK/$HKN-up.git"; git init -q --bare -b main "$HK_REMOTE"
+HK_SEED="$WORK/$HKN-seed"; git init -q -b main "$HK_SEED"
+git -C "$HK_SEED" config user.email t@t; git -C "$HK_SEED" config user.name t
+echo a > "$HK_SEED/f"; git -C "$HK_SEED" add f; git -C "$HK_SEED" commit -qm base
+git -C "$HK_SEED" push -q "$HK_REMOTE" HEAD:refs/heads/main
+echo b >> "$HK_SEED/f"; git -C "$HK_SEED" commit -qam head
+HK_HEAD=$(git -C "$HK_SEED" rev-parse HEAD)
+git -C "$HK_SEED" push -q "$HK_REMOTE" HEAD:refs/heads/feature/x
+HK_CLONE="$WORK/$HKN-clone"; git clone -q "$HK_REMOTE" "$HK_CLONE"   # clean, at base
+printf '#!/bin/sh\ntouch generated.txt\n' > "$HK_CLONE/.git/hooks/post-checkout"
+chmod +x "$HK_CLONE/.git/hooks/post-checkout"
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$HK_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
-   && [[ "$(git -C "$EOL_CLONE" rev-parse HEAD)" == "$EOL_HEAD" ]]; then ok
-else bad "managed sync died on inherent eol-renormalization dirt (loop wedged)"; fi
+   && [[ "$(git -C "$HK_CLONE" rev-parse HEAD)" == "$HK_HEAD" ]] \
+   && [[ ! -e "$HK_CLONE/generated.txt" ]]; then ok
+else bad "a post-checkout hook artifact survived the --dir sync (add -A would publish it)"; fi
+
+t "sync: --dir dirt guard sees inner untracked hidden by submodule-local config"
+SMH="smh$RANDOM$RANDOM"
+SMH_REPO="$WORK/$SMH-dep"; git init -q -b main "$SMH_REPO"
+git -C "$SMH_REPO" config user.email t@t; git -C "$SMH_REPO" config user.name t
+echo s1 > "$SMH_REPO/g"; git -C "$SMH_REPO" add g; git -C "$SMH_REPO" commit -qm s1
+SMH_REMOTE="$WORK/$SMH-up.git"; git init -q --bare -b main "$SMH_REMOTE"
+SMH_SEED="$WORK/$SMH-seed"; git init -q -b main "$SMH_SEED"
+git -C "$SMH_SEED" config user.email t@t; git -C "$SMH_SEED" config user.name t
+echo a > "$SMH_SEED/f"; git -C "$SMH_SEED" add f
+git -C "$SMH_SEED" -c protocol.file.allow=always submodule add -q "$SMH_REPO" dep 2>/dev/null
+git -C "$SMH_SEED" add dep .gitmodules; git -C "$SMH_SEED" commit -qm super
+git -C "$SMH_SEED" push -q "$SMH_REMOTE" HEAD:refs/heads/main
+git -C "$SMH_SEED" push -q "$SMH_REMOTE" HEAD:refs/heads/feature/x
+SMH_CLONE="$WORK/$SMH-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SMH_REMOTE" "$SMH_CLONE"
+echo caller-data > "$SMH_CLONE/dep/notes.txt"          # caller's untracked file inside dep
+git -C "$SMH_CLONE/dep" config status.showUntrackedFiles no   # ...hidden by inner config
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SMH_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "inner config hid caller's untracked submodule file (later trusted syncs would delete it)"
+elif [[ -f "$SMH_CLONE/dep/notes.txt" ]]; then ok
+else bad "the guard fired but the caller's inner file was destroyed"; fi
+
+t "sync: a PR-supplied .gitmodules update=merge cannot mutate the caller's submodule branch"
+SMM="smm$RANDOM$RANDOM"
+SMM_REPO="$WORK/$SMM-dep"; git init -q -b main "$SMM_REPO"
+git -C "$SMM_REPO" config user.email t@t; git -C "$SMM_REPO" config user.name t
+echo d2 > "$SMM_REPO/g"; git -C "$SMM_REPO" add g; git -C "$SMM_REPO" commit -qm d2
+SMM_D2=$(git -C "$SMM_REPO" rev-parse HEAD)
+echo d3 >> "$SMM_REPO/g"; git -C "$SMM_REPO" commit -qam d3
+SMM_D3=$(git -C "$SMM_REPO" rev-parse HEAD)
+SMM_REMOTE="$WORK/$SMM-up.git"; git init -q --bare -b main "$SMM_REMOTE"
+SMM_SEED="$WORK/$SMM-seed"; git init -q -b main "$SMM_SEED"
+git -C "$SMM_SEED" config user.email t@t; git -C "$SMM_SEED" config user.name t
+echo a > "$SMM_SEED/f"; git -C "$SMM_SEED" add f
+git -C "$SMM_SEED" -c protocol.file.allow=always submodule add -q "$SMM_REPO" dep 2>/dev/null
+git -C "$SMM_SEED/dep" checkout -q "$SMM_D2"
+git -C "$SMM_SEED" add dep .gitmodules; git -C "$SMM_SEED" commit -qm super
+git -C "$SMM_SEED" push -q "$SMM_REMOTE" HEAD:refs/heads/main
+git -C "$SMM_SEED" config -f .gitmodules submodule.dep.update merge   # PR-controlled strategy
+git -C "$SMM_SEED/dep" checkout -q "$SMM_D3"
+git -C "$SMM_SEED" add dep .gitmodules; git -C "$SMM_SEED" commit -qm "move dep, merge strategy"
+git -C "$SMM_SEED" push -q "$SMM_REMOTE" HEAD:refs/heads/feature/x
+SMM_CLONE="$WORK/$SMM-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SMM_REMOTE" "$SMM_CLONE"
+git -C "$SMM_CLONE/dep" checkout -q -b callerwork      # caller branch at recorded D2
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SMM_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
+   && [[ "$(git -C "$SMM_CLONE/dep" rev-parse refs/heads/callerwork)" == "$SMM_D2" ]] \
+   && [[ "$(git -C "$SMM_CLONE/dep" rev-parse HEAD)" == "$SMM_D3" ]] \
+   && ! git -C "$SMM_CLONE/dep" symbolic-ref -q HEAD >/dev/null; then ok
+else bad "update=merge from the PR's .gitmodules advanced or rewrote the caller's branch"; fi
+
+t "sync: submodule-internal eol noise does not wedge the managed loop"
+SME="sme$RANDOM$RANDOM"
+SME_REPO="$WORK/$SME-dep"; git init -q -b main "$SME_REPO"
+git -C "$SME_REPO" config user.email t@t; git -C "$SME_REPO" config user.name t
+printf 'l1\r\nl2\r\n' > "$SME_REPO/w.txt"
+git -C "$SME_REPO" -c core.autocrlf=false add w.txt; git -C "$SME_REPO" commit -qm crlf
+printf 'w.txt text eol=lf\n' > "$SME_REPO/.gitattributes"
+git -C "$SME_REPO" add .gitattributes; git -C "$SME_REPO" commit -qm attrs   # no renormalize
+SME_REMOTE="$WORK/$SME-up.git"; git init -q --bare -b main "$SME_REMOTE"
+SME_SEED="$WORK/$SME-seed"; git init -q -b main "$SME_SEED"
+git -C "$SME_SEED" config user.email t@t; git -C "$SME_SEED" config user.name t
+echo a > "$SME_SEED/f"; git -C "$SME_SEED" add f
+git -C "$SME_SEED" -c protocol.file.allow=always submodule add -q "$SME_REPO" dep 2>/dev/null
+git -C "$SME_SEED" add dep .gitmodules; git -C "$SME_SEED" commit -qm super
+git -C "$SME_SEED" push -q "$SME_REMOTE" HEAD:refs/heads/main
+git -C "$SME_SEED" push -q "$SME_REMOTE" HEAD:refs/heads/feature/x
+SME_CLONE="$WORK/$SME-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SME_REMOTE" "$SME_CLONE"
+SME_HEAD=$(git -C "$SME_SEED" rev-parse HEAD)
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SME_CLONE" BASE_REF=main HEAD_REF=feature/x \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
+   && [[ "$(git -C "$SME_CLONE" rev-parse HEAD)" == "$SME_HEAD" ]]; then ok
+else bad "inner eol noise (not publishable via the superproject) wedged the managed sync"; fi
+
+t "sync: untracked artifacts inside an initialized submodule are cleaned (managed)"
+SMC="smc$RANDOM$RANDOM"
+SMC_REPO="$WORK/$SMC-dep"; git init -q -b main "$SMC_REPO"
+git -C "$SMC_REPO" config user.email t@t; git -C "$SMC_REPO" config user.name t
+echo s1 > "$SMC_REPO/g"; git -C "$SMC_REPO" add g; git -C "$SMC_REPO" commit -qm s1
+SMC_REMOTE="$WORK/$SMC-up.git"; git init -q --bare -b main "$SMC_REMOTE"
+SMC_SEED="$WORK/$SMC-seed"; git init -q -b main "$SMC_SEED"
+git -C "$SMC_SEED" config user.email t@t; git -C "$SMC_SEED" config user.name t
+echo a > "$SMC_SEED/f"; git -C "$SMC_SEED" add f
+git -C "$SMC_SEED" -c protocol.file.allow=always submodule add -q "$SMC_REPO" dep 2>/dev/null
+git -C "$SMC_SEED" add dep .gitmodules; git -C "$SMC_SEED" commit -qm super
+git -C "$SMC_SEED" push -q "$SMC_REMOTE" HEAD:refs/heads/main
+git -C "$SMC_SEED" push -q "$SMC_REMOTE" HEAD:refs/heads/feature/x
+SMC_CLONE="$WORK/$SMC-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SMC_REMOTE" "$SMC_CLONE"
+echo tampered >> "$SMC_CLONE/dep/g"                    # tracked edit inside submodule
+echo cache > "$SMC_CLONE/dep/generated.cache"          # untracked artifact inside submodule
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SMC_CLONE" BASE_REF=main HEAD_REF=feature/x \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
+   && [[ ! -e "$SMC_CLONE/dep/generated.cache" ]] \
+   && ! grep -q tampered "$SMC_CLONE/dep/g" \
+   && [[ -z "$(git -C "$SMC_CLONE" status --porcelain --untracked-files=normal --ignore-submodules=none)" ]]; then ok
+else bad "state inside an initialized submodule survived the managed sync"; fi
 
 t "sync: an inherited SYNC_DIR_TRUSTED=1 cannot bypass the first --dir dirt check"
 sync_setup feature/x
