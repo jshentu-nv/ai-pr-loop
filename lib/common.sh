@@ -586,8 +586,10 @@ ensure_repo_clone() {
 #     `HEAD` (forges allow it) maps to `refs/remotes/origin/HEAD`, normally
 #     a SYMREF to origin/<default> — fetching into it follows the symref
 #     and corrupts the base tracking ref instead (alternating checkouts).
-#     We fetch into fixed, private, non-symbolic refs (refs/ai-pr-loop/*),
-#     which branch names can never alias.
+#     We fetch into fixed, private refs (refs/ai-pr-loop/*), which branch
+#     names can never alias — and clear each destination with a --no-deref
+#     delete first, so even a pre-planted symref AT the destination cannot
+#     redirect the fetch onto some other ref.
 #   - A force-rewound remote (B→A) leaving a stale local HEAD at B. The
 #     leading-'+' refspec force-updates our private ref to mirror the
 #     remote, then we detach onto it.
@@ -605,15 +607,29 @@ ensure_repo_clone() {
 #     are dropped instead of wedging the loop or being committed.
 #   - Swallowed failures. No `|| true`; every step `|| die`, and HEAD is
 #     asserted equal to the fetched head at the end.
+
+# Internal sentinel: 1 after the first verified-clean --dir sync of THIS
+# process. Reset at source time — an inherited environment value must never
+# be able to skip the first-sync safety checks.
+SYNC_DIR_TRUSTED=0
+
 sync_repo_to_pr_head() {
-  local d="$REPO_DIR" target head dirt
+  local d="$REPO_DIR" target head dirt r
+  # The fetch destinations must be DIRECT refs: git dereferences a
+  # pre-existing symref destination and would force-rewrite whatever local
+  # branch it points at. --no-deref delete removes the symref itself (rc 0
+  # when absent), so the fetch below always creates fresh direct refs.
+  for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
+    git -C "$d" update-ref --no-deref -d "$r" \
+      || die "could not clear stale ref $r in $d"
+  done
   git -C "$d" fetch --quiet origin \
       "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
       "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
     || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
   target=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
     || die "could not resolve the PR head (refs/ai-pr-loop/head) after fetch"
-  if [[ "${MANAGED_CLONE:-1}" == "1" || "${SYNC_DIR_TRUSTED:-0}" == "1" ]]; then
+  if [[ "${MANAGED_CLONE:-1}" == "1" || "$SYNC_DIR_TRUSTED" == "1" ]]; then
     # Unconditionally (even when HEAD already matches): --force drops
     # staged/unstaged changes; clean -ffd drops untracked files including
     # embedded git repos (single -f leaves those, and `git add -A` would
@@ -623,6 +639,39 @@ sync_repo_to_pr_head() {
       || die "could not check out the PR head $target in $d"
     git -C "$d" clean -qffd \
       || die "could not remove untracked files in $d"
+    # An initialized submodule left on a different commit would be staged
+    # by `git add -A` as a changed gitlink; put every initialized one back
+    # on the recorded commit (no-op when there are none).
+    git -C "$d" submodule update --quiet --recursive --force \
+      || die "could not reset initialized submodules in $d"
+    # Fail closed on anything the cleanup above did not cover. Submodule
+    # worktree dirt is ignored: it cannot be published through a
+    # superproject commit (only a moved submodule HEAD can, and that was
+    # just reset). One carve-out: a plain worktree-modification (' M') of a
+    # regular tracked file IMMEDIATELY after a forced checkout can only be
+    # non-round-tripping eol/filter content (e.g. a CRLF blob under an
+    # 'eol=lf' attribute committed without renormalizing) — no cleanup can
+    # ever make such a repo probe clean, so dying here would wedge the loop
+    # on legitimate PR content. Warn and continue for that class only;
+    # anything else (untracked, index changes, gitlink drift) still dies.
+    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+      || die "git status failed in $d"
+    if [[ -n "$dirt" ]]; then
+      local line path benign=1
+      while IFS= read -r line; do
+        [[ "$line" == " M "* ]] || { benign=0; break; }
+        path=${line:3}
+        # Quoted (exotic) paths and gitlinks are not provably benign.
+        [[ "$path" == \"* ]] && { benign=0; break; }
+        [[ "$(git -C "$d" ls-files -s -- "$path" 2>/dev/null | awk '{print $1; exit}')" == "160000" ]] \
+          && { benign=0; break; }
+      done <<< "$dirt"
+      if [[ "$benign" == "1" ]]; then
+        log "warning: checkout-non-idempotent tracked content in $d (eol/filter renormalization; agents' git add -A may stage it): $dirt"
+      else
+        die "residual uncommitted state in $d survived cleanup — refusing to run agents on it: $dirt"
+      fi
+    fi
   else
     dirt=$(git -C "$d" status --porcelain --untracked-files=normal) \
       || die "git status failed in $d"
@@ -634,9 +683,12 @@ sync_repo_to_pr_head() {
       die "REPO_DIR=$d HEAD ($head) is not an ancestor of the PR head ($target) — refusing to discard local work in a --dir clone; reconcile it manually or omit --dir to use a managed checkout"
     fi
     # Detach even when the SHA already matches, so a turn's commit can
-    # never advance a caller's local branch.
-    git -C "$d" checkout --quiet --detach "$target" \
-      || die "could not check out the PR head $target in $d"
+    # never advance a caller's local branch. --no-overwrite-ignore: an
+    # ignored caller file whose path the PR head starts tracking must fail
+    # the checkout (fail closed), not be silently replaced — the porcelain
+    # probe above cannot see ignored files.
+    git -C "$d" checkout --quiet --detach --no-overwrite-ignore "$target" \
+      || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
     # The caller's clone was verified clean; from here this invocation owns
     # it, and later syncs clean the loop's own turn artifacts (above).
     SYNC_DIR_TRUSTED=1

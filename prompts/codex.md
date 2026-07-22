@@ -15,6 +15,9 @@ of the loop (max {{MAX_ITER}}).
 
 1. **Fetch latest state.**
    - `cd {{REPO_DIR}}`
+   - `git update-ref --no-deref -d "refs/ai-pr-loop/base"; git update-ref --no-deref -d "refs/ai-pr-loop/head"`
+     (clears the fetch destinations so a stale symref there can never
+     redirect the fetch; rc is 0 even when the refs don't exist)
    - `git fetch origin "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head"`
    - `git checkout --detach "refs/ai-pr-loop/head"` to land on the exact
      head with Claude's latest commit. Use these private `refs/ai-pr-loop/*`

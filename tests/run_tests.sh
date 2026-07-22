@@ -1609,6 +1609,7 @@ new_case codex-refspec-gh
 run_turn codex
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
+assert_substr    "$CRP" 'git update-ref --no-deref -d "refs/ai-pr-loop/base"; git update-ref --no-deref -d "refs/ai-pr-loop/head"'
 assert_substr    "$CRP" 'git fetch origin "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head"'
 assert_substr    "$CRP" 'git checkout --detach "refs/ai-pr-loop/head"'
 assert_substr    "$CRP" 'git diff "refs/ai-pr-loop/base...HEAD"'
@@ -1620,6 +1621,7 @@ new_case codex-refspec-gl
 run_turn codex FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
+assert_substr    "$CRP" 'git update-ref --no-deref -d "refs/ai-pr-loop/base"; git update-ref --no-deref -d "refs/ai-pr-loop/head"'
 assert_substr    "$CRP" 'git checkout --detach "refs/ai-pr-loop/head"'
 assert_substr    "$CRP" 'git diff "refs/ai-pr-loop/base...HEAD"'
 assert_no_substr "$CRP" 'git checkout "$HEAD_REF"'
@@ -1787,6 +1789,97 @@ sync_setup feature/x
 git init -q "$SYNC_CLONE/vendor-embed" && echo x > "$SYNC_CLONE/vendor-embed/f"
 if sync_run feature/x && [[ ! -e "$SYNC_CLONE/vendor-embed" ]]; then ok
 else bad "embedded repo survived sync; a later git add -A would commit a gitlink"; fi
+
+t "sync: pre-existing symrefs at the private destinations cannot rewrite local branches"
+sync_setup feature/x
+# Each victim sits at the SHA the OTHER destination would write, so a fetch
+# leaking through either surviving symref produces an observable rewrite.
+git -C "$SYNC_CLONE" branch -q victim1 "$SYNC_HEAD"   # base refspec would write SYNC_BASE
+git -C "$SYNC_CLONE" branch -q victim2 "$SYNC_BASE"   # head refspec would write SYNC_HEAD
+git -C "$SYNC_CLONE" symbolic-ref refs/ai-pr-loop/base refs/heads/victim1
+git -C "$SYNC_CLONE" symbolic-ref refs/ai-pr-loop/head refs/heads/victim2
+if sync_run feature/x \
+   && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/heads/victim1)" == "$SYNC_HEAD" ]] \
+   && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/heads/victim2)" == "$SYNC_BASE" ]] \
+   && ! git -C "$SYNC_CLONE" symbolic-ref -q refs/ai-pr-loop/base >/dev/null \
+   && ! git -C "$SYNC_CLONE" symbolic-ref -q refs/ai-pr-loop/head >/dev/null \
+   && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/ai-pr-loop/base)" == "$SYNC_BASE" ]] \
+   && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/ai-pr-loop/head)" == "$SYNC_HEAD" ]]; then ok
+else bad "a planted symref destination redirected the fetch onto a local branch"; fi
+
+t "sync: eol/filter non-idempotent tracked content warns instead of wedging the loop"
+EOLN="eol$RANDOM$RANDOM"
+EOL_REMOTE="$WORK/$EOLN-up.git"; git init -q --bare -b main "$EOL_REMOTE"
+EOL_SEED="$WORK/$EOLN-seed"; git init -q -b main "$EOL_SEED"
+git -C "$EOL_SEED" config user.email t@t; git -C "$EOL_SEED" config user.name t
+printf 'line1\r\nline2\r\n' > "$EOL_SEED/w.txt"
+git -C "$EOL_SEED" -c core.autocrlf=false add w.txt; git -C "$EOL_SEED" commit -qm crlf
+git -C "$EOL_SEED" push -q "$EOL_REMOTE" HEAD:refs/heads/main
+printf 'w.txt text eol=lf\n' > "$EOL_SEED/.gitattributes"
+git -C "$EOL_SEED" add .gitattributes; git -C "$EOL_SEED" commit -qm attrs   # no renormalize
+git -C "$EOL_SEED" push -q "$EOL_REMOTE" HEAD:refs/heads/feature/x
+EOL_CLONE="$WORK/$EOLN-clone"; git clone -q "$EOL_REMOTE" "$EOL_CLONE"
+EOL_HEAD=$(git -C "$EOL_SEED" rev-parse HEAD)
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$EOL_CLONE" BASE_REF=main HEAD_REF=feature/x \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
+   && [[ "$(git -C "$EOL_CLONE" rev-parse HEAD)" == "$EOL_HEAD" ]]; then ok
+else bad "managed sync died on inherent eol-renormalization dirt (loop wedged)"; fi
+
+t "sync: an inherited SYNC_DIR_TRUSTED=1 cannot bypass the first --dir dirt check"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"
+echo caller-edit >> "$SYNC_CLONE/f"                    # tracked, unstaged dirt
+if sync_run feature/x MANAGED_CLONE=0 SYNC_DIR_TRUSTED=1; then
+  bad "ambient SYNC_DIR_TRUSTED skipped the first-sync safety checks"
+elif grep -q caller-edit "$SYNC_CLONE/f"; then ok
+else bad "the bypass was rejected but the caller's edit was destroyed"; fi
+
+t "sync: an initialized submodule on another commit is reset, not staged as a gitlink"
+SUBN="sub$RANDOM$RANDOM"
+SUB_REPO="$WORK/$SUBN-dep"; git init -q -b main "$SUB_REPO"
+git -C "$SUB_REPO" config user.email t@t; git -C "$SUB_REPO" config user.name t
+echo s1 > "$SUB_REPO/g"; git -C "$SUB_REPO" add g; git -C "$SUB_REPO" commit -qm s1
+SUB_S1=$(git -C "$SUB_REPO" rev-parse HEAD)
+echo s2 >> "$SUB_REPO/g"; git -C "$SUB_REPO" commit -qam s2
+SUB_S2=$(git -C "$SUB_REPO" rev-parse HEAD)
+SUB_REMOTE="$WORK/$SUBN-up.git"; git init -q --bare -b main "$SUB_REMOTE"
+SUB_SEED="$WORK/$SUBN-seed"; git init -q -b main "$SUB_SEED"
+git -C "$SUB_SEED" config user.email t@t; git -C "$SUB_SEED" config user.name t
+echo a > "$SUB_SEED/f"; git -C "$SUB_SEED" add f
+git -C "$SUB_SEED" -c protocol.file.allow=always submodule add -q "$SUB_REPO" dep 2>/dev/null
+git -C "$SUB_SEED/dep" checkout -q "$SUB_S1"
+git -C "$SUB_SEED" add dep .gitmodules; git -C "$SUB_SEED" commit -qm super
+git -C "$SUB_SEED" push -q "$SUB_REMOTE" HEAD:refs/heads/main
+git -C "$SUB_SEED" push -q "$SUB_REMOTE" HEAD:refs/heads/feature/x
+SUB_CLONE="$WORK/$SUBN-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SUB_REMOTE" "$SUB_CLONE"
+git -C "$SUB_CLONE/dep" checkout -q "$SUB_S2"          # drift the submodule HEAD
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SUB_CLONE" BASE_REF=main HEAD_REF=feature/x \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
+   && [[ "$(git -C "$SUB_CLONE/dep" rev-parse HEAD)" == "$SUB_S1" ]]; then ok
+else bad "drifted submodule HEAD survived sync; git add -A would stage the gitlink"; fi
+
+t "sync: an ignored caller file the head starts tracking fails closed (--dir)"
+IGN="ign$RANDOM$RANDOM"
+IGN_REMOTE="$WORK/$IGN-up.git"; git init -q --bare -b main "$IGN_REMOTE"
+IGN_SEED="$WORK/$IGN-seed"; git init -q -b main "$IGN_SEED"
+git -C "$IGN_SEED" config user.email t@t; git -C "$IGN_SEED" config user.name t
+printf 'secret\n' > "$IGN_SEED/.gitignore"; echo a > "$IGN_SEED/f"
+git -C "$IGN_SEED" add .gitignore f; git -C "$IGN_SEED" commit -qm base
+git -C "$IGN_SEED" push -q "$IGN_REMOTE" HEAD:refs/heads/main
+echo from-pr > "$IGN_SEED/secret"; git -C "$IGN_SEED" add -f secret
+git -C "$IGN_SEED" commit -qm "track secret"
+git -C "$IGN_SEED" push -q "$IGN_REMOTE" HEAD:refs/heads/feature/x
+IGN_CLONE="$WORK/$IGN-clone"; git clone -q "$IGN_REMOTE" "$IGN_CLONE"   # at base
+echo caller-private > "$IGN_CLONE/secret"              # ignored: porcelain empty
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$IGN_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "--dir sync silently overwrote the caller's ignored file"
+elif [[ "$(cat "$IGN_CLONE/secret")" == "caller-private" ]]; then ok
+else bad "the checkout was rejected but the caller's ignored file was replaced"; fi
 
 # --- run.sh flag validation ----------------------------------------------
 
