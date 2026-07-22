@@ -98,13 +98,33 @@ require_cmd() {
 # credential is GITLAB_TOKEN, which preflight consumes before ever reaching
 # the glab-config fallback.
 # The host key defaults to $FORGE_HOST; preflight may pin $GLAB_HOST_KEY
-# to the equivalent default-port spelling instead (glab keys host config by
-# the exact authority string used at login, so a PAT stored under
-# 'gl.example:443' is invisible under the canonical 'gl.example').
+# to an equivalent stored spelling instead (glab keys host config by the
+# exact authority string used at login, so a PAT stored under
+# 'gl.example:443' or 'GL.EXAMPLE' is invisible under the canonical
+# 'gl.example').
 glab_config_get() {
   env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN -u GLAB_TOKEN \
       -u GLAB_IS_OAUTH2 -u GITLAB_IS_OAUTH2 \
     glab config get "$1" --host "${GLAB_HOST_KEY:-$FORGE_HOST}" 2>/dev/null
+}
+
+# List the EXACT host-key spellings configured in glab (one per line).
+# glab exposes no list command, so read the hosts: section of its config
+# file directly — host keys are the 4-space-indented `key:` lines between
+# `hosts:` and the next top-level key. Used only as a candidate source for
+# the preflight probe (the values are still read through the glab binary),
+# so an unreadable/moved config degrades to the enumerated candidates.
+glab_config_host_keys() {
+  local cfg="${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}/config.yml"
+  [[ -r "$cfg" ]] || return 0
+  awk '
+    /^hosts:[[:space:]]*$/ { in_hosts = 1; next }
+    in_hosts && /^[^[:space:]]/ { in_hosts = 0 }
+    in_hosts && /^    [^[:space:]][^:]*(:[0-9]+)?:[[:space:]]*$/ {
+      k = $0
+      sub(/^    /, "", k); sub(/:[[:space:]]*$/, "", k)
+      print k
+    }' "$cfg" 2>/dev/null
 }
 
 preflight() {
@@ -183,6 +203,15 @@ preflight() {
               _glab_pad="0${_glab_pad}"
             done
           done
+          # Last: DISCOVER configured host keys and keep those whose
+          # canonical authority is this endpoint — covers spellings no
+          # enumeration can (arbitrary case mixed with padding, e.g. a PAT
+          # logged in under 'GL.EXAMPLE' probed from a lowercase run).
+          while IFS= read -r _glab_cand; do
+            [[ -n "$_glab_cand" ]] || continue
+            [[ "$(canon_authority "$_glab_cand" "${FORGE_SCHEME:-https}")" == "$FORGE_HOST" ]] \
+              && set -- "$@" "$_glab_cand"
+          done < <(glab_config_host_keys)
           for _glab_cand in "$@"; do
             [[ -n "$_glab_cand" ]] || continue
             [[ "$_glab_seen" == *" $_glab_cand "* ]] && continue
@@ -226,11 +255,14 @@ preflight() {
 # before the colon contains a slash — i.e. it is a host, not a local path,
 # matching git's own interpretation).
 normalize_remote_slug() {
-  # In order: ssh://[user@]host[:port]/PATH; [user@]host:PATH (scp-style);
-  # http(s)://[cred@]host/PATH; userless host:PATH (scp-style — only when
-  # the char after the colon isn't '/', so scheme prefixes like file://
-  # and absolute scp paths are left intact for the mismatch report).
-  sed -E 's#^ssh://[^/]+/##; s#^[^/:@]+@[^:/]+:##; s#^https?://[^/]+/##; s#^[^/:@]+:([^/])#\1#; s#\.git$##; s#^/##' <<<"$1"
+  # In order: ssh://[user@]host[:port]/PATH; [user@][v6bracket]:PATH and
+  # [user@]host:PATH (scp-style); http(s)://[cred@]host/PATH; userless
+  # host:PATH (scp-style — only when the char after the colon isn't '/',
+  # so scheme prefixes like file:// and absolute scp paths are left intact
+  # for the mismatch report). Bracketed IPv6 strips before the general scp
+  # expressions, whose [^:/]+ would otherwise stop at the first colon
+  # inside the brackets.
+  sed -E 's#^ssh://[^/]+/##; s#^[^/:@]+@\[[^]]+\]:##; s#^[^/:@]+@[^:/]+:##; s#^https?://[^/]+/##; s#^\[[^]]+\]:([^/])#\1#; s#^[^/:@]+:([^/])#\1#; s#\.git$##; s#^/##' <<<"$1"
 }
 
 # Validate a forge authority before it is ever embedded in an API URL: a
@@ -309,7 +341,17 @@ normalize_remote_host() {
       # Unknown transport (file://, ftp://, ...) — not a forge endpoint.
       : ;;
     *@*:*)
-      url="${url#*@}"; lc_host "${url%%:*}"
+      url="${url#*@}"
+      if [[ "$url" == \[* ]]; then
+        # scp-style with a bracketed IPv6 host: git@[::1]:path
+        head="${url%%]*}"; lc_host "${head#[}"
+      else
+        lc_host "${url%%:*}"
+      fi
+      ;;
+    \[*\]:*)
+      # userless bracketed IPv6: [::1]:path
+      head="${url%%]*}"; lc_host "${head#[}"
       ;;
     [!/]*:*)
       head="${url%%:*}"

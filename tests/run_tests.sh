@@ -405,6 +405,14 @@ t "host: ssh:// URL hostname case folds (host_sans_port path)"
 assert_eq "$(normalize_remote_host 'ssh://git@GL.EXAMPLE:2222/g/p.git')" gl.example
 t "host: userless scp hostname case folds"
 assert_eq "$(normalize_remote_host 'GL.EXAMPLE:g/p.git')" gl.example
+t "host: bracketed IPv6 scp origin parses its address"
+assert_eq "$(normalize_remote_host 'git@[::1]:g/p.git')" ::1
+t "host: userless bracketed IPv6 scp origin parses its address"
+assert_eq "$(normalize_remote_host '[::1]:g/p.git')" ::1
+t "slug: bracketed IPv6 scp origin"
+assert_eq "$(normalize_remote_slug 'git@[::1]:g/p.git')" g/p
+t "slug: userless bracketed IPv6 scp origin"
+assert_eq "$(normalize_remote_slug '[::1]:g/p.git')" g/p
 t "authority: userinfo is stripped"
 assert_eq "$(normalize_remote_http_authority 'https://user@gl.example/g/p.git')" gl.example
 t "authority: ssh remote yields nothing (hostname comparison instead)"
@@ -1195,6 +1203,18 @@ else
   bad "uppercase ssh origin rejected for the lowercase host"
 fi
 
+t "clone guard: bracketed IPv6 scp origin passes for the IPv6 target"
+CLONE_V6="$WORK/clone-v6"
+git init -q "$CLONE_V6" >/dev/null 2>&1
+git -C "$CLONE_V6" remote add origin 'git@[::1]:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST='[::1]' REPO_SLUG=g/p REPO_DIR='$CLONE_V6'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "IPv6 scp origin rejected for its own IPv6 target"
+fi
+
 t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
 CLONE_SSHGH="$WORK/clone-sshgh"
 git init -q "$CLONE_SSHGH" >/dev/null 2>&1
@@ -1472,6 +1492,20 @@ assert_prints 'forge: gitlab host=gitlab.example.com scheme=https repo=g/sub/p p
 
 t "run.sh: bare number + --repo stays github on github.com"
 run_run_sh 1 --repo o/n --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
+
+# Equivalent spellings of the supported GitHub endpoint must infer github,
+# not gitlab, and normalize to the canonical host.
+t "run.sh: --host GITHUB.COM infers github and canonicalizes"
+run_run_sh 1 --repo o/n --host GITHUB.COM --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
+
+t "run.sh: --host github.com:443 with --forge github is accepted"
+run_run_sh 1 --repo o/n --forge github --host github.com:443 --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
+
+t "run.sh: --host GITHUB.COM:443 infers github"
+run_run_sh 1 --repo o/n --host GITHUB.COM:443 --print-config
 assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
 
 t "run.sh: --repo conflicting with the URL repo dies"
@@ -1755,6 +1789,28 @@ assert_dies_with "MR is not open"
 t "run.sh: PAT under a case-preserved bare key is found from the port-spelled URL"
 run_run_sh STUB_GLAB_TOKEN_HOST=GL.EXAMPLE https://GL.EXAMPLE:443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk7"
 assert_dies_with "MR is not open"
+
+t "run.sh: LOWERCASE invocation discovers a PAT under an UPPERCASE stored key"
+# Arbitrary case can't be enumerated — the probe falls back to discovering
+# glab's configured host keys (from its config file) and matching their
+# canonical authorities.
+GLAB_CFG_FIX="$WORK/glab-cfg"
+mkdir -p "$GLAB_CFG_FIX"
+cat > "$GLAB_CFG_FIX/config.yml" <<'CFG'
+git_protocol: ssh
+hosts:
+    gitlab.com:
+        token:
+    GL.EXAMPLE:
+        token: from-config
+CFG
+run_run_sh GLAB_CONFIG_DIR="$GLAB_CFG_FIX" STUB_GLAB_TOKEN_HOST=GL.EXAMPLE https://gl.example/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk8"
+assert_dies_with "MR is not open"
+
+t "config keys: discovery lists the exact stored spellings"
+KEYS=$(env -i PATH="$STUBS:/usr/bin:/bin" GLAB_CONFIG_DIR="$GLAB_CFG_FIX" "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; glab_config_host_keys" | tr '\n' ' ')
+assert_eq "$KEYS" "gitlab.com GL.EXAMPLE "
 
 t "run.sh: --preflight-only reports identity, MR URL, and branches"
 # Pre-clean so a guard regression in a previous suite run can't leave

@@ -264,8 +264,13 @@ if [[ -n "$URL_ARG" ]]; then
   FORGE="$URL_FORGE"; FORGE_HOST="$URL_HOST"; FORGE_SCHEME="$URL_SCHEME"
   REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
 fi
+# Forge inference and the GitHub host check compare CANONICAL authorities:
+# GITHUB.COM and github.com:443 are spellings of the supported GitHub
+# endpoint, and matching the literal string would route them through the
+# GitLab path (or reject them as self-hosted GitHub).
 if [[ -z "$FORGE" ]]; then
-  if [[ -n "$FORGE_HOST" && "$FORGE_HOST" != "github.com" ]]; then
+  if [[ -n "$FORGE_HOST" ]] \
+     && [[ "$(canon_authority "$FORGE_HOST" "${FORGE_SCHEME:-https}")" != "github.com" ]]; then
     FORGE=gitlab
   else
     FORGE=github
@@ -274,8 +279,9 @@ fi
 case "$FORGE" in
   github)
     FORGE_HOST="${FORGE_HOST:-github.com}"
-    [[ "$FORGE_HOST" == "github.com" ]] \
+    [[ "$(canon_authority "$FORGE_HOST" https)" == "github.com" ]] \
       || die "self-hosted GitHub is not supported (--host $FORGE_HOST)"
+    FORGE_HOST="github.com"
     FORGE_SCHEME=https
     ;;
   gitlab)
