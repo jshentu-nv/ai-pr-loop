@@ -405,6 +405,12 @@ t "host: ssh:// URL hostname case folds (host_sans_port path)"
 assert_eq "$(normalize_remote_host 'ssh://git@GL.EXAMPLE:2222/g/p.git')" gl.example
 t "host: userless scp hostname case folds"
 assert_eq "$(normalize_remote_host 'GL.EXAMPLE:g/p.git')" gl.example
+t "authority: trailing-dot FQDN spelling folds to the bare name"
+assert_eq "$(normalize_remote_http_authority 'https://gl.example./g/p.git')" gl.example
+t "host: trailing-dot ssh hostname folds to the bare name"
+assert_eq "$(normalize_remote_host 'git@gl.example.:g/p.git')" gl.example
+t "host: trailing-dot ssh:// URL hostname folds too (host_sans_port path)"
+assert_eq "$(normalize_remote_host 'ssh://git@gl.example.:2222/g/p.git')" gl.example
 t "host: bracketed IPv6 scp origin parses its address"
 assert_eq "$(normalize_remote_host 'git@[::1]:g/p.git')" ::1
 t "host: userless bracketed IPv6 scp origin parses its address"
@@ -1215,6 +1221,32 @@ else
   bad "IPv6 scp origin rejected for its own IPv6 target"
 fi
 
+t "clone guard: a DIFFERENT IPv6 scp origin is rejected (never an 'alias')"
+# [::2] is simply another server than [::1] — an IP literal must not ride
+# the dotless-ssh-alias leniency.
+CLONE_V6X="$WORK/clone-v6x"
+git init -q "$CLONE_V6X" >/dev/null 2>&1
+git -C "$CLONE_V6X" remote add origin 'git@[::2]:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST='[::1]' REPO_SLUG=g/p REPO_DIR='$CLONE_V6X'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "origin [::2] accepted for target [::1] — wrong-instance push hole"
+else
+  ok
+fi
+
+t "clone guard: a different ssh:// IPv6 origin is rejected too"
+CLONE_V6Y="$WORK/clone-v6y"
+git init -q "$CLONE_V6Y" >/dev/null 2>&1
+git -C "$CLONE_V6Y" remote add origin 'ssh://git@[::2]:22/g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST='[::1]' REPO_SLUG=g/p REPO_DIR='$CLONE_V6Y'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  bad "ssh:// origin [::2] accepted for target [::1]"
+else
+  ok
+fi
+
 t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
 CLONE_SSHGH="$WORK/clone-sshgh"
 git init -q "$CLONE_SSHGH" >/dev/null 2>&1
@@ -1616,9 +1648,17 @@ t "run.sh: underscore intranet hostname passes validation"
 run_run_sh 3 --repo g/p --host gitlab_master.corp --print-config
 assert_prints 'forge: gitlab host=gitlab_master.corp scheme=https repo=g/p pr=3'
 
-t "run.sh: trailing-dot absolute FQDN passes validation"
+t "run.sh: trailing-dot absolute FQDN passes validation and canonicalizes"
 run_run_sh 3 --repo g/p --host gitlab.example.com. --print-config
-assert_prints 'forge: gitlab host=gitlab.example.com. scheme=https repo=g/p pr=3'
+assert_prints 'forge: gitlab host=gitlab.example.com scheme=https repo=g/p pr=3'
+
+t "run.sh: --host github.com. infers github (absolute-FQDN spelling)"
+run_run_sh 1 --repo o/n --host github.com. --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
+
+t "run.sh: --host github.com. with explicit --forge github is accepted"
+run_run_sh 1 --repo o/n --forge github --host github.com. --print-config
+assert_prints 'forge: github host=github.com scheme=https repo=o/n pr=1'
 
 t "run.sh: http URL reaches the API on http (actual curl target)"
 HTTP_CURL_LOG="$WORK/http-curl.log"
@@ -1811,6 +1851,39 @@ t "config keys: discovery lists the exact stored spellings"
 KEYS=$(env -i PATH="$STUBS:/usr/bin:/bin" GLAB_CONFIG_DIR="$GLAB_CFG_FIX" "$BASH_BIN" -c \
   ". '$ROOT/lib/common.sh'; glab_config_host_keys" | tr '\n' ' ')
 assert_eq "$KEYS" "gitlab.com GL.EXAMPLE "
+
+t "config file: GLAB_CONFIG_DIR wins"
+assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" GLAB_CONFIG_DIR=/x "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; glab_config_file")" "/x/config.yml"
+
+t "config file: XDG default when glab is not a snap"
+assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" XDG_CONFIG_HOME=/xdg "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; glab_config_file")" "/xdg/glab-cli/config.yml"
+
+t "config file: snap-installed glab reads its remapped HOME"
+# A shell function shadows the command builtin, faking a /snap/bin/glab.
+assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" HOME=/h "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; command() { echo /snap/bin/glab; }; glab_config_file")" \
+  "/h/snap/glab/current/.config/glab-cli/config.yml"
+
+t "config keys: discovery unwraps YAML-quoted IPv6 keys"
+# glab serializes bracket keys quoted: '[ABCD::1]':
+GLAB_CFG_V6="$WORK/glab-cfg-v6"
+mkdir -p "$GLAB_CFG_V6"
+cat > "$GLAB_CFG_V6/config.yml" <<'CFG'
+hosts:
+    '[ABCD::1]':
+        token: from-config
+    "[cafe::2]:8443":
+        token: also
+CFG
+KEYS=$(env -i PATH="$STUBS:/usr/bin:/bin" GLAB_CONFIG_DIR="$GLAB_CFG_V6" "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; glab_config_host_keys" | tr '\n' ' ')
+assert_eq "$KEYS" "[ABCD::1] [cafe::2]:8443 "
+
+t "run.sh: lowercase IPv6 invocation discovers the PAT under the quoted uppercase key"
+run_run_sh GLAB_CONFIG_DIR="$GLAB_CFG_V6" STUB_GLAB_TOKEN_HOST='[ABCD::1]' 'https://[abcd::1]/g/p/-/merge_requests/9' --dir "$WORK/glclone-pk9"
+assert_dies_with "MR is not open"
 
 t "run.sh: --preflight-only reports identity, MR URL, and branches"
 # Pre-clean so a guard regression in a previous suite run can't leave

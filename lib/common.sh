@@ -108,21 +108,39 @@ glab_config_get() {
     glab config get "$1" --host "${GLAB_HOST_KEY:-$FORGE_HOST}" 2>/dev/null
 }
 
+# The config file the glab BINARY actually reads: $GLAB_CONFIG_DIR wins;
+# a Snap-installed glab is confined to its own remapped HOME
+# (~/snap/glab/current/.config/glab-cli), invisible at the caller's
+# default path; everything else uses the XDG default.
+glab_config_file() {
+  if [[ -n "${GLAB_CONFIG_DIR:-}" ]]; then
+    printf '%s/config.yml\n' "$GLAB_CONFIG_DIR"
+  elif [[ "$(command -v glab 2>/dev/null)" == /snap/* ]]; then
+    printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "$HOME"
+  else
+    printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+  fi
+}
+
 # List the EXACT host-key spellings configured in glab (one per line).
 # glab exposes no list command, so read the hosts: section of its config
 # file directly — host keys are the 4-space-indented `key:` lines between
-# `hosts:` and the next top-level key. Used only as a candidate source for
-# the preflight probe (the values are still read through the glab binary),
-# so an unreadable/moved config degrades to the enumerated candidates.
+# `hosts:` and the next top-level key, with one layer of YAML quoting
+# stripped (glab quotes keys like '[abcd::1]'). Used only as a candidate
+# source for the preflight probe (the values are still read through the
+# glab binary), so an unreadable/moved config degrades to the enumerated
+# candidates.
 glab_config_host_keys() {
-  local cfg="${GLAB_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/glab-cli}/config.yml"
+  local cfg
+  cfg=$(glab_config_file)
   [[ -r "$cfg" ]] || return 0
   awk '
     /^hosts:[[:space:]]*$/ { in_hosts = 1; next }
     in_hosts && /^[^[:space:]]/ { in_hosts = 0 }
-    in_hosts && /^    [^[:space:]][^:]*(:[0-9]+)?:[[:space:]]*$/ {
+    in_hosts && /^    [^[:space:]].*:[[:space:]]*$/ {
       k = $0
       sub(/^    /, "", k); sub(/:[[:space:]]*$/, "", k)
+      if (k ~ /^\047.*\047$/ || k ~ /^".*"$/) k = substr(k, 2, length(k) - 2)
       print k
     }' "$cfg" 2>/dev/null
 }
@@ -288,6 +306,16 @@ validate_forge_authority() {
 # (stock macOS) lacks ${var,,}, hence tr.
 lc_host() { LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"; }
 
+# Comparable DNS-host form: lowercased, with one trailing dot — the
+# absolute-FQDN spelling of the same name — stripped. IP literals
+# (bracketed or bare IPv6) only lowercase.
+canon_dns_host() {
+  local h
+  h=$(lc_host "$1")
+  if [[ "$h" != \[* && "$h" != *:* && "$h" == *. ]]; then h="${h%.}"; fi
+  printf '%s\n' "$h"
+}
+
 # Canonicalize an http(s) authority for a scheme: the host lowercases (DNS
 # matching is case-insensitive) and the port normalizes NUMERICALLY —
 # leading zeros drop (:0443 is :443 — curl parses the number), the scheme's
@@ -299,20 +327,21 @@ canon_authority() {
   local a="$1" scheme="$2" host port def=''
   case "$scheme" in http) def=80 ;; https) def=443 ;; esac
   if [[ "$a" =~ ^(.+):([0-9]+)$ ]]; then
-    host=$(lc_host "${BASH_REMATCH[1]}"); port=$((10#${BASH_REMATCH[2]}))
+    host=$(canon_dns_host "${BASH_REMATCH[1]}"); port=$((10#${BASH_REMATCH[2]}))
     if [[ -n "$def" ]] && (( port == def )); then
       printf '%s\n' "$host"
     else
       printf '%s:%s\n' "$host" "$port"
     fi
   else
-    lc_host "$a"
+    canon_dns_host "$a"
   fi
 }
 
 # Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
-# their address) and lowercase it. This is the comparable form
-# normalize_remote_host emits — hostname comparisons are case-insensitive.
+# their address) and reduce to the comparable DNS form (lowercased, one
+# trailing dot stripped). This is the form normalize_remote_host emits —
+# hostname comparisons are case- and absolute-FQDN-insensitive.
 host_sans_port() {
   local h="$1"
   if [[ "$h" == \[* ]]; then
@@ -320,7 +349,7 @@ host_sans_port() {
   else
     h="${h%%:*}"
   fi
-  lc_host "$h"
+  canon_dns_host "$h"
 }
 
 # Hostname of a git remote URL: scheme://[user@]host[:port]/path and the
@@ -346,7 +375,7 @@ normalize_remote_host() {
         # scp-style with a bracketed IPv6 host: git@[::1]:path
         head="${url%%]*}"; lc_host "${head#[}"
       else
-        lc_host "${url%%:*}"
+        canon_dns_host "${url%%:*}"
       fi
       ;;
     \[*\]:*)
@@ -355,7 +384,7 @@ normalize_remote_host() {
       ;;
     [!/]*:*)
       head="${url%%:*}"
-      if [[ "$head" != */* ]]; then lc_host "$head"; fi
+      if [[ "$head" != */* ]]; then canon_dns_host "$head"; fi
       ;;
     *)
       : ;;
@@ -448,6 +477,15 @@ validate_origin_url() {
         : ;;
       *.*)
         die "REPO_DIR=$REPO_DIR origin $kind URL points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
+        ;;
+      *:*)
+        # An IP literal is an exact endpoint, never a ~/.ssh/config alias —
+        # a nonmatching IPv6 origin must not ride the dotless-name
+        # leniency below ([::2] is simply a different server than [::1]).
+        # The comparison is TEXTUAL: hextet spellings are not
+        # canonicalized, so [0:0:0:0:0:0:0:1] does not equal [::1] here —
+        # the remediation names that case.
+        die "REPO_DIR=$REPO_DIR origin $kind URL points at IPv6 host '[$remote_host]', not '[$want_host]' — same slug on a different host is a different repository (IPv6 literals compare textually: if this is the same address in another spelling, point origin at the target's exact spelling)"
         ;;
       *)
         log "origin $kind host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
