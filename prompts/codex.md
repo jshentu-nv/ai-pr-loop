@@ -15,9 +15,12 @@ of the loop (max {{MAX_ITER}}).
 
 1. **Fetch latest state.**
    - `cd {{REPO_DIR}}`
-   - `git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"`
-   - `git checkout "$HEAD_REF"` and `git pull --ff-only origin "refs/heads/$HEAD_REF"` so you see Claude's
-     most recent commits.
+   - `git fetch origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"`
+   - `git checkout --detach "refs/remotes/origin/$HEAD_REF"` to land on the
+     exact head with Claude's latest commit. Use `--detach` and the fully
+     qualified `refs/remotes/origin/$HEAD_REF`: a bare `git checkout
+     "$HEAD_REF"` mis-reads an option-like (`-f`) or ambiguous (`@`) branch
+     name and may silently not switch at all.
 
 2. **Read the PR's metadata and full discussion** — not just the bot thread:
    - `gh pr view {{PR_NUMBER}} --repo {{REPO_OWNER}}/{{REPO_NAME}}` for title,

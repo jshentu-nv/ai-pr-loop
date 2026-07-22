@@ -574,6 +574,48 @@ ensure_repo_clone() {
   esac
 }
 
+# Move $REPO_DIR's working tree to the EXACT PR/MR head, or die. Called
+# before every turn so the agents never operate on the wrong commit. It
+# defends against three hazards a plain `git checkout "$HEAD_REF"; git pull
+# --ff-only … || true` does not:
+#   - Option-like / ambiguous forge branch names. `refs/heads/-f` and `@`
+#     are valid refs, but `git checkout "$HEAD_REF"` reads `-f` as a flag
+#     (silently NOT switching, rc 0) and `@` as HEAD. We resolve the head
+#     through its tracking ref and detach onto the literal COMMIT — a SHA
+#     can't be reparsed as an option.
+#   - A force-rewound remote (B→A) leaving a stale local HEAD at B. The
+#     `+refs/heads/X:refs/remotes/origin/X` fetch force-updates the tracking
+#     ref to mirror the remote, then we detach onto A.
+#   - Swallowed failures. No `|| true`; every step `|| die`, and HEAD is
+#     asserted equal to the fetched head at the end.
+# A managed clone (the loop's own) is reset freely; a caller-supplied --dir
+# clone whose HEAD is NOT an ancestor of the fetched head (local-ahead or
+# divergent work) dies rather than have that work discarded.
+sync_repo_to_pr_head() {
+  local d="$REPO_DIR" target head
+  git -C "$d" fetch --quiet origin \
+      "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
+      "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF" \
+    || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
+  target=$(git -C "$d" rev-parse --verify --quiet "refs/remotes/origin/$HEAD_REF^{commit}") \
+    || die "could not resolve the PR head (refs/remotes/origin/$HEAD_REF) after fetch"
+  head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
+  if [[ "$head" != "$target" ]]; then
+    if [[ "${MANAGED_CLONE:-1}" == "1" ]]; then
+      git -C "$d" checkout --quiet --force --detach "$target" \
+        || die "could not check out the PR head $target in $d"
+    else
+      if [[ -n "$head" ]] && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
+        die "REPO_DIR=$d HEAD ($head) is not an ancestor of the PR head ($target) — refusing to discard local work in a --dir clone; reconcile it manually or omit --dir to use a managed checkout"
+      fi
+      git -C "$d" checkout --quiet --detach "$target" \
+        || die "could not check out the PR head $target in $d (uncommitted changes? reconcile manually)"
+    fi
+  fi
+  [[ "$(git -C "$d" rev-parse HEAD)" == "$target" ]] \
+    || die "post-sync HEAD in $d is not the PR head $target"
+}
+
 # --- GitLab API helper ----------------------------------------------------------
 
 # GET a path (with optional query) under $FORGE_SCHEME://$FORGE_HOST/api/v4/.

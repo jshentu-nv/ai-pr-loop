@@ -165,6 +165,7 @@ HARD_CEILING=50           # safety bound when --max 0 (uncapped)
 
 REPO_SLUG=""
 REPO_DIR=""
+MANAGED_CLONE=1          # 0 when --dir points at a caller-supplied clone
 MAX_ITER="$MAX_ITER_DEFAULT"
 CONVERGE_N="$CONVERGE_DEFAULT"
 PR_NUMBER=""
@@ -189,7 +190,7 @@ CODEX_TIER="fast"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)          REPO_SLUG="$2"; shift 2 ;;
-    --dir)           REPO_DIR="$2";  shift 2 ;;
+    --dir)           REPO_DIR="$2"; MANAGED_CLONE=0; shift 2 ;;
     --forge)         [[ $# -ge 2 && "$2" != -* ]] || die "--forge needs github or gitlab"; FORGE="$2"; shift 2 ;;
     --host)          [[ $# -ge 2 && "$2" != -* ]] || die "--host needs a hostname"; FORGE_HOST="$2"; shift 2 ;;
     --max)           MAX_ITER="$2";  shift 2 ;;
@@ -568,19 +569,10 @@ log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 
-# Make sure local checkout matches the remote PR branch.
-( cd "$REPO_DIR"
-  # Fully-qualify refs: a Git-valid branch beginning with '+' (e.g. '+main')
-  # would otherwise be read as a force-refspec ('+src') targeting the wrong
-  # branch. 'refs/heads/…' makes the refspec start with 'refs/', never '+'.
-  git fetch --quiet origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"
-  current=$(git rev-parse --abbrev-ref HEAD)
-  if [[ "$current" != "$HEAD_REF" ]]; then
-    log "switching local branch from $current to $HEAD_REF"
-    git checkout "$HEAD_REF"
-  fi
-  git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true
-)
+# Position the local checkout at the EXACT PR head (fail-closed; handles
+# option-like/ambiguous branch names and force-rewound remotes). See
+# sync_repo_to_pr_head in lib/common.sh.
+sync_repo_to_pr_head
 
 # --- resume detection ---------------------------------------------------------
 #
@@ -692,8 +684,8 @@ while (( RUNS < MAX_ITER )); do
       fi
     fi
 
-    # Pull in case anything landed remotely between turns.
-    ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true )
+    # Re-sync to the PR head in case anything landed remotely between turns.
+    sync_repo_to_pr_head
   fi
 
   # Claude response.
@@ -708,8 +700,8 @@ while (( RUNS < MAX_ITER )); do
     break
   fi
 
-  # Pull — Claude pushed.
-  ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true )
+  # Re-sync — Claude pushed; the local checkout must track the new PR head.
+  sync_repo_to_pr_head
 
   ITER=$((ITER + 1))
   RUNS=$((RUNS + 1))

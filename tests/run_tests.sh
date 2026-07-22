@@ -1596,30 +1596,32 @@ t "claude (gitlab): a malicious branch name cannot inject via sed rendering"
 check_malref_render claude claude.prompt.md \
   FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
 
-# --- refspec-safe branch handling (leading '+' can't force the wrong ref) ---
-# A Git-valid branch like '+main' is read as a force-refspec ('+src') by
-# fetch/push, so every recipe fully-qualifies: fetch/pull refs/heads/<ref>,
-# push HEAD:refs/heads/<ref>, diff refs/remotes/origin/<ref>. run.sh does
-# the same for its own git ops.
+# --- refspec-safe, literal branch handling ---------------------------------
+# A Git-valid branch like '+main' is read as a force-refspec ('+src'), and
+# '-f'/'@' are option-like/ambiguous to `git checkout`. So recipes fetch into
+# the tracking ref, detach onto it (codex) / push HEAD:refs/heads/<ref>
+# (claude), and diff refs/remotes/origin/<ref>; run.sh syncs via
+# sync_repo_to_pr_head. No bare-branch positional refspec anywhere.
 
-t "codex (github): fetch/pull/diff recipes fully-qualify refs"
+t "codex (github): fetch/checkout/diff recipes fully-qualify refs literally"
 new_case codex-refspec-gh
 run_turn codex
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
-assert_substr    "$CRP" 'git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"'
-assert_substr    "$CRP" 'git pull --ff-only origin "refs/heads/$HEAD_REF"'
+assert_substr    "$CRP" 'git fetch origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"'
+assert_substr    "$CRP" 'git checkout --detach "refs/remotes/origin/$HEAD_REF"'
 assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
+assert_no_substr "$CRP" 'git checkout "$HEAD_REF"'
 assert_no_substr "$CRP" 'git fetch origin "$BASE_REF" "$HEAD_REF"'
 
-t "codex (gitlab): fetch/diff recipes fully-qualify refs"
+t "codex (gitlab): fetch/checkout/diff recipes fully-qualify refs literally"
 new_case codex-refspec-gl
 run_turn codex FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
-assert_substr    "$CRP" 'git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"'
+assert_substr    "$CRP" 'git checkout --detach "refs/remotes/origin/$HEAD_REF"'
 assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
-assert_no_substr "$CRP" 'git fetch origin "$BASE_REF" "$HEAD_REF"'
+assert_no_substr "$CRP" 'git checkout "$HEAD_REF"'
 
 t "claude (github): push recipe fully-qualifies the destination ref"
 new_case claude-refspec-gh
@@ -1637,15 +1639,80 @@ CRP="$CASE_DIR/state/iter-01/claude.prompt.md"
 assert_substr    "$CRP" 'git push origin "HEAD:refs/heads/$HEAD_REF"'
 assert_no_substr "$CRP" 'git push origin "$HEAD_REF"'
 
-t "run.sh: its own git fetch/pull fully-qualify refs (no bare +-forceable refspec)"
-if grep -Fq 'git fetch --quiet origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"' "$ROOT/run.sh" \
-   && grep -Fq 'git pull --ff-only --quiet origin "refs/heads/$HEAD_REF"' "$ROOT/run.sh" \
-   && ! grep -Fq 'git fetch --quiet origin "$BASE_REF" "$HEAD_REF"' "$ROOT/run.sh" \
-   && ! grep -Fq 'git pull --ff-only --quiet origin "$HEAD_REF"' "$ROOT/run.sh"; then
+t "run.sh: syncs via sync_repo_to_pr_head, not a bare best-effort pull"
+if grep -Fq 'sync_repo_to_pr_head' "$ROOT/run.sh" \
+   && ! grep -Fq 'git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true' "$ROOT/run.sh" \
+   && ! grep -Fq 'git checkout "$HEAD_REF"' "$ROOT/run.sh"; then
   ok
 else
-  bad "run.sh git fetch/pull are not refspec-safe"
+  bad "run.sh still uses a bare pull/checkout instead of the fail-closed sync"
 fi
+
+# --- sync_repo_to_pr_head (real git: exact head, fail-closed, literal) -------
+# Build a bare remote with 'main' and a head branch (whose name may be
+# option-like/ambiguous), plus a clone, and exercise the sync directly.
+sync_setup() {  # <head-branch> -> $SYNC_REMOTE $SYNC_CLONE $SYNC_SEED $SYNC_HEAD $SYNC_BASE
+  local hb="$1" n="sync$RANDOM$RANDOM"
+  SYNC_REMOTE="$WORK/$n-remote.git"; git init -q --bare -b main "$SYNC_REMOTE"
+  SYNC_SEED="$WORK/$n-seed"; git init -q -b main "$SYNC_SEED"
+  git -C "$SYNC_SEED" config user.email t@t; git -C "$SYNC_SEED" config user.name t
+  echo base > "$SYNC_SEED/f"; git -C "$SYNC_SEED" add f; git -C "$SYNC_SEED" commit -qm base
+  SYNC_BASE=$(git -C "$SYNC_SEED" rev-parse HEAD)
+  git -C "$SYNC_SEED" push -q "$SYNC_REMOTE" HEAD:refs/heads/main
+  echo head >> "$SYNC_SEED/f"; git -C "$SYNC_SEED" commit -qam head
+  SYNC_HEAD=$(git -C "$SYNC_SEED" rev-parse HEAD)
+  git -C "$SYNC_SEED" push -q "$SYNC_REMOTE" "HEAD:refs/heads/$hb"
+  SYNC_CLONE="$WORK/$n-clone"; git clone -q "$SYNC_REMOTE" "$SYNC_CLONE"
+}
+sync_run() {  # <head-ref> [VAR=VAL ...]
+  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    REPO_DIR="$SYNC_CLONE" BASE_REF=main HEAD_REF="$1" "${@:2}" \
+    "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1
+}
+sync_head_now() { git -C "$SYNC_CLONE" rev-parse HEAD; }
+
+t "sync: managed clone lands on the exact head (ordinary branch)"
+sync_setup feature/x
+if sync_run feature/x && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
+else bad "sync did not land the managed clone on the head"; fi
+
+t "sync: an option-like '-f' head branch is selected literally"
+sync_setup -f
+if sync_run -f && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
+else bad "'-f' head not selected literally (checkout mis-parsed it as a flag?)"; fi
+
+t "sync: an ambiguous '@' head branch is selected literally"
+sync_setup '@'
+if sync_run '@' && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
+else bad "'@' head not selected literally"; fi
+
+t "sync: a leading-'+' head branch is selected literally"
+sync_setup '+weird'
+if sync_run '+weird' && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
+else bad "'+weird' head not selected literally"; fi
+
+t "sync: a force-rewound managed clone hard-resets to the new head"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"   # local at B
+git -C "$SYNC_SEED" push -q --force "$SYNC_REMOTE" "$SYNC_BASE:refs/heads/feature/x"  # remote B->A
+if sync_run feature/x && [[ "$(sync_head_now)" == "$SYNC_BASE" ]]; then ok
+else bad "sync did not reset the stale local HEAD to the rewound remote head"; fi
+
+t "sync: a --dir clone with local-ahead work fails closed (not discarded)"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"
+git -C "$SYNC_CLONE" config user.email t@t; git -C "$SYNC_CLONE" config user.name t
+echo local >> "$SYNC_CLONE/f"; git -C "$SYNC_CLONE" commit -qam localahead
+SYNC_AHEAD=$(sync_head_now)
+if sync_run feature/x MANAGED_CLONE=0; then bad "discarded local-ahead work in a --dir clone"
+elif [[ "$(sync_head_now)" == "$SYNC_AHEAD" ]]; then ok
+else bad "--dir local-ahead HEAD was moved despite the fail-closed guard"; fi
+
+t "sync: a --dir clone behind the head advances cleanly"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_BASE"   # ancestor of head
+if sync_run feature/x MANAGED_CLONE=0 && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
+else bad "--dir clone behind the head did not advance to it"; fi
 
 # --- run.sh flag validation ----------------------------------------------
 

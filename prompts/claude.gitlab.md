@@ -85,7 +85,11 @@ past a failed mutation as if it landed.
          ai-loop: claude-implementer
          "
      ```
-   - Push: `git push origin "HEAD:refs/heads/$HEAD_REF"`
+   - Push: `git push origin "HEAD:refs/heads/$HEAD_REF"`. The loop already
+     positioned this checkout at the head (it may be a detached HEAD);
+     commit here and push with that `HEAD:refs/heads/…` refspec. Do **not**
+     `git checkout "$HEAD_REF"` — an option-like (`-f`) or ambiguous (`@`)
+     branch name may silently fail to switch.
    - One commit per iteration is preferred; if multiple logical fixes
      warrant multiple commits, that's fine.
 
