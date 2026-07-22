@@ -61,8 +61,10 @@ per-iteration progress (verdicts, issue counts, errors) back into the
 conversation. When the loop terminates it reports the final verdict, the
 per-iter wall time, and a link to the PR.
 
-The agent will only act under your gh-authed identity, only on the PR you
-named, and will ask you to confirm the first time it's about to post.
+The agent only acts on the PR/MR you named, posting comments under your
+forge API identity (gh PAT on GitHub, GitLab token on GitLab) and pushing
+commits through the checkout's git credential (which may be a different
+account), and will ask you to confirm the first time it's about to post.
 
 ## What the agents do
 

@@ -393,6 +393,10 @@ t "authority: http remote keeps its non-default port"
 assert_eq "$(normalize_remote_http_authority 'http://gitlab.lab:8929/g/p.git')" gitlab.lab:8929
 t "authority: https remote drops an explicit default port"
 assert_eq "$(normalize_remote_http_authority 'https://gl.example:443/g/p.git')" gl.example
+t "authority: leading-zero default port drops numerically"
+assert_eq "$(normalize_remote_http_authority 'https://gl.example:0443/g/p.git')" gl.example
+t "authority: leading-zero non-default port normalizes its digits"
+assert_eq "$(normalize_remote_http_authority 'http://gitlab.lab:08929/g/p.git')" gitlab.lab:8929
 t "authority: userinfo is stripped"
 assert_eq "$(normalize_remote_http_authority 'https://user@gl.example/g/p.git')" gl.example
 t "authority: ssh remote yields nothing (hostname comparison instead)"
@@ -1135,6 +1139,30 @@ else
   bad "https origin with explicit :443 rejected for the bare host"
 fi
 
+t "clone guard: leading-zero default-port origin equals the bare host"
+CLONE_LZ="$WORK/clone-lz"
+git init -q "$CLONE_LZ" >/dev/null 2>&1
+git -C "$CLONE_LZ" remote add origin https://gl.example:0443/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_LZ'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "https origin with :0443 rejected for the bare host (same endpoint)"
+fi
+
+t "clone guard: leading-zero non-default-port origin equals its canonical spelling"
+CLONE_LZ2="$WORK/clone-lz2"
+git init -q "$CLONE_LZ2" >/dev/null 2>&1
+git -C "$CLONE_LZ2" remote add origin http://gitlab.lab:08929/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gitlab.lab:8929 FORGE_SCHEME=http REPO_SLUG=g/p REPO_DIR='$CLONE_LZ2'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "http origin with :08929 rejected for canonical :8929 target"
+fi
+
 t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
 CLONE_SSHGH="$WORK/clone-sshgh"
 git init -q "$CLONE_SSHGH" >/dev/null 2>&1
@@ -1599,13 +1627,52 @@ assert_dies_with "pre-canonicalization spelling"
 
 t "run.sh: legacy state keyed by a leading-zero spelling also refuses"
 # A pre-normalization build keyed a ':0443'-spelled run verbatim; the
-# guard must probe this invocation's own original spelling too, or the
-# re-key silently orphans that tree.
+# guard discovers equivalent-spelling trees by scanning, so ANY re-entry
+# spelling must refuse, not just the one that recreates the old name.
 mkdir -p "$ROOT/state/gl.example:0443__g__p/pr-9"
 printf 'gitlab https://gl.example:0443 g/p\n' > "$ROOT/state/gl.example:0443__g__p/pr-9/.repo-slug"
 run_run_sh https://gl.example:0443/g/p/-/merge_requests/9 --print-config
 rm -rf "$ROOT/state/gl.example:0443__g__p"
 assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: BARE invocation refuses a ':0443'-keyed legacy tree (reverse spelling)"
+mkdir -p "$ROOT/state/gl.example:0443__g__p/pr-9"
+printf 'gitlab https://gl.example:0443 g/p\n' > "$ROOT/state/gl.example:0443__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:0443__g__p"
+assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: bare HTTP invocation refuses a ':080'-keyed legacy tree"
+mkdir -p "$ROOT/state/gitlab.lab:080__g__p/pr-9"
+printf 'gitlab http://gitlab.lab:080 g/p\n' > "$ROOT/state/gitlab.lab:080__g__p/pr-9/.repo-slug"
+run_run_sh http://gitlab.lab/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gitlab.lab:080__g__p"
+assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: canonical ':8443' invocation refuses an ':08443'-keyed legacy tree"
+mkdir -p "$ROOT/state/gl.example:08443__g__p/pr-9"
+printf 'gitlab https://gl.example:08443 g/p\n' > "$ROOT/state/gl.example:08443__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example:8443/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:08443__g__p"
+assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: the canonical tree itself never triggers the guard (resume works)"
+# The scan enumerates the canonical tree too; skipping it is load-bearing —
+# without the skip, every resumed GitLab run would die on its own state.
+mkdir -p "$ROOT/state/gl.example__g__p/pr-9"
+printf 'gitlab https://gl.example g/p\n' > "$ROOT/state/gl.example__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example__g__p"
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+
+t "run.sh: a same-slug tree for an UNRELATED host never triggers the guard"
+# The canon-equivalence filter is load-bearing too: gitlab.internal is not
+# a spelling of gl.example, whatever its marker says.
+mkdir -p "$ROOT/state/gitlab.internal__g__p/pr-9"
+printf 'gitlab https://gitlab.internal g/p\n' > "$ROOT/state/gitlab.internal__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gitlab.internal__g__p"
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
 
 t "run.sh: a canonical http-on-443 tree is NOT mistaken for legacy https state"
 # 443 is not http's default port, so state/gl.example:443__g__p with an
@@ -1623,6 +1690,12 @@ assert_dies_with "MR is not open"
 
 t "run.sh: stored PAT under the default-port glab key is found (bare invocation)"
 run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:443 https://gl.example/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk2"
+assert_dies_with "MR is not open"
+
+t "run.sh: stored PAT under the exact leading-zero glab key is found"
+# glab keys config by the exact login string; the invocation's original
+# validated spelling must be probed alongside canonical + default twin.
+run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:0443 https://gl.example:0443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk3"
 assert_dies_with "MR is not open"
 
 t "run.sh: --preflight-only reports identity, MR URL, and branches"

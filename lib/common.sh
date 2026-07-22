@@ -137,22 +137,29 @@ preflight() {
       # Detect that configuration and reject it with instructions rather
       # than failing obscurely on /user (or hours later on token expiry).
       if [[ -z "${GITLAB_TOKEN:-}" ]]; then
-        # FORGE_HOST is canonical (default port stripped), but glab keys
-        # its host config by the exact string used at login — a PAT stored
-        # under 'gl.example:443' is invisible under 'gl.example'. Probe the
-        # canonical key first, then the equivalent default-port twin, and
-        # pin ONE key for the paired is_oauth2/token reads so the auth mode
-        # and the token can never come from different sessions.
-        local _glab_twin=''
+        # FORGE_HOST is canonical (port numerically normalized), but glab
+        # keys its host config by the EXACT string used at login — a PAT
+        # stored under 'gl.example:443' or 'gl.example:0443' is invisible
+        # under 'gl.example'. Probe the canonical key, then the
+        # invocation's original validated spelling (run.sh's ORIG_HOST),
+        # then the default-port twin, and pin ONE key for the paired
+        # is_oauth2/token reads so the auth mode and the token can never
+        # come from different sessions.
+        local _glab_twin='' _glab_cand
         GLAB_HOST_KEY="$FORGE_HOST"
         case "${FORGE_SCHEME:-https}" in
           http)  _glab_twin="${FORGE_HOST}:80"  ;;
           https) _glab_twin="${FORGE_HOST}:443" ;;
         esac
-        if [[ -z "$(glab_config_get token)" && -n "$_glab_twin" ]] \
-           && [[ -n "$(GLAB_HOST_KEY="$_glab_twin"; glab_config_get token)" ]]; then
-          log "glab config: PAT stored under host key '$_glab_twin' (default-port spelling) — using that key"
-          GLAB_HOST_KEY="$_glab_twin"
+        if [[ -z "$(glab_config_get token)" ]]; then
+          for _glab_cand in "${ORIG_HOST:-}" "$_glab_twin"; do
+            [[ -n "$_glab_cand" && "$_glab_cand" != "$GLAB_HOST_KEY" ]] || continue
+            if [[ -n "$(GLAB_HOST_KEY="$_glab_cand"; glab_config_get token)" ]]; then
+              log "glab config: PAT stored under host key '$_glab_cand' — using that key"
+              GLAB_HOST_KEY="$_glab_cand"
+              break
+            fi
+          done
         fi
         if [[ "$(glab_config_get is_oauth2)" == "true" ]]; then
           die "glab session for $GLAB_HOST_KEY is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
@@ -211,6 +218,27 @@ validate_forge_authority() {
     || die "invalid forge host '$a' — expected host[:port] (userinfo, paths, or other URL characters are not allowed)"
 }
 
+# Canonicalize an http(s) authority's port NUMERICALLY for a scheme:
+# leading zeros drop (:0443 is :443 — curl parses the number), the scheme's
+# default port drops entirely, any other port keeps its canonical digits.
+# The single normalizer behind target-identity canonicalization, remote
+# comparison, and legacy-state discovery — equivalent spellings must agree
+# everywhere or they fork identity at whichever layer was missed.
+canon_authority() {
+  local a="$1" scheme="$2" host port def=''
+  case "$scheme" in http) def=80 ;; https) def=443 ;; esac
+  if [[ "$a" =~ ^(.+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"; port=$((10#${BASH_REMATCH[2]}))
+    if [[ -n "$def" ]] && (( port == def )); then
+      printf '%s\n' "$host"
+    else
+      printf '%s:%s\n' "$host" "$port"
+    fi
+  else
+    printf '%s\n' "$a"
+  fi
+}
+
 # Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
 # their address). This is the comparable form normalize_remote_host emits.
 host_sans_port() {
@@ -252,11 +280,12 @@ normalize_remote_host() {
   esac
 }
 
-# Authority (host[:port], userinfo stripped, the scheme's default port
-# dropped) of an http(s) git remote; prints nothing for any other transport.
-# Unlike ssh — where the transport port is unrelated to the web port — an
-# HTTP(S) port is part of the instance identity: gitlab.lab:8929 and
-# gitlab.lab:9999 are different GitLabs.
+# Authority (host[:port], userinfo stripped, the port canonicalized
+# numerically per scheme) of an http(s) git remote; prints nothing for any
+# other transport. Unlike ssh — where the transport port is unrelated to
+# the web port — an HTTP(S) port is part of the instance identity:
+# gitlab.lab:8929 and gitlab.lab:9999 are different GitLabs, while
+# gl.example:0443 and gl.example are the same https endpoint.
 normalize_remote_http_authority() {
   local url="$1" scheme authority
   case "$url" in
@@ -265,22 +294,13 @@ normalize_remote_http_authority() {
     *) return 0 ;;
   esac
   authority="${url#*://}"; authority="${authority%%/*}"; authority="${authority#*@}"
-  case "$scheme" in
-    http)  authority="${authority%:80}"  ;;
-    https) authority="${authority%:443}" ;;
-  esac
-  printf '%s\n' "$authority"
+  canon_authority "$authority" "$scheme"
 }
 
-# $FORGE_HOST normalized the same way (the $FORGE_SCHEME default port
-# dropped), so the two sides of the http(s) authority comparison agree.
+# $FORGE_HOST normalized the same way, so the two sides of the http(s)
+# authority comparison agree (a no-op when run.sh already canonicalized).
 forge_http_authority() {
-  local a="$FORGE_HOST"
-  case "${FORGE_SCHEME:-https}" in
-    http)  a="${a%:80}"  ;;
-    https) a="${a%:443}" ;;
-  esac
-  printf '%s\n' "$a"
+  canon_authority "$FORGE_HOST" "${FORGE_SCHEME:-https}"
 }
 
 # Ensure $REPO_DIR contains a clone of $REPO_SLUG. If it doesn't exist (or is
