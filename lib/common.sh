@@ -137,23 +137,56 @@ preflight() {
       # Detect that configuration and reject it with instructions rather
       # than failing obscurely on /user (or hours later on token expiry).
       if [[ -z "${GITLAB_TOKEN:-}" ]]; then
-        # FORGE_HOST is canonical (port numerically normalized), but glab
-        # keys its host config by the EXACT string used at login — a PAT
-        # stored under 'gl.example:443' or 'gl.example:0443' is invisible
-        # under 'gl.example'. Probe the canonical key, then the
-        # invocation's original validated spelling (run.sh's ORIG_HOST),
-        # then the default-port twin, and pin ONE key for the paired
+        # FORGE_HOST is canonical (host lowercased, port numerically
+        # normalized), but glab keys its host config by the EXACT string
+        # used at login — a PAT stored under 'gl.example:443' or
+        # 'gl.example:0443' is invisible under 'gl.example'. Probe the
+        # canonical key, then the invocation's original validated spelling
+        # (run.sh's ORIG_HOST), then EVERY accepted zero-padded spelling of
+        # the endpoint's port (the validator caps ports at 5 digits, so
+        # the paddings are finite), and pin ONE key for the paired
         # is_oauth2/token reads so the auth mode and the token can never
         # come from different sessions.
-        local _glab_twin='' _glab_cand
+        local _glab_cand _glab_base _glab_obase _glab_b _glab_port _glab_pad _glab_seen _glab_bare
         GLAB_HOST_KEY="$FORGE_HOST"
-        case "${FORGE_SCHEME:-https}" in
-          http)  _glab_twin="${FORGE_HOST}:80"  ;;
-          https) _glab_twin="${FORGE_HOST}:443" ;;
-        esac
+        _glab_base="$FORGE_HOST"; _glab_port=''; _glab_bare=1
+        if [[ "$FORGE_HOST" =~ ^(.+):([0-9]+)$ ]]; then
+          _glab_base="${BASH_REMATCH[1]}"; _glab_port="${BASH_REMATCH[2]}"; _glab_bare=0
+        else
+          case "${FORGE_SCHEME:-https}" in
+            http)  _glab_port=80  ;;
+            https) _glab_port=443 ;;
+          esac
+        fi
+        # glab stores login spellings verbatim and case-preserved, so when
+        # the invocation's original host part differs in case from the
+        # lowercased canonical base, its spellings must be enumerated too.
+        _glab_obase="${ORIG_HOST:-}"
+        if [[ "$_glab_obase" =~ ^(.+):([0-9]+)$ ]]; then
+          _glab_obase="${BASH_REMATCH[1]}"
+        fi
+        [[ "$_glab_obase" == "$_glab_base" ]] && _glab_obase=''
         if [[ -z "$(glab_config_get token)" ]]; then
-          for _glab_cand in "${ORIG_HOST:-}" "$_glab_twin"; do
-            [[ -n "$_glab_cand" && "$_glab_cand" != "$GLAB_HOST_KEY" ]] || continue
+          _glab_seen=" $GLAB_HOST_KEY "
+          set -- "${ORIG_HOST:-}"
+          for _glab_b in "$_glab_base" "$_glab_obase"; do
+            [[ -n "$_glab_b" ]] || continue
+            # The bare spelling is equivalent only when the endpoint sits
+            # on the scheme's default port (the canonical bare form was
+            # already probed; this adds the original-cased one).
+            if [[ "$_glab_bare" == 1 && "$_glab_b" != "$_glab_base" ]]; then
+              set -- "$@" "$_glab_b"
+            fi
+            _glab_pad="$_glab_port"
+            while [[ -n "$_glab_pad" && ${#_glab_pad} -le 5 ]]; do
+              set -- "$@" "${_glab_b}:${_glab_pad}"
+              _glab_pad="0${_glab_pad}"
+            done
+          done
+          for _glab_cand in "$@"; do
+            [[ -n "$_glab_cand" ]] || continue
+            [[ "$_glab_seen" == *" $_glab_cand "* ]] && continue
+            _glab_seen="${_glab_seen}${_glab_cand} "
             if [[ -n "$(GLAB_HOST_KEY="$_glab_cand"; glab_config_get token)" ]]; then
               log "glab config: PAT stored under host key '$_glab_cand' — using that key"
               GLAB_HOST_KEY="$_glab_cand"
@@ -218,7 +251,13 @@ validate_forge_authority() {
     || die "invalid forge host '$a' — expected host[:port] (userinfo, paths, or other URL characters are not allowed)"
 }
 
-# Canonicalize an http(s) authority's port NUMERICALLY for a scheme:
+# Lowercase a host string: DNS reg-names (and IPv6 hex digits) are
+# case-insensitive, so GL.EXAMPLE and gl.example are one endpoint. bash 3.2
+# (stock macOS) lacks ${var,,}, hence tr.
+lc_host() { LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# Canonicalize an http(s) authority for a scheme: the host lowercases (DNS
+# matching is case-insensitive) and the port normalizes NUMERICALLY —
 # leading zeros drop (:0443 is :443 — curl parses the number), the scheme's
 # default port drops entirely, any other port keeps its canonical digits.
 # The single normalizer behind target-identity canonicalization, remote
@@ -228,19 +267,20 @@ canon_authority() {
   local a="$1" scheme="$2" host port def=''
   case "$scheme" in http) def=80 ;; https) def=443 ;; esac
   if [[ "$a" =~ ^(.+):([0-9]+)$ ]]; then
-    host="${BASH_REMATCH[1]}"; port=$((10#${BASH_REMATCH[2]}))
+    host=$(lc_host "${BASH_REMATCH[1]}"); port=$((10#${BASH_REMATCH[2]}))
     if [[ -n "$def" ]] && (( port == def )); then
       printf '%s\n' "$host"
     else
       printf '%s:%s\n' "$host" "$port"
     fi
   else
-    printf '%s\n' "$a"
+    lc_host "$a"
   fi
 }
 
 # Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
-# their address). This is the comparable form normalize_remote_host emits.
+# their address) and lowercase it. This is the comparable form
+# normalize_remote_host emits — hostname comparisons are case-insensitive.
 host_sans_port() {
   local h="$1"
   if [[ "$h" == \[* ]]; then
@@ -248,7 +288,7 @@ host_sans_port() {
   else
     h="${h%%:*}"
   fi
-  printf '%s\n' "$h"
+  lc_host "$h"
 }
 
 # Hostname of a git remote URL: scheme://[user@]host[:port]/path and the
@@ -269,11 +309,11 @@ normalize_remote_host() {
       # Unknown transport (file://, ftp://, ...) — not a forge endpoint.
       : ;;
     *@*:*)
-      url="${url#*@}"; printf '%s\n' "${url%%:*}"
+      url="${url#*@}"; lc_host "${url%%:*}"
       ;;
     [!/]*:*)
       head="${url%%:*}"
-      if [[ "$head" != */* ]]; then printf '%s\n' "$head"; fi
+      if [[ "$head" != */* ]]; then lc_host "$head"; fi
       ;;
     *)
       : ;;

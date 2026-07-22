@@ -397,6 +397,14 @@ t "authority: leading-zero default port drops numerically"
 assert_eq "$(normalize_remote_http_authority 'https://gl.example:0443/g/p.git')" gl.example
 t "authority: leading-zero non-default port normalizes its digits"
 assert_eq "$(normalize_remote_http_authority 'http://gitlab.lab:08929/g/p.git')" gitlab.lab:8929
+t "authority: hostname case folds (DNS matching is case-insensitive)"
+assert_eq "$(normalize_remote_http_authority 'https://GL.EXAMPLE:443/g/p.git')" gl.example
+t "host: ssh hostname case folds"
+assert_eq "$(normalize_remote_host 'git@GL.EXAMPLE:g/p.git')" gl.example
+t "host: ssh:// URL hostname case folds (host_sans_port path)"
+assert_eq "$(normalize_remote_host 'ssh://git@GL.EXAMPLE:2222/g/p.git')" gl.example
+t "host: userless scp hostname case folds"
+assert_eq "$(normalize_remote_host 'GL.EXAMPLE:g/p.git')" gl.example
 t "authority: userinfo is stripped"
 assert_eq "$(normalize_remote_http_authority 'https://user@gl.example/g/p.git')" gl.example
 t "authority: ssh remote yields nothing (hostname comparison instead)"
@@ -1163,6 +1171,30 @@ else
   bad "http origin with :08929 rejected for canonical :8929 target"
 fi
 
+t "clone guard: lowercase origin passes for an uppercase-spelled target (https)"
+CLONE_CASE="$WORK/clone-case"
+git init -q "$CLONE_CASE" >/dev/null 2>&1
+git -C "$CLONE_CASE" remote add origin https://gl.example/g/p.git
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=GL.EXAMPLE REPO_SLUG=g/p REPO_DIR='$CLONE_CASE'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "case-differing spellings of one DNS host rejected as different endpoints"
+fi
+
+t "clone guard: uppercase ssh origin passes for the lowercase host"
+CLONE_CASE2="$WORK/clone-case2"
+git init -q "$CLONE_CASE2" >/dev/null 2>&1
+git -C "$CLONE_CASE2" remote add origin 'git@GL.EXAMPLE:g/p.git'
+if env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" "$BASH_BIN" -c \
+  "set -euo pipefail; FORGE=gitlab FORGE_HOST=gl.example REPO_SLUG=g/p REPO_DIR='$CLONE_CASE2'; . '$ROOT/lib/common.sh'; ensure_repo_clone" \
+  >/dev/null 2>&1; then
+  ok
+else
+  bad "uppercase ssh origin rejected for the lowercase host"
+fi
+
 t "clone guard: ssh.github.com (SSH over 443) counts as github.com"
 CLONE_SSHGH="$WORK/clone-sshgh"
 git init -q "$CLONE_SSHGH" >/dev/null 2>&1
@@ -1696,6 +1728,32 @@ t "run.sh: stored PAT under the exact leading-zero glab key is found"
 # glab keys config by the exact login string; the invocation's original
 # validated spelling must be probed alongside canonical + default twin.
 run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:0443 https://gl.example:0443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk3"
+assert_dies_with "MR is not open"
+
+t "run.sh: BARE invocation finds a PAT stored under a zero-padded key"
+# Reverse spelling: login used ':0443', invocation is bare — the probe must
+# enumerate every accepted zero-padded spelling of the endpoint's port.
+run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:0443 https://gl.example/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk4"
+assert_dies_with "MR is not open"
+
+t "run.sh: canonical ':8443' invocation finds a PAT stored under ':08443'"
+run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:08443 https://gl.example:8443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk5"
+assert_dies_with "MR is not open"
+
+t "run.sh: uppercase MR URL canonicalizes to the lowercase identity"
+run_run_sh https://GL.EXAMPLE/g/p/-/merge_requests/9 --print-config
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+assert_prints "dir: $ROOT/checkouts/gl.example__g__p"
+
+t "run.sh: PAT under a case-preserved port-spelled key is found from the bare uppercase URL"
+# glab stores login spellings verbatim (case-preserved): the probe must
+# enumerate the original-cased base's spellings, not just the lowercased
+# canonical ones.
+run_run_sh STUB_GLAB_TOKEN_HOST=GL.EXAMPLE:443 https://GL.EXAMPLE/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk6"
+assert_dies_with "MR is not open"
+
+t "run.sh: PAT under a case-preserved bare key is found from the port-spelled URL"
+run_run_sh STUB_GLAB_TOKEN_HOST=GL.EXAMPLE https://GL.EXAMPLE:443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk7"
 assert_dies_with "MR is not open"
 
 t "run.sh: --preflight-only reports identity, MR URL, and branches"

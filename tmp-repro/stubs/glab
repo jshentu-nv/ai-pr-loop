@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+case "$*" in
+  "config get token --host "*)
+    if [[ -n "${GITLAB_TOKEN:-}${GITLAB_ACCESS_TOKEN:-}${OAUTH_TOKEN:-}${GLAB_TOKEN:-}" ]]; then
+      echo "${GITLAB_TOKEN:-${GITLAB_ACCESS_TOKEN:-${OAUTH_TOKEN:-$GLAB_TOKEN}}}"
+      exit 0
+    fi
+    if [[ "${STUB_GLAB_NO_TOKEN:-0}" == "1" ]]; then exit 1; fi
+    if [[ -n "${STUB_GLAB_TOKEN_HOST:-}" && "$*" != *"--host $STUB_GLAB_TOKEN_HOST" ]]; then
+      exit 1
+    fi
+    echo "stub-glab-token"
+    ;;
+  "config get is_oauth2 --host "*)
+    echo "${GLAB_IS_OAUTH2:-${GITLAB_IS_OAUTH2:-${STUB_GLAB_OAUTH:-false}}}"
+    ;;
+  "repo clone "*)
+    if [[ -n "${4:-}" ]]; then mkdir -p "$4"; fi
+    ;;
+esac

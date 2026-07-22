@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+url=''; method=GET; prev=''
+for a in "$@"; do
+  case "$prev" in -X) method="$a" ;; esac
+  [[ "$a" == http://* || "$a" == https://* ]] && url="$a"
+  prev="$a"
+done
+case "$method $url" in
+  "GET "*"/api/v4/user") echo '{"username":"testuser"}' ;;
+  "GET "*"/merge_requests/"*) echo '{}' ;;
+  *) echo '{}' ;;
+esac
