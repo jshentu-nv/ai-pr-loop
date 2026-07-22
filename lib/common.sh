@@ -637,9 +637,9 @@ sync_repo_to_pr_head() {
     # never commits them. core.hooksPath=/dev/null: no caller-installed
     # hook may run (a post-checkout hook could recreate artifacts right
     # after cleanup).
-    git -C "$d" -c core.hooksPath=/dev/null checkout --quiet --force --detach "$target" \
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --force --detach "$target" \
       || die "could not check out the PR head $target in $d"
-    git -C "$d" clean -qffd \
+    git -C "$d" -c core.fsmonitor=false clean -qffd \
       || die "could not remove untracked files in $d"
     # An initialized submodule left on a different commit would be staged
     # by `git add -A` as a changed gitlink; put every initialized one back
@@ -649,9 +649,9 @@ sync_repo_to_pr_head() {
     # strategy must never come from the just-checked-out .gitmodules
     # (update=merge/rebase would create commits instead of detaching).
     # (Both are no-ops when there are no submodules.)
-    git -C "$d" -c core.hooksPath=/dev/null submodule update --quiet --checkout --recursive --force \
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule update --quiet --checkout --recursive --force \
       || die "could not reset initialized submodules in $d"
-    git -C "$d" submodule --quiet foreach --recursive git clean -qffd \
+    git -C "$d" submodule --quiet foreach --recursive git -c core.fsmonitor=false clean -qffd \
       || die "could not clean initialized submodules in $d"
     # Fail closed on anything the cleanup above did not cover.
     # --ignore-submodules=dirty is config-independent where it matters: it
@@ -666,15 +666,19 @@ sync_repo_to_pr_head() {
     # refusing to run is the only way to keep the commit invariant; the
     # repo owner can fix the branch with `git add --renormalize . && git
     # commit`.
-    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+    # core.fsmonitor=false: a formerly---dir clone keeps its caller config,
+    # and a "nothing changed" fsmonitor answer must not fake this probe.
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
       || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
   else
     # Probe config-independently: a caller's submodule.<name>.ignore=all
     # would otherwise hide a drifted gitlink from this check, and a turn's
-    # `git add -A` would stage it.
-    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    # `git add -A` would stage it. core.fsmonitor=false: a caller's
+    # fsmonitor hook/daemon claiming "nothing changed" would make status
+    # skip the real worktree and report a tracked edit as clean.
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
@@ -684,10 +688,30 @@ sync_repo_to_pr_head() {
     # submodule.<name>.ignore=all) could hide caller state that this
     # invocation's later trusted syncs would clean away.
     dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             git -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git submodule status probe failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
+    # An active sparse checkout marks every out-of-cone file skip-worktree,
+    # hiding it from the status probes; refuse it with accurate guidance
+    # (the generic index-bits advice below would only mislead here).
+    if [[ "$(git -C "$d" config --get core.sparseCheckout 2>/dev/null)" == "true" ]]; then
+      die "REPO_DIR=$d uses sparse-checkout, which the loop cannot safely run on (out-of-cone files are hidden from its safety probes) — run 'git sparse-checkout disable' first, or omit --dir to use a managed checkout"
+    fi
+    # assume-unchanged / skip-worktree index bits make status skip a file
+    # entirely: a caller edit behind one would pass the probes above and be
+    # destroyed by this invocation's later forced syncs. ls-files -v tags
+    # them (lowercase = assume-unchanged, 'S'/'s' = skip-worktree); refuse
+    # both, in the superproject and in every initialized submodule.
+    dirt=$(git -C "$d" ls-files -v | { grep -E '^(S|[a-z]) ' || true; }) \
+      || die "git ls-files probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries that hide edits from status — clear them (git update-index --no-assume-unchanged/--no-skip-worktree) before running with --dir: $dirt"
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             'git ls-files -v | { grep -E "^(S|[a-z]) " || true; }') \
+      || die "git submodule ls-files probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries inside initialized submodules — clear them before running with --dir: $dirt"
     head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
     if [[ -n "$head" && "$head" != "$target" ]] \
        && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
@@ -700,27 +724,38 @@ sync_repo_to_pr_head() {
     # probe above cannot see ignored files. core.hooksPath=/dev/null: a
     # caller-installed post-checkout hook must not run (it could create
     # artifacts a turn's `git add -A` would publish).
-    git -C "$d" -c core.hooksPath=/dev/null checkout --quiet --detach --no-overwrite-ignore "$target" \
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$target" \
       || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
-    # Align initialized submodules with the just-checked-out head (the
-    # gitlink may have moved between the caller's commit and the head).
-    # --checkout: never honor an update=merge/rebase strategy from the
-    # PR-controlled .gitmodules — it would commit onto (or fast-forward)
-    # the caller's local submodule branch instead of detaching. The
-    # worktrees were verified clean above, so nothing of the caller's is
-    # lost.
-    git -C "$d" -c core.hooksPath=/dev/null submodule update --quiet --checkout --recursive --force \
-      || die "could not reset initialized submodules in $d"
+    # Align each initialized submodule with the gitlink its (just-updated)
+    # superproject records, exactly as the superproject was treated: a
+    # literal detached checkout with --no-overwrite-ignore, so an ignored
+    # caller file inside a submodule whose path the new gitlink starts
+    # tracking fails closed instead of being silently replaced
+    # ('submodule update --force' has no such protection). $sha1 is
+    # foreach's recorded-gitlink variable — single quotes are deliberate.
+    # Not honoring .gitmodules update strategies is also what keeps a
+    # PR-supplied update=merge/rebase from committing onto caller branches.
+    # If the recorded commit is not fetched yet (e.g. the caller set
+    # fetch.recurseSubmodules=false), try to fetch it best-effort first —
+    # 'submodule update' used to do this; the checkout still fails closed
+    # if the commit stays unavailable.
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule --quiet foreach --recursive \
+        'git rev-parse --verify --quiet "$sha1^{commit}" >/dev/null 2>&1 \
+           || git -c core.hooksPath=/dev/null fetch --quiet origin "$sha1" 2>/dev/null \
+           || git -c core.hooksPath=/dev/null fetch --quiet origin 2>/dev/null \
+           || true; \
+         git -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$sha1"' \
+      || die "could not align initialized submodules with the PR head in $d (a caller file inside a submodule may collide with a path the PR tracks, or a recorded commit could not be fetched; reconcile manually)"
     # Config-independent post-check (superproject and submodule
     # worktrees): nothing — hook output, submodule drift, filter effects —
     # may have appeared between the pre-check and here. Caller-preserving:
     # on failure we die without cleaning.
-    dirt=$(git -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d is not clean after checking out the PR head (a hook or filter may have produced state a turn could publish): $dirt"
     dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             git -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git submodule status probe failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d has state inside initialized submodules after checking out the PR head: $dirt"

@@ -1929,6 +1929,154 @@ if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
    && ! git -C "$SMM_CLONE/dep" symbolic-ref -q HEAD >/dev/null; then ok
 else bad "update=merge from the PR's .gitmodules advanced or rewrote the caller's branch"; fi
 
+t "sync: a caller fsmonitor hook cannot hide tracked edits from the --dir dirt guard"
+FSM="fsm$RANDOM$RANDOM"
+FSM_REMOTE="$WORK/$FSM-up.git"; git init -q --bare -b main "$FSM_REMOTE"
+FSM_SEED="$WORK/$FSM-seed"; git init -q -b main "$FSM_SEED"
+git -C "$FSM_SEED" config user.email t@t; git -C "$FSM_SEED" config user.name t
+echo a > "$FSM_SEED/f"; git -C "$FSM_SEED" add f; git -C "$FSM_SEED" commit -qm base
+git -C "$FSM_SEED" push -q "$FSM_REMOTE" HEAD:refs/heads/main
+echo b >> "$FSM_SEED/f"; git -C "$FSM_SEED" commit -qam head
+git -C "$FSM_SEED" push -q "$FSM_REMOTE" HEAD:refs/heads/feature/x
+FSM_CLONE="$WORK/$FSM-clone"; git clone -q "$FSM_REMOTE" "$FSM_CLONE"
+printf '#!/bin/sh\nprintf "v2tok\\0"\n' > "$FSM_CLONE/.git/fsmon"   # "nothing changed"
+chmod +x "$FSM_CLONE/.git/fsmon"
+git -C "$FSM_CLONE" config core.fsmonitor "$FSM_CLONE/.git/fsmon"
+git -C "$FSM_CLONE" update-index --fsmonitor              # prime the index extension
+git -C "$FSM_CLONE" status --porcelain >/dev/null         # ...while the tree is clean
+echo caller-edit >> "$FSM_CLONE/f"                        # NOW the hook hides this edit
+if [[ -n "$(git -C "$FSM_CLONE" status --porcelain)" ]]; then
+  bad "test precondition failed: the fsmonitor hook did not hide the edit from status"
+elif env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$FSM_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "an fsmonitor hook hid the caller's tracked edit from the --dir dirt guard"
+elif grep -q caller-edit "$FSM_CLONE/f"; then ok
+else bad "the guard fired but the caller's edit was destroyed"; fi
+
+t "sync: a lying fsmonitor hook cannot wedge the trusted-path cleanup"
+FST="fst$RANDOM$RANDOM"
+FST_REMOTE="$WORK/$FST-up.git"; git init -q --bare -b main "$FST_REMOTE"
+FST_SEED="$WORK/$FST-seed"; git init -q -b main "$FST_SEED"
+git -C "$FST_SEED" config user.email t@t; git -C "$FST_SEED" config user.name t
+echo a > "$FST_SEED/f"; git -C "$FST_SEED" add f; git -C "$FST_SEED" commit -qm base
+git -C "$FST_SEED" push -q "$FST_REMOTE" HEAD:refs/heads/main
+git -C "$FST_SEED" push -q "$FST_REMOTE" HEAD:refs/heads/feature/x
+FST_CLONE="$WORK/$FST-clone"; git clone -q "$FST_REMOTE" "$FST_CLONE"
+printf '#!/bin/sh\nprintf "v2tok\\0"\n' > "$FST_CLONE/.git/fsmon"; chmod +x "$FST_CLONE/.git/fsmon"
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$FST_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c '
+       . "$1/lib/common.sh"
+       sync_repo_to_pr_head                    # clean first sync -> trusted
+       git -C "$REPO_DIR" config core.fsmonitor "$REPO_DIR/.git/fsmon"
+       git -C "$REPO_DIR" update-index --fsmonitor
+       git -C "$REPO_DIR" status --porcelain >/dev/null   # prime while clean
+       echo agent-edit >> "$REPO_DIR/f"        # a turn leaves a tracked edit
+       sync_repo_to_pr_head                    # trusted cleanup must drop it
+     ' _ "$ROOT" >/dev/null 2>&1 \
+   && ! grep -q agent-edit "$FST_CLONE/f"; then ok
+else bad "fsmonitor-primed edit survived (or wedged) the trusted-path cleanup"; fi
+
+t "sync: --dir refuses a sparse-checkout clone with accurate guidance"
+SPC="spc$RANDOM$RANDOM"
+SPC_REMOTE="$WORK/$SPC-up.git"; git init -q --bare -b main "$SPC_REMOTE"
+SPC_SEED="$WORK/$SPC-seed"; git init -q -b main "$SPC_SEED"
+git -C "$SPC_SEED" config user.email t@t; git -C "$SPC_SEED" config user.name t
+mkdir -p "$SPC_SEED/dirA" "$SPC_SEED/dirB"
+echo a > "$SPC_SEED/dirA/a.txt"; echo b > "$SPC_SEED/dirB/b.txt"
+git -C "$SPC_SEED" add .; git -C "$SPC_SEED" commit -qm base
+git -C "$SPC_SEED" push -q "$SPC_REMOTE" HEAD:refs/heads/main
+git -C "$SPC_SEED" push -q "$SPC_REMOTE" HEAD:refs/heads/feature/x
+SPC_CLONE="$WORK/$SPC-clone"; git clone -q "$SPC_REMOTE" "$SPC_CLONE"
+git -C "$SPC_CLONE" sparse-checkout set dirA 2>/dev/null
+SPC_ERR=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    REPO_DIR="$SPC_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+    "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" 2>&1) && SPC_RC=0 || SPC_RC=$?
+if [[ "$SPC_RC" != 0 ]] && grep -q 'sparse-checkout disable' <<< "$SPC_ERR"; then ok
+else bad "sparse-checkout --dir clone was accepted, or the die message lacks accurate guidance"; fi
+
+t "sync: assume-unchanged edits inside a submodule fail the --dir guard, edit intact"
+SAU="sau$RANDOM$RANDOM"
+SAU_REPO="$WORK/$SAU-dep"; git init -q -b main "$SAU_REPO"
+git -C "$SAU_REPO" config user.email t@t; git -C "$SAU_REPO" config user.name t
+echo s1 > "$SAU_REPO/g"; git -C "$SAU_REPO" add g; git -C "$SAU_REPO" commit -qm s1
+SAU_REMOTE="$WORK/$SAU-up.git"; git init -q --bare -b main "$SAU_REMOTE"
+SAU_SEED="$WORK/$SAU-seed"; git init -q -b main "$SAU_SEED"
+git -C "$SAU_SEED" config user.email t@t; git -C "$SAU_SEED" config user.name t
+echo a > "$SAU_SEED/f"; git -C "$SAU_SEED" add f
+git -C "$SAU_SEED" -c protocol.file.allow=always submodule add -q "$SAU_REPO" dep 2>/dev/null
+git -C "$SAU_SEED" add dep .gitmodules; git -C "$SAU_SEED" commit -qm super
+git -C "$SAU_SEED" push -q "$SAU_REMOTE" HEAD:refs/heads/main
+git -C "$SAU_SEED" push -q "$SAU_REMOTE" HEAD:refs/heads/feature/x   # gitlink does NOT move
+SAU_CLONE="$WORK/$SAU-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SAU_REMOTE" "$SAU_CLONE"
+echo hidden-edit >> "$SAU_CLONE/dep/g"
+git -C "$SAU_CLONE/dep" update-index --assume-unchanged g   # invisible to every status
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SAU_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "an assume-unchanged submodule edit passed the --dir guard (later syncs destroy it)"
+elif grep -q hidden-edit "$SAU_CLONE/dep/g"; then ok
+else bad "the guard fired but the caller's submodule edit was destroyed"; fi
+
+t "sync: assume-unchanged and skip-worktree edits fail the --dir guard, edits intact"
+AUW="auw$RANDOM$RANDOM"
+AUW_REMOTE="$WORK/$AUW-up.git"; git init -q --bare -b main "$AUW_REMOTE"
+AUW_SEED="$WORK/$AUW-seed"; git init -q -b main "$AUW_SEED"
+git -C "$AUW_SEED" config user.email t@t; git -C "$AUW_SEED" config user.name t
+echo a > "$AUW_SEED/f"; git -C "$AUW_SEED" add f; git -C "$AUW_SEED" commit -qm base
+git -C "$AUW_SEED" push -q "$AUW_REMOTE" HEAD:refs/heads/main
+git -C "$AUW_SEED" push -q "$AUW_REMOTE" HEAD:refs/heads/feature/x
+AUW_CLONE="$WORK/$AUW-clone"; git clone -q "$AUW_REMOTE" "$AUW_CLONE"   # at head already
+echo hidden-edit >> "$AUW_CLONE/f"
+git -C "$AUW_CLONE" update-index --assume-unchanged f   # status now empty
+AUW_OK=1
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    REPO_DIR="$AUW_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+    "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 && AUW_OK=0
+grep -q hidden-edit "$AUW_CLONE/f" || AUW_OK=0
+git -C "$AUW_CLONE" update-index --no-assume-unchanged f
+git -C "$AUW_CLONE" update-index --skip-worktree f      # same hazard, other bit
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    REPO_DIR="$AUW_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+    "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 && AUW_OK=0
+grep -q hidden-edit "$AUW_CLONE/f" || AUW_OK=0
+if [[ "$AUW_OK" == 1 ]]; then ok
+else bad "an assume-unchanged/skip-worktree edit passed the --dir guard or was destroyed"; fi
+
+t "sync: an ignored caller file inside a submodule the PR starts tracking fails closed"
+SIG="sig$RANDOM$RANDOM"
+SIG_REPO="$WORK/$SIG-dep"; git init -q -b main "$SIG_REPO"
+git -C "$SIG_REPO" config user.email t@t; git -C "$SIG_REPO" config user.name t
+printf 'secret\n' > "$SIG_REPO/.gitignore"; echo d1 > "$SIG_REPO/g"
+git -C "$SIG_REPO" add .gitignore g; git -C "$SIG_REPO" commit -qm d1
+SIG_D1=$(git -C "$SIG_REPO" rev-parse HEAD)
+echo from-pr > "$SIG_REPO/secret"; git -C "$SIG_REPO" add -f secret
+git -C "$SIG_REPO" commit -qm "track secret"
+SIG_D2=$(git -C "$SIG_REPO" rev-parse HEAD)
+SIG_REMOTE="$WORK/$SIG-up.git"; git init -q --bare -b main "$SIG_REMOTE"
+SIG_SEED="$WORK/$SIG-seed"; git init -q -b main "$SIG_SEED"
+git -C "$SIG_SEED" config user.email t@t; git -C "$SIG_SEED" config user.name t
+echo a > "$SIG_SEED/f"; git -C "$SIG_SEED" add f
+git -C "$SIG_SEED" -c protocol.file.allow=always submodule add -q "$SIG_REPO" dep 2>/dev/null
+git -C "$SIG_SEED/dep" checkout -q "$SIG_D1"
+git -C "$SIG_SEED" add dep .gitmodules; git -C "$SIG_SEED" commit -qm super
+git -C "$SIG_SEED" push -q "$SIG_REMOTE" HEAD:refs/heads/main
+git -C "$SIG_SEED/dep" checkout -q "$SIG_D2"
+git -C "$SIG_SEED" add dep; git -C "$SIG_SEED" commit -qm "move dep to D2"
+git -C "$SIG_SEED" push -q "$SIG_REMOTE" HEAD:refs/heads/feature/x
+SIG_CLONE="$WORK/$SIG-clone"
+git -c protocol.file.allow=always clone -q --recurse-submodules "$SIG_REMOTE" "$SIG_CLONE"
+echo caller-private > "$SIG_CLONE/dep/secret"          # ignored at D1: probes clean
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SIG_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
+  bad "--dir sync silently replaced the caller's ignored file inside the submodule"
+elif [[ "$(cat "$SIG_CLONE/dep/secret")" == "caller-private" ]] \
+   && [[ "$(git -C "$SIG_CLONE/dep" rev-parse HEAD)" == "$SIG_D1" ]]; then ok
+else bad "the guard fired but the caller's submodule file or HEAD was changed"; fi
+
 t "sync: submodule-internal eol noise does not wedge the managed loop"
 SME="sme$RANDOM$RANDOM"
 SME_REPO="$WORK/$SME-dep"; git init -q -b main "$SME_REPO"
