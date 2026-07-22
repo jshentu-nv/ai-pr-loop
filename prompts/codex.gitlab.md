@@ -37,12 +37,14 @@ never continue past a failed mutation as if it landed.
 
 1. **Fetch latest state.**
    - `cd {{REPO_DIR}}`
-   - `git fetch origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"`
-   - `git checkout --detach "refs/remotes/origin/$HEAD_REF"` to land on the
-     exact head with Claude's latest commit. Use `--detach` and the fully
-     qualified `refs/remotes/origin/$HEAD_REF`: a bare `git checkout
+   - `git fetch origin "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head"`
+   - `git checkout --detach "refs/ai-pr-loop/head"` to land on the exact
+     head with Claude's latest commit. Use these private `refs/ai-pr-loop/*`
+     destinations and `--detach` exactly as written: a bare `git checkout
      "$HEAD_REF"` mis-reads an option-like (`-f`) or ambiguous (`@`) branch
-     name and may silently not switch at all.
+     name, and fetching into `refs/remotes/origin/…` corrupts the tracking
+     refs when a branch is literally named `HEAD` (that path is a symref to
+     the default branch).
 
 2. **Read the MR's metadata and full discussion** — not just the bot thread:
    - `glab mr view {{PR_NUMBER}}` (run inside `{{REPO_DIR}}`; glab resolves
@@ -102,7 +104,7 @@ never continue past a failed mutation as if it landed.
    - When in doubt about whether something is a real issue vs. a stylistic
      preference, **read more code** before flagging it.
 
-5. **Review the current diff** (`git diff "refs/remotes/origin/$BASE_REF...HEAD"`) with
+5. **Review the current diff** (`git diff "refs/ai-pr-loop/base...HEAD"`) with
    that context in mind. Evaluate correctness, design, perf, docs, and
    consistency with the project's conventions. Apply these focused passes
    when the diff touches the relevant area (skip a pass cleanly if it

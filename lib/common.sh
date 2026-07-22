@@ -574,43 +574,72 @@ ensure_repo_clone() {
   esac
 }
 
-# Move $REPO_DIR's working tree to the EXACT PR/MR head, or die. Called
-# before every turn so the agents never operate on the wrong commit. It
-# defends against three hazards a plain `git checkout "$HEAD_REF"; git pull
-# --ff-only … || true` does not:
+# Move $REPO_DIR's working tree to the EXACT PR/MR head — clean and
+# detached — or die. Called before every turn so the agents never operate
+# on (or commit) anything outside the PR. Hazards it defends against:
 #   - Option-like / ambiguous forge branch names. `refs/heads/-f` and `@`
 #     are valid refs, but `git checkout "$HEAD_REF"` reads `-f` as a flag
 #     (silently NOT switching, rc 0) and `@` as HEAD. We resolve the head
-#     through its tracking ref and detach onto the literal COMMIT — a SHA
-#     can't be reparsed as an option.
+#     to a literal COMMIT and detach onto it — a SHA can't be reparsed as
+#     an option.
+#   - Branch-derived tracking-ref destinations. A branch literally named
+#     `HEAD` (forges allow it) maps to `refs/remotes/origin/HEAD`, normally
+#     a SYMREF to origin/<default> — fetching into it follows the symref
+#     and corrupts the base tracking ref instead (alternating checkouts).
+#     We fetch into fixed, private, non-symbolic refs (refs/ai-pr-loop/*),
+#     which branch names can never alias.
 #   - A force-rewound remote (B→A) leaving a stale local HEAD at B. The
-#     `+refs/heads/X:refs/remotes/origin/X` fetch force-updates the tracking
-#     ref to mirror the remote, then we detach onto A.
+#     leading-'+' refspec force-updates our private ref to mirror the
+#     remote, then we detach onto it.
+#   - Leftover working-tree state. An agent turn runs `git add`/`commit`,
+#     so any staged/unstaged/untracked file lying around would be published
+#     with the PR. A managed clone (the loop's own) is force-reset and
+#     cleaned before every turn. A caller-supplied --dir clone is checked
+#     ONCE, on the first sync of this invocation: ANY dirt (probed with
+#     --untracked-files=normal, so a caller's status.showUntrackedFiles=no
+#     can't hide files) or a HEAD that is not an ancestor of the fetched
+#     head (local-ahead/divergent) dies rather than have caller work
+#     discarded or committed. After that first clean sync the invocation
+#     owns the clone: later syncs force-reset and clean it like a managed
+#     one, so build/test artifacts the loop's own agent turns leave behind
+#     are dropped instead of wedging the loop or being committed.
 #   - Swallowed failures. No `|| true`; every step `|| die`, and HEAD is
 #     asserted equal to the fetched head at the end.
-# A managed clone (the loop's own) is reset freely; a caller-supplied --dir
-# clone whose HEAD is NOT an ancestor of the fetched head (local-ahead or
-# divergent work) dies rather than have that work discarded.
 sync_repo_to_pr_head() {
-  local d="$REPO_DIR" target head
+  local d="$REPO_DIR" target head dirt
   git -C "$d" fetch --quiet origin \
-      "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
-      "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF" \
+      "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
+      "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
     || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
-  target=$(git -C "$d" rev-parse --verify --quiet "refs/remotes/origin/$HEAD_REF^{commit}") \
-    || die "could not resolve the PR head (refs/remotes/origin/$HEAD_REF) after fetch"
-  head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
-  if [[ "$head" != "$target" ]]; then
-    if [[ "${MANAGED_CLONE:-1}" == "1" ]]; then
-      git -C "$d" checkout --quiet --force --detach "$target" \
-        || die "could not check out the PR head $target in $d"
-    else
-      if [[ -n "$head" ]] && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
-        die "REPO_DIR=$d HEAD ($head) is not an ancestor of the PR head ($target) — refusing to discard local work in a --dir clone; reconcile it manually or omit --dir to use a managed checkout"
-      fi
-      git -C "$d" checkout --quiet --detach "$target" \
-        || die "could not check out the PR head $target in $d (uncommitted changes? reconcile manually)"
+  target=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
+    || die "could not resolve the PR head (refs/ai-pr-loop/head) after fetch"
+  if [[ "${MANAGED_CLONE:-1}" == "1" || "${SYNC_DIR_TRUSTED:-0}" == "1" ]]; then
+    # Unconditionally (even when HEAD already matches): --force drops
+    # staged/unstaged changes; clean -ffd drops untracked files including
+    # embedded git repos (single -f leaves those, and `git add -A` would
+    # publish one as a gitlink). Ignored files may stay — `git add -A`
+    # never commits them.
+    git -C "$d" checkout --quiet --force --detach "$target" \
+      || die "could not check out the PR head $target in $d"
+    git -C "$d" clean -qffd \
+      || die "could not remove untracked files in $d"
+  else
+    dirt=$(git -C "$d" status --porcelain --untracked-files=normal) \
+      || die "git status failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, or untracked) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
+    head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
+    if [[ -n "$head" && "$head" != "$target" ]] \
+       && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
+      die "REPO_DIR=$d HEAD ($head) is not an ancestor of the PR head ($target) — refusing to discard local work in a --dir clone; reconcile it manually or omit --dir to use a managed checkout"
     fi
+    # Detach even when the SHA already matches, so a turn's commit can
+    # never advance a caller's local branch.
+    git -C "$d" checkout --quiet --detach "$target" \
+      || die "could not check out the PR head $target in $d"
+    # The caller's clone was verified clean; from here this invocation owns
+    # it, and later syncs clean the loop's own turn artifacts (above).
+    SYNC_DIR_TRUSTED=1
   fi
   [[ "$(git -C "$d" rev-parse HEAD)" == "$target" ]] \
     || die "post-sync HEAD in $d is not the PR head $target"

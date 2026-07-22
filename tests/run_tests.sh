@@ -1597,20 +1597,21 @@ check_malref_render claude claude.prompt.md \
   FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
 
 # --- refspec-safe, literal branch handling ---------------------------------
-# A Git-valid branch like '+main' is read as a force-refspec ('+src'), and
-# '-f'/'@' are option-like/ambiguous to `git checkout`. So recipes fetch into
-# the tracking ref, detach onto it (codex) / push HEAD:refs/heads/<ref>
-# (claude), and diff refs/remotes/origin/<ref>; run.sh syncs via
-# sync_repo_to_pr_head. No bare-branch positional refspec anywhere.
+# A Git-valid branch like '+main' is read as a force-refspec ('+src'),
+# '-f'/'@' are option-like/ambiguous to `git checkout`, and a branch named
+# 'HEAD' aliases the origin/HEAD symref if fetched into refs/remotes/origin.
+# So recipes fetch into private non-symbolic refs (refs/ai-pr-loop/*), detach
+# onto the head (codex) / push HEAD:refs/heads/<ref> (claude), and diff
+# refs/ai-pr-loop/base...HEAD; run.sh syncs via sync_repo_to_pr_head.
 
 t "codex (github): fetch/checkout/diff recipes fully-qualify refs literally"
 new_case codex-refspec-gh
 run_turn codex
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
-assert_substr    "$CRP" 'git fetch origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" "+refs/heads/$HEAD_REF:refs/remotes/origin/$HEAD_REF"'
-assert_substr    "$CRP" 'git checkout --detach "refs/remotes/origin/$HEAD_REF"'
-assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
+assert_substr    "$CRP" 'git fetch origin "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head"'
+assert_substr    "$CRP" 'git checkout --detach "refs/ai-pr-loop/head"'
+assert_substr    "$CRP" 'git diff "refs/ai-pr-loop/base...HEAD"'
 assert_no_substr "$CRP" 'git checkout "$HEAD_REF"'
 assert_no_substr "$CRP" 'git fetch origin "$BASE_REF" "$HEAD_REF"'
 
@@ -1619,8 +1620,8 @@ new_case codex-refspec-gl
 run_turn codex FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
 assert_rc0
 CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
-assert_substr    "$CRP" 'git checkout --detach "refs/remotes/origin/$HEAD_REF"'
-assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
+assert_substr    "$CRP" 'git checkout --detach "refs/ai-pr-loop/head"'
+assert_substr    "$CRP" 'git diff "refs/ai-pr-loop/base...HEAD"'
 assert_no_substr "$CRP" 'git checkout "$HEAD_REF"'
 
 t "claude (github): push recipe fully-qualifies the destination ref"
@@ -1713,6 +1714,79 @@ sync_setup feature/x
 git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_BASE"   # ancestor of head
 if sync_run feature/x MANAGED_CLONE=0 && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]]; then ok
 else bad "--dir clone behind the head did not advance to it"; fi
+
+t "sync: a head branch literally named 'HEAD' stays stable across repeated syncs"
+sync_setup HEAD
+SYNC_OK=1
+for _ in 1 2 3 4; do   # the origin/HEAD-symref alias made this alternate base/head
+  sync_run HEAD && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]] || SYNC_OK=0
+done
+if [[ "$SYNC_OK" == 1 ]] \
+   && [[ "$(git -C "$SYNC_CLONE" rev-parse refs/ai-pr-loop/base)" == "$SYNC_BASE" ]]; then ok
+else bad "'HEAD'-named branch aliased a symref: sync alternated or corrupted the base ref"; fi
+
+t "sync: a managed clone's staged/unstaged/untracked dirt is dropped, not committed"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"   # already at target
+echo tampered >> "$SYNC_CLONE/f"                       # unstaged
+echo staged > "$SYNC_CLONE/staged.txt"; git -C "$SYNC_CLONE" add staged.txt   # staged
+echo stray > "$SYNC_CLONE/untracked.txt"               # untracked
+if sync_run feature/x && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]] \
+   && [[ -z "$(git -C "$SYNC_CLONE" status --porcelain)" ]]; then ok
+else bad "managed clone kept dirty state after sync (an agent turn could commit it)"; fi
+
+t "sync: a --dir clone at the exact head but with dirt fails closed, dirt intact"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"   # already at target
+echo staged > "$SYNC_CLONE/staged.txt"; git -C "$SYNC_CLONE" add staged.txt
+echo stray > "$SYNC_CLONE/untracked.txt"
+if sync_run feature/x MANAGED_CLONE=0; then bad "dirty --dir clone at the head was accepted"
+elif [[ -f "$SYNC_CLONE/staged.txt" && -f "$SYNC_CLONE/untracked.txt" ]]; then ok
+else bad "--dir dirt was destroyed by the fail-closed path"; fi
+
+t "sync: a --dir clone behind the head with dirt fails closed, HEAD unmoved"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_BASE"   # behind the head
+echo stray > "$SYNC_CLONE/untracked.txt"
+if sync_run feature/x MANAGED_CLONE=0; then bad "dirty behind --dir clone advanced anyway"
+elif [[ "$(sync_head_now)" == "$SYNC_BASE" && -f "$SYNC_CLONE/untracked.txt" ]]; then ok
+else bad "--dir behind-with-dirt moved HEAD or lost the dirt"; fi
+
+t "sync: a clean --dir clone is detached even when already at the head"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q -b atspot "$SYNC_HEAD"  # attached branch at target
+if sync_run feature/x MANAGED_CLONE=0 && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]] \
+   && ! git -C "$SYNC_CLONE" symbolic-ref -q HEAD >/dev/null; then ok
+else bad "sync left HEAD attached to a local branch (a turn's commit would move it)"; fi
+
+t "sync: --dir dirt guard sees untracked files despite status.showUntrackedFiles=no"
+sync_setup feature/x
+git -C "$SYNC_CLONE" checkout -q --detach "$SYNC_HEAD"
+git -C "$SYNC_CLONE" config status.showUntrackedFiles no   # caller perf setting
+echo stray > "$SYNC_CLONE/untracked.txt"
+if sync_run feature/x MANAGED_CLONE=0; then
+  bad "caller config hid the untracked file from the --dir dirt guard"
+else ok; fi
+
+t "sync: after the first clean --dir sync, agent-turn artifacts are cleaned, not fatal"
+sync_setup feature/x
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     REPO_DIR="$SYNC_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
+     "$BASH_BIN" -c '
+       . "$1/lib/common.sh"
+       sync_repo_to_pr_head                    # strict first sync (clean clone)
+       echo artifact > "$REPO_DIR/agent-scratch.log"   # a turn leaves test output
+       sync_repo_to_pr_head                    # between-turn sync must not die
+     ' _ "$ROOT" >/dev/null 2>&1 \
+   && [[ "$(sync_head_now)" == "$SYNC_HEAD" ]] \
+   && [[ ! -e "$SYNC_CLONE/agent-scratch.log" ]]; then ok
+else bad "mid-run --dir sync died on (or kept) the loop's own turn artifact"; fi
+
+t "sync: managed clean removes an embedded git repo (would publish as a gitlink)"
+sync_setup feature/x
+git init -q "$SYNC_CLONE/vendor-embed" && echo x > "$SYNC_CLONE/vendor-embed/f"
+if sync_run feature/x && [[ ! -e "$SYNC_CLONE/vendor-embed" ]]; then ok
+else bad "embedded repo survived sync; a later git add -A would commit a gitlink"; fi
 
 # --- run.sh flag validation ----------------------------------------------
 
