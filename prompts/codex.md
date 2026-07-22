@@ -15,8 +15,8 @@ of the loop (max {{MAX_ITER}}).
 
 1. **Fetch latest state.**
    - `cd {{REPO_DIR}}`
-   - `git fetch origin "$BASE_REF" "$HEAD_REF"`
-   - `git checkout "$HEAD_REF"` and `git pull --ff-only` so you see Claude's
+   - `git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"`
+   - `git checkout "$HEAD_REF"` and `git pull --ff-only origin "refs/heads/$HEAD_REF"` so you see Claude's
      most recent commits.
 
 2. **Read the PR's metadata and full discussion** — not just the bot thread:
@@ -75,7 +75,7 @@ of the loop (max {{MAX_ITER}}).
    - When in doubt about whether something is a real issue vs. a stylistic
      preference, **read more code** before flagging it.
 
-5. **Review the current diff** (`git diff "origin/$BASE_REF...HEAD"`) with
+5. **Review the current diff** (`git diff "refs/remotes/origin/$BASE_REF...HEAD"`) with
    that context in mind. Evaluate correctness, design, perf, docs, and
    consistency with the project's conventions. Apply these focused passes
    when the diff touches the relevant area (skip a pass cleanly if it

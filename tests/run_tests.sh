@@ -55,6 +55,7 @@ bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s — %s\n' "$CURRENT" "$1" >&2; }
 assert_line()      { if grep -Fxq -- "$2" "$1"; then ok; else bad "argv missing exact arg: $2"; fi; }
 assert_no_line()   { if grep -Fxq -- "$2" "$1"; then bad "argv unexpectedly contains: $2"; else ok; fi; }
 assert_no_substr() { if grep -Fq  -- "$2" "$1"; then bad "argv unexpectedly has substring: $2"; else ok; fi; }
+assert_substr()    { if grep -Fq  -- "$2" "$1"; then ok; else bad "file missing substring: $2"; fi; }
 assert_pair() {  # file flag value — value must be the arg right after flag
   if awk -v f="$2" -v v="$3" 'prev==f && $0==v {found=1} {prev=$0} END {exit !found}' "$1"; then
     ok
@@ -1594,6 +1595,57 @@ check_malref_render codex codex.prompt.md \
 t "claude (gitlab): a malicious branch name cannot inject via sed rendering"
 check_malref_render claude claude.prompt.md \
   FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
+
+# --- refspec-safe branch handling (leading '+' can't force the wrong ref) ---
+# A Git-valid branch like '+main' is read as a force-refspec ('+src') by
+# fetch/push, so every recipe fully-qualifies: fetch/pull refs/heads/<ref>,
+# push HEAD:refs/heads/<ref>, diff refs/remotes/origin/<ref>. run.sh does
+# the same for its own git ops.
+
+t "codex (github): fetch/pull/diff recipes fully-qualify refs"
+new_case codex-refspec-gh
+run_turn codex
+assert_rc0
+CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
+assert_substr    "$CRP" 'git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"'
+assert_substr    "$CRP" 'git pull --ff-only origin "refs/heads/$HEAD_REF"'
+assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
+assert_no_substr "$CRP" 'git fetch origin "$BASE_REF" "$HEAD_REF"'
+
+t "codex (gitlab): fetch/diff recipes fully-qualify refs"
+new_case codex-refspec-gl
+run_turn codex FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
+assert_rc0
+CRP="$CASE_DIR/state/iter-01/codex.prompt.md"
+assert_substr    "$CRP" 'git fetch origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"'
+assert_substr    "$CRP" 'git diff "refs/remotes/origin/$BASE_REF...HEAD"'
+assert_no_substr "$CRP" 'git fetch origin "$BASE_REF" "$HEAD_REF"'
+
+t "claude (github): push recipe fully-qualifies the destination ref"
+new_case claude-refspec-gh
+run_turn claude
+assert_rc0
+CRP="$CASE_DIR/state/iter-01/claude.prompt.md"
+assert_substr    "$CRP" 'git push origin "HEAD:refs/heads/$HEAD_REF"'
+assert_no_substr "$CRP" 'git push origin "$HEAD_REF"'
+
+t "claude (gitlab): push recipe fully-qualifies the destination ref"
+new_case claude-refspec-gl
+run_turn claude FORGE=gitlab FORGE_HOST=gl.example PROJECT_ENC=g%2Fr REPO_SLUG=g/r GITLAB_TOKEN=tok
+assert_rc0
+CRP="$CASE_DIR/state/iter-01/claude.prompt.md"
+assert_substr    "$CRP" 'git push origin "HEAD:refs/heads/$HEAD_REF"'
+assert_no_substr "$CRP" 'git push origin "$HEAD_REF"'
+
+t "run.sh: its own git fetch/pull fully-qualify refs (no bare +-forceable refspec)"
+if grep -Fq 'git fetch --quiet origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"' "$ROOT/run.sh" \
+   && grep -Fq 'git pull --ff-only --quiet origin "refs/heads/$HEAD_REF"' "$ROOT/run.sh" \
+   && ! grep -Fq 'git fetch --quiet origin "$BASE_REF" "$HEAD_REF"' "$ROOT/run.sh" \
+   && ! grep -Fq 'git pull --ff-only --quiet origin "$HEAD_REF"' "$ROOT/run.sh"; then
+  ok
+else
+  bad "run.sh git fetch/pull are not refspec-safe"
+fi
 
 # --- run.sh flag validation ----------------------------------------------
 

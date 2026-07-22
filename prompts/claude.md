@@ -67,7 +67,7 @@ null on GitHub).
          ai-loop: claude-implementer
          "
      ```
-   - Push: `git push origin "$HEAD_REF"`
+   - Push: `git push origin "HEAD:refs/heads/$HEAD_REF"`
    - One commit per iteration is preferred; if multiple logical fixes
      warrant multiple commits, that's fine.
 

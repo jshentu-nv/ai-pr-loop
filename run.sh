@@ -570,13 +570,16 @@ log "------------------------------------------------------------"
 
 # Make sure local checkout matches the remote PR branch.
 ( cd "$REPO_DIR"
-  git fetch --quiet origin "$BASE_REF" "$HEAD_REF"
+  # Fully-qualify refs: a Git-valid branch beginning with '+' (e.g. '+main')
+  # would otherwise be read as a force-refspec ('+src') targeting the wrong
+  # branch. 'refs/heads/…' makes the refspec start with 'refs/', never '+'.
+  git fetch --quiet origin "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"
   current=$(git rev-parse --abbrev-ref HEAD)
   if [[ "$current" != "$HEAD_REF" ]]; then
     log "switching local branch from $current to $HEAD_REF"
     git checkout "$HEAD_REF"
   fi
-  git pull --ff-only --quiet origin "$HEAD_REF" || true
+  git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true
 )
 
 # --- resume detection ---------------------------------------------------------
@@ -690,7 +693,7 @@ while (( RUNS < MAX_ITER )); do
     fi
 
     # Pull in case anything landed remotely between turns.
-    ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "$HEAD_REF" || true )
+    ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true )
   fi
 
   # Claude response.
@@ -706,7 +709,7 @@ while (( RUNS < MAX_ITER )); do
   fi
 
   # Pull — Claude pushed.
-  ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "$HEAD_REF" || true )
+  ( cd "$REPO_DIR" && git pull --ff-only --quiet origin "refs/heads/$HEAD_REF" || true )
 
   ITER=$((ITER + 1))
   RUNS=$((RUNS + 1))
