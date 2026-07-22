@@ -111,19 +111,27 @@ glab_config_get() {
 # The config file the glab BINARY actually reads: $GLAB_CONFIG_DIR wins;
 # a Snap-installed glab is confined to its own remapped HOME
 # (~/snap/glab/current/.config/glab-cli), invisible at the caller's
-# default path; then glab's legacy location ($HOME/.config/glab-cli) when
-# it EXISTS — glab prefers it over an XDG_CONFIG_HOME override — and the
-# XDG default last.
+# default path — snapd launches from /snap/bin or, on distributions
+# without the /snap symlink, from /var/lib/snapd/snap/bin; then glab's
+# legacy location ($HOME/.config/glab-cli) when it EXISTS — glab prefers
+# it over an XDG_CONFIG_HOME override — and the XDG default last.
 glab_config_file() {
   if [[ -n "${GLAB_CONFIG_DIR:-}" ]]; then
     printf '%s/config.yml\n' "$GLAB_CONFIG_DIR"
-  elif [[ "$(command -v glab 2>/dev/null)" == /snap/* ]]; then
-    printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "${HOME:-}"
-  elif [[ -f "${HOME:-}/.config/glab-cli/config.yml" ]]; then
-    printf '%s/.config/glab-cli/config.yml\n' "${HOME:-}"
-  else
-    printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-${HOME:-}/.config}"
+    return
   fi
+  case "$(command -v glab 2>/dev/null)" in
+    /snap/*|/var/lib/snapd/snap/*)
+      printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "${HOME:-}"
+      ;;
+    *)
+      if [[ -f "${HOME:-}/.config/glab-cli/config.yml" ]]; then
+        printf '%s/.config/glab-cli/config.yml\n' "${HOME:-}"
+      else
+        printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-${HOME:-}/.config}"
+      fi
+      ;;
+  esac
 }
 
 # List the EXACT host-key spellings configured in glab (one per line).

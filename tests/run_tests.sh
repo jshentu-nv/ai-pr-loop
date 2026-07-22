@@ -1939,6 +1939,12 @@ assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" HOME=/h "$BASH_BIN" -c \
   ". '$ROOT/lib/common.sh'; command() { echo /snap/bin/glab; }; glab_config_file")" \
   "/h/snap/glab/current/.config/glab-cli/config.yml"
 
+t "config file: the alternate snapd launcher layout is a snap too"
+# Distributions without the /snap symlink launch from /var/lib/snapd/snap/bin.
+assert_eq "$(env -i PATH="$STUBS:/usr/bin:/bin" HOME=/h "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; command() { echo /var/lib/snapd/snap/bin/glab; }; glab_config_file")" \
+  "/h/snap/glab/current/.config/glab-cli/config.yml"
+
 t "config file: an existing legacy config wins over an XDG override (glab precedence)"
 LEGACY_HOME="$WORK/legacy-home"
 mkdir -p "$LEGACY_HOME/.config/glab-cli"
