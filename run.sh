@@ -123,6 +123,14 @@
 #                 defaults) and exit without contacting GitHub; the PR number
 #                 is optional in this mode. Used by tests/run_tests.sh to
 #                 observe the resolution.
+#   --preflight-only
+#                 Run the full authenticated preflight — authority
+#                 validation, credential resolution (env-isolated,
+#                 OAuth-rejecting), /user lookup, PR/MR fetch + open check —
+#                 print the resolved identity, PR/MR URL, and branches, then
+#                 exit 0 WITHOUT cloning, posting, or looping. Side-effect
+#                 free: the skill uses it to name the exact posting identity
+#                 before asking the operator to confirm a run.
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
@@ -163,6 +171,7 @@ FORGE_HOST=""
 RESTART=0
 REVIEW_ONLY=0
 PRINT_CONFIG=0
+PREFLIGHT_ONLY=0
 CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
@@ -195,6 +204,7 @@ while [[ $# -gt 0 ]]; do
     --codex-effort)  [[ $# -ge 2 && -n "$2" ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
+    --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     -h|--help)
       awk 'NR < 2 { next } /^set -euo pipefail/ { exit } { print }' "$0"; exit 0 ;;
     *)
@@ -282,22 +292,37 @@ validate_forge_authority "$FORGE_HOST"
 # the same MR in the equivalent form would split its state (losing
 # sessions, context, and the on-disk verdict that makes an approved
 # resume a no-op).
-CANON_HOST="$FORGE_HOST"
+CANON_HOST="$FORGE_HOST"; LEGACY_PORT=''
 case "$FORGE_SCHEME" in
-  http)  CANON_HOST="${FORGE_HOST%:80}"  ;;
-  https) CANON_HOST="${FORGE_HOST%:443}" ;;
+  http)  CANON_HOST="${FORGE_HOST%:80}";  LEGACY_PORT=80  ;;
+  https) CANON_HOST="${FORGE_HOST%:443}"; LEGACY_PORT=443 ;;
 esac
-if [[ "$CANON_HOST" != "$FORGE_HOST" ]]; then
-  # One-time upgrade guard: managed dirs keyed by the pre-canonicalization
-  # spelling would be silently orphaned — losing sessions, context, and the
-  # approved-resume verdict — so refuse with explicit steps instead
-  # (mirroring the pre-scheme marker precedent in ensure_state_dir).
-  OLD_IDENT="${FORGE_HOST}__${REPO_SLUG//\//__}"
+FORGE_HOST="$CANON_HOST"
+# One-time upgrade guard, BOTH directions: a managed tree keyed by the
+# legacy default-port spelling must refuse loudly whether THIS invocation
+# spelled the port or not — a bare re-invocation would otherwise silently
+# select a fresh bare-host tree and orphan the legacy one (sessions,
+# context, and the approved-resume verdict), exactly the split
+# canonicalization exists to prevent. Mirrors the pre-scheme marker
+# precedent in ensure_state_dir.
+if [[ "$FORGE" == "gitlab" && -n "$LEGACY_PORT" ]]; then
+  LEGACY_IDENT="${CANON_HOST}:${LEGACY_PORT}__${REPO_SLUG//\//__}"
   NEW_IDENT="${CANON_HOST}__${REPO_SLUG//\//__}"
-  if [[ -e "$LOOP_HOME/state/$OLD_IDENT" || -e "$LOOP_HOME/checkouts/$OLD_IDENT" ]]; then
-    die "state/checkout keyed by the pre-canonicalization spelling '$FORGE_HOST' exists under $LOOP_HOME/{state,checkouts}/$OLD_IDENT; the canonical identity is now '$CANON_HOST'. Rename each dir to .../$NEW_IDENT and update each state pr-*/.repo-slug marker to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', or remove the old dirs"
+  # Only its markers prove the port-named tree is OURS: the same directory
+  # name is legitimate CANONICAL state for the opposite scheme (443 is not
+  # http's default port, 80 not https's), so match same-scheme markers and
+  # the ambiguous pre-scheme form — a tree whose markers all name the other
+  # scheme belongs to that endpoint and is left alone. Migration is per-PR
+  # (never a whole-tree rename: with an existing $NEW_IDENT tree, mv would
+  # NEST the legacy tree inside it, hiding the very sessions/verdicts this
+  # guard protects).
+  if [[ -d "$LOOP_HOME/state/$LEGACY_IDENT" ]] \
+     && grep -qsxF \
+          -e "gitlab ${FORGE_SCHEME}://${CANON_HOST}:${LEGACY_PORT} ${REPO_SLUG}" \
+          -e "gitlab ${CANON_HOST}:${LEGACY_PORT} ${REPO_SLUG}" \
+          "$LOOP_HOME/state/$LEGACY_IDENT"/pr-*/.repo-slug; then
+    die "state keyed by the pre-canonicalization spelling '${CANON_HOST}:${LEGACY_PORT}' exists under $LOOP_HOME/state/$LEGACY_IDENT; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any $LOOP_HOME/checkouts/$LEGACY_IDENT) — or simply remove the legacy dirs to start fresh"
   fi
-  FORGE_HOST="$CANON_HOST"
 fi
 if [[ "$FORGE_SCHEME" == "http" ]]; then
   log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
@@ -392,7 +417,10 @@ export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
-ensure_repo_clone
+# --preflight-only stops before any side effect: no clone, no state dir, no
+# comment. It still needs branch discovery below for the open check and the
+# canonical URL, so only the clone is skipped here.
+(( PREFLIGHT_ONLY == 1 )) || ensure_repo_clone
 
 # --- discover branches --------------------------------------------------------
 
@@ -421,6 +449,18 @@ case "$FORGE" in
     ;;
 esac
 export HEAD_REF BASE_REF
+
+# --preflight-only: report what a real run would use — the posting identity
+# (resolved from the actual credential via /user or gh), the canonical
+# PR/MR URL, and the branches — then stop. Reaching this line already
+# proves authority validation, credential resolution, and the open check
+# all passed; any failure died above with its specific message.
+if (( PREFLIGHT_ONLY == 1 )); then
+  printf 'identity: %s\n' "$GH_USER"
+  printf 'pr: %s\n' "$PR_URL"
+  printf 'branches: %s <- %s\n' "$BASE_REF" "$HEAD_REF"
+  exit 0
+fi
 
 ensure_state_dir
 export STATE_DIR

@@ -193,6 +193,12 @@ case "$*" in
       exit 0
     fi
     if [[ "${STUB_GLAB_NO_TOKEN:-0}" == "1" ]]; then exit 1; fi
+    # Host-sensitive mode: glab keys host config by the exact authority
+    # string used at login, so a PAT stored under 'host:443' is invisible
+    # under the bare spelling. When set, only that exact --host key hits.
+    if [[ -n "${STUB_GLAB_TOKEN_HOST:-}" && "$*" != *"--host $STUB_GLAB_TOKEN_HOST" ]]; then
+      exit 1
+    fi
     echo "stub-glab-token"
     ;;
   "config get is_oauth2 --host "*)
@@ -202,7 +208,9 @@ case "$*" in
     echo "${GLAB_IS_OAUTH2:-${GITLAB_IS_OAUTH2:-${STUB_GLAB_OAUTH:-false}}}"
     ;;
   "repo clone "*)
-    :
+    # Create the target dir like real glab would, so tests asserting that a
+    # code path did NOT clone have teeth (argv: repo clone SLUG DIR).
+    if [[ -n "${4:-}" ]]; then mkdir -p "$4"; fi
     ;;
 esac
 EOF
@@ -244,6 +252,15 @@ case "$method $url" in
  {"id":"disc-human","notes":[{"id":501,"type":null,"system":false,"created_at":"2026-01-01T00:00:04Z","body":"human comment"}]}
 ]
 PAYLOAD
+    ;;
+  "GET "*"/merge_requests/"*)
+    # Gated: most tests want the terminal "MR is not open" die; the
+    # --preflight-only tests need a real open MR.
+    if [[ "${STUB_MR_OPEN:-0}" == "1" ]]; then
+      echo '{"state":"opened","source_branch":"feat/x","target_branch":"main","web_url":"https://gl.example/g/p/-/merge_requests/9","source_project_id":1,"target_project_id":1}'
+    else
+      echo '{}'
+    fi
     ;;
   "POST "*)
     echo '{"id":"stub-post"}'
@@ -1535,14 +1552,63 @@ run_run_sh http://gitlab.lab:8929/g/p/-/merge_requests/9 --print-config
 assert_prints 'forge: gitlab host=gitlab.lab:8929 scheme=http repo=g/p pr=9'
 assert_prints "dir: $ROOT/checkouts/gitlab.lab:8929__g__p"
 
-t "run.sh: pre-canonicalization port-spelled state refuses with rename guidance"
+t "run.sh: pre-canonicalization port-spelled state refuses with migration guidance"
 # State written by an earlier build under the ':443' spelling must not be
 # silently orphaned (the approved-resume no-op depends on its verdict file).
-# $ROOT/state is gitignored; the fixture is removed right after.
+# The tree is identified by its markers, not just its name. $ROOT/state is
+# gitignored; the fixture is removed right after.
 mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
+printf 'gitlab https://gl.example:443 g/p\n' > "$ROOT/state/gl.example:443__g__p/pr-9/.repo-slug"
 run_run_sh https://gl.example:443/g/p/-/merge_requests/9 --print-config
 rm -rf "$ROOT/state/gl.example:443__g__p"
 assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: the BARE spelling also refuses when legacy port-spelled state exists"
+# The guard must be two-sided: a bare re-invocation would otherwise
+# silently select a fresh bare-host tree and orphan the legacy one.
+mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
+printf 'gitlab gl.example:443 g/p\n' > "$ROOT/state/gl.example:443__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:443__g__p"
+assert_dies_with "pre-canonicalization spelling"
+
+t "run.sh: a canonical http-on-443 tree is NOT mistaken for legacy https state"
+# 443 is not http's default port, so state/gl.example:443__g__p with an
+# http marker is another endpoint's canonical tree — a bare https run must
+# leave it alone and proceed.
+mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
+printf 'gitlab http://gl.example:443 g/p\n' > "$ROOT/state/gl.example:443__g__p/pr-9/.repo-slug"
+run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
+rm -rf "$ROOT/state/gl.example:443__g__p"
+assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
+
+t "run.sh: stored PAT under the default-port glab key is found (port-spelled invocation)"
+run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:443 https://gl.example:443/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk1"
+assert_dies_with "MR is not open"
+
+t "run.sh: stored PAT under the default-port glab key is found (bare invocation)"
+run_run_sh STUB_GLAB_TOKEN_HOST=gl.example:443 https://gl.example/g/p/-/merge_requests/9 --dir "$WORK/glclone-pk2"
+assert_dies_with "MR is not open"
+
+t "run.sh: --preflight-only reports identity, MR URL, and branches"
+# Pre-clean so a guard regression in a previous suite run can't leave
+# debris that fails the side-effect assertion below against fixed code.
+rm -rf "$ROOT/state/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
+run_run_sh STUB_MR_OPEN=1 9 --repo g/p --forge gitlab --preflight-only
+assert_prints 'identity: testuser'
+assert_prints 'pr: https://gl.example/g/p/-/merge_requests/9'
+assert_prints 'branches: main <- feat/x'
+
+t "run.sh: --preflight-only creates no clone or state dir"
+if [[ -e "$ROOT/checkouts/gitlab.com__g__p" || -e "$ROOT/state/gitlab.com__g__p" ]]; then
+  bad "preflight-only left side effects on disk"
+else
+  ok
+fi
+
+t "run.sh: --preflight-only still dies on a non-open MR"
+run_run_sh 9 --repo g/p --forge gitlab --preflight-only
+assert_dies_with "MR is not open"
 
 t "run.sh: managed github checkout keeps the legacy layout"
 run_run_sh 1 --repo o/n --print-config

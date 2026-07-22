@@ -147,15 +147,22 @@ never continue past a failed mutation as if it landed.
    First fetch the MR's diff SHAs (once per turn):
 
    ```bash
-   # diff_refs populates ASYNCHRONOUSLY on a freshly created MR (a
-   # documented empty-fields window) — null SHAs would 400 every
-   # positioned discussion, so poll briefly until all three are present:
+   # diff_refs populates ASYNCHRONOUSLY — empty on a freshly created MR
+   # (a documented empty-fields window) and STALE right after a push
+   # (GitLab keeps the previous refs while regenerating the diff, and
+   # this loop reviews immediately after Claude pushes). Null SHAs would
+   # 400 every positioned discussion; stale refs would anchor findings to
+   # the previous commit's diff. Poll until the refs are complete AND
+   # their head_sha matches the branch head you just checked out:
+   EXPECTED_HEAD=$(git -C {{REPO_DIR}} rev-parse HEAD)
    REFS=''
    for _try in 1 2 3 4 5 6; do
      REFS=$(curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        "$API/merge_requests/{{PR_NUMBER}}" \
-       | jq 'if (.diff_refs.base_sha and .diff_refs.head_sha and .diff_refs.start_sha)
-             then .diff_refs else empty end')
+       | jq --arg h "$EXPECTED_HEAD" \
+           'if (.diff_refs.base_sha and .diff_refs.head_sha and .diff_refs.start_sha
+                and .diff_refs.head_sha == $h)
+            then .diff_refs else empty end')
      [ -n "$REFS" ] && break
      sleep 5
    done
@@ -164,8 +171,8 @@ never continue past a failed mutation as if it landed.
    If `REFS` is still empty after the poll, do **not** post positioned
    discussions this turn: put every line-specific finding in the summary
    note instead (cite `path:line` in its text) and mention that
-   `diff_refs` never populated. Never send a position payload with null
-   SHAs.
+   `diff_refs` never caught up with the branch head. Never send a
+   position payload with null or stale SHAs.
 
    Then per finding:
 

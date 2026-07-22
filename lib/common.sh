@@ -97,10 +97,14 @@ require_cmd() {
 # before its token gets exported). The loop's only supported environment
 # credential is GITLAB_TOKEN, which preflight consumes before ever reaching
 # the glab-config fallback.
+# The host key defaults to $FORGE_HOST; preflight may pin $GLAB_HOST_KEY
+# to the equivalent default-port spelling instead (glab keys host config by
+# the exact authority string used at login, so a PAT stored under
+# 'gl.example:443' is invisible under the canonical 'gl.example').
 glab_config_get() {
   env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN -u GLAB_TOKEN \
       -u GLAB_IS_OAUTH2 -u GITLAB_IS_OAUTH2 \
-    glab config get "$1" --host "$FORGE_HOST" 2>/dev/null
+    glab config get "$1" --host "${GLAB_HOST_KEY:-$FORGE_HOST}" 2>/dev/null
 }
 
 preflight() {
@@ -133,8 +137,25 @@ preflight() {
       # Detect that configuration and reject it with instructions rather
       # than failing obscurely on /user (or hours later on token expiry).
       if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+        # FORGE_HOST is canonical (default port stripped), but glab keys
+        # its host config by the exact string used at login — a PAT stored
+        # under 'gl.example:443' is invisible under 'gl.example'. Probe the
+        # canonical key first, then the equivalent default-port twin, and
+        # pin ONE key for the paired is_oauth2/token reads so the auth mode
+        # and the token can never come from different sessions.
+        local _glab_twin=''
+        GLAB_HOST_KEY="$FORGE_HOST"
+        case "${FORGE_SCHEME:-https}" in
+          http)  _glab_twin="${FORGE_HOST}:80"  ;;
+          https) _glab_twin="${FORGE_HOST}:443" ;;
+        esac
+        if [[ -z "$(glab_config_get token)" && -n "$_glab_twin" ]] \
+           && [[ -n "$(GLAB_HOST_KEY="$_glab_twin"; glab_config_get token)" ]]; then
+          log "glab config: PAT stored under host key '$_glab_twin' (default-port spelling) — using that key"
+          GLAB_HOST_KEY="$_glab_twin"
+        fi
         if [[ "$(glab_config_get is_oauth2)" == "true" ]]; then
-          die "glab session for $FORGE_HOST is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
+          die "glab session for $GLAB_HOST_KEY is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
         fi
         GITLAB_TOKEN=$(glab_config_get token) || GITLAB_TOKEN=''
       fi

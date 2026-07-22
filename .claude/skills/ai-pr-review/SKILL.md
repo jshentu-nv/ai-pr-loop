@@ -161,11 +161,17 @@ GitLab (self-hosted: substitute the host):
 command -v glab && glab --version 2>&1 | head -1
 command -v codex && codex --version 2>&1 | head -1
 command -v claude && claude --version 2>&1 | head -1
-# Validate and resolve the target through the orchestrator itself — this
-# rejects malformed or hostile inputs (e.g. userinfo smuggled into the MR
-# URL's authority) before any credential is used anywhere:
-"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --print-config
+# The orchestrator's own side-effect-free authenticated preflight: it
+# validates the URL/authority (rejecting e.g. userinfo smuggling before
+# any credential is used), resolves the credential exactly as the run
+# will (env-isolated, OAuth-rejecting), fetches the MR, and prints the
+# posting identity + canonical URL + branches — without cloning, posting,
+# or looping:
+"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --preflight-only
 ```
+
+The `identity:` line names the exact GitLab account the loop will post
+and push as — quote it verbatim in the step-3 confirmation.
 
 **Run no glab auth commands and no PAT-bearing curl (nor a raw
 `glab config get token` lookup) in this preflight.** Hand-rolled checks
@@ -178,27 +184,25 @@ OAuth masked by `GLAB_IS_OAUTH2=false`) or failure for one it supports
 `validate_forge_authority` (a crafted MR URL like
 `https://good.host@attacker.invalid/…` would send the token to the
 attacker's host) and `glab_config_get` (ambient `OAUTH_TOKEN` /
-`GITLAB_ACCESS_TOKEN` shadowing the host's PAT). `run.sh` performs the one
-authoritative preflight the moment it starts — token resolution
+`GITLAB_ACCESS_TOKEN` shadowing the host's PAT). `--preflight-only` runs
+the same authoritative preflight the loop itself uses — token resolution
 (env-isolated, host-scoped, rejecting OAuth-backed glab sessions with
-instructions to set a `GITLAB_TOKEN` PAT) and the MR fetch — and dies
-immediately with a clear message on any failure, which the monitor in
-step 5 surfaces.
+instructions to set a `GITLAB_TOKEN` PAT) plus the MR fetch — and dies
+with the same clear messages on any failure.
 
-Bail if either CLI is missing or `--print-config` rejects the target.
-Auth and MR state (must be `opened`) are enforced by `run.sh` itself at
-launch — treat an immediate exit with "MR is not open" / "GitLab auth
-failed" / "no GitLab token" / "OAuth-backed" as the preflight failure to
-report.
+Bail if either CLI is missing or `--preflight-only` fails: "invalid forge
+host", "MR is not open", "GitLab auth failed", "no GitLab token", and
+"OAuth-backed" are the failure messages to report to the user.
 
 ### 3. Confirm before posting
 
 The loop writes to a live PR/MR: it will post comments and (via Claude)
 push commits using the user's forge identity (gh PAT on GitHub, GitLab
-token on GitLab). Always tell the user the exact identity and the PR/MR
-URL, then ask for confirmation **unless they already authorized the run
-explicitly** in the same conversation (e.g. "start the review", "kick it
-off", "go", a previous run in this session). When in doubt, ask.
+token on GitLab). Always tell the user the exact identity (GitHub: from
+`gh auth status`; GitLab: the `identity:` line of `--preflight-only`) and
+the PR/MR URL, then ask for confirmation **unless they already authorized
+the run explicitly** in the same conversation (e.g. "start the review",
+"kick it off", "go", a previous run in this session). When in doubt, ask.
 
 ### 4. Launch in the background
 
