@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
-description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request. Use when the user asks to "review PR X", "run AI review on <PR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR autonomously until convergence or approval. Posts comments and pushes commits under the gh-authenticated user's PAT.
-argument-hint: "[pr-number or pr-url] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
+description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account.
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -15,8 +15,9 @@ user, then stream progress back into the conversation.
 `ai-pr-loop` alternates two CLIs:
 
 - **`codex exec`** as reviewer — reads the diff + prior thread, posts
-  inline review comments via the GitHub reviews API for line-specific
-  findings plus a summary issue-comment with a `[CODEX_VERDICT: …]` line.
+  inline review comments for line-specific findings (GitHub reviews API /
+  GitLab positioned discussions) plus a summary comment with a
+  `[CODEX_VERDICT: …]` line.
 - **`claude -p`** as implementer — replies inline to each finding,
   commits fixes under a bot git identity, pushes back when it disagrees.
 
@@ -27,13 +28,23 @@ accumulates round over round.
 
 Parse the user's request into:
 
-- `PR_NUMBER` — numeric PR id.
-- `REPO_SLUG` — `OWNER/NAME`.
+- `PR_NUMBER` — numeric PR id (GitLab: the MR iid).
+- `REPO_SLUG` — `OWNER/NAME` (GitLab: the full project path, subgroups
+  included, e.g. `group/subgroup/project`).
+- Forge — GitHub (default) or GitLab (`--forge gitlab`, plus
+  `--host <hostname>` for self-hosted).
 
-If the user pasted a URL like `https://github.com/foo/bar/pull/42`:
-- `REPO_SLUG=foo/bar`, `PR_NUMBER=42`.
+**If the user pasted a PR/MR URL, pass it straight through as the
+positional argument** — `run.sh` derives forge, host, repo, and number
+itself:
+- `https://github.com/foo/bar/pull/42` → GitHub
+- `https://<any-host>/<group>/<project>/-/merge_requests/7` → GitLab
+  (gitlab.com or self-hosted; the host is kept)
 
-If only a bare number, ask the user for the repo slug — don't guess from cwd.
+If only a bare number, ask the user for the repo slug — don't guess from
+cwd. For a GitLab repo given as slug + number, also pass
+`--host <hostname>` (implies the gitlab forge) unless it's gitlab.com,
+where `--forge gitlab` alone suffices.
 
 Optional flags worth surfacing if the user mentions a constraint:
 
@@ -42,7 +53,8 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--converge N` — stop after N consecutive BLOCKER=0 MAJOR=0 codex iters.
   Default 3. Pass `0` to disable convergence-based termination.
 - `--dir DIR` — use an existing local clone. Omit to let the loop manage
-  its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/`.
+  its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/` (GitLab repos:
+  `checkouts/<host>__<slug with / -> __>/`).
 - `--restart` — force a new review round even if codex previously
   APPROVED. Use after new commits land past a prior approval ("pull
   latest and review again", "new commits were pushed, run another round").
@@ -132,7 +144,9 @@ and ask where they want it cloned. Do not silently clone for them.
 ### 2. Preflight
 
 Run these checks in parallel and surface any failures **before** kicking off
-the loop:
+the loop.
+
+GitHub:
 
 ```bash
 gh auth status 2>&1 | head -2
@@ -141,21 +155,69 @@ command -v claude && claude --version 2>&1 | head -1
 gh pr view <PR_NUMBER> --repo <REPO_SLUG> --json state,headRefName,title,url
 ```
 
-Bail if `gh auth` is bad, either CLI is missing, or the PR isn't `OPEN`.
+GitLab (self-hosted: substitute the host):
+
+```bash
+command -v glab && glab --version 2>&1 | head -1
+command -v codex && codex --version 2>&1 | head -1
+command -v claude && claude --version 2>&1 | head -1
+# The orchestrator's own side-effect-free authenticated preflight: it
+# validates the URL/authority (rejecting e.g. userinfo smuggling before
+# any credential is used), resolves the credential exactly as the run
+# will (env-isolated, OAuth-rejecting), fetches the MR, and prints the
+# posting identity + canonical URL + branches — without cloning, posting,
+# or looping:
+"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --preflight-only
+```
+
+The `identity:` line names the exact GitLab account behind every **API
+call and comment**. Pushes are different: they go through the checkout's
+own git credential (SSH key or credential helper — the non-interactive
+push path the README requires), which can belong to another account.
+Quote the `identity:` line verbatim in the step-3 confirmation as the
+comment/API account, and say that pushes use the checkout's git
+credential, which may differ.
+
+**Run no glab auth commands and no PAT-bearing curl (nor a raw
+`glab config get token` lookup) in this preflight.** Hand-rolled checks
+keep diverging from the orchestrator's auth model: `glab auth status`
+resolves its credential and OAuth-vs-PAT mode from ambient env and config
+overrides, so it can report success for a session `run.sh` rejects (stored
+OAuth masked by `GLAB_IS_OAUTH2=false`) or failure for one it supports
+(explicit `GITLAB_TOKEN` treated as OAuth because the stored config says
+`is_oauth2: true`). A hand-built curl would additionally bypass
+`validate_forge_authority` (a crafted MR URL like
+`https://good.host@attacker.invalid/…` would send the token to the
+attacker's host) and `glab_config_get` (ambient `OAUTH_TOKEN` /
+`GITLAB_ACCESS_TOKEN` shadowing the host's PAT). `--preflight-only` runs
+the same authoritative preflight the loop itself uses — token resolution
+(env-isolated, host-scoped, rejecting OAuth-backed glab sessions with
+instructions to set a `GITLAB_TOKEN` PAT) plus the MR fetch — and dies
+with the same clear messages on any failure.
+
+Bail if either CLI is missing or `--preflight-only` fails: "invalid forge
+host", "MR is not open", "GitLab auth failed", "no GitLab token", and
+"OAuth-backed" are the failure messages to report to the user.
 
 ### 3. Confirm before posting
 
-The loop writes to a live PR: it will post comments and (via Claude) push
-commits using the gh-authed user's PAT. Always tell the user the exact
-identity and the PR URL, then ask for confirmation **unless they already
-authorized the run explicitly** in the same conversation (e.g. "start the
-review", "kick it off", "go", a previous run in this session). When in
-doubt, ask.
+The loop writes to a live PR/MR: it posts comments under the user's forge
+API identity (gh PAT on GitHub, GitLab token on GitLab), and (via Claude)
+pushes commits through the checkout's git credential. Always tell the
+user the exact **comment/API identity** (GitHub: from `gh auth status`;
+GitLab: the `identity:` line of `--preflight-only`) and the PR/MR URL,
+noting that **pushes use the checkout's git credential (SSH key or
+credential helper), which may belong to a different account** — then ask
+for confirmation **unless they already authorized the run explicitly** in
+the same conversation (e.g. "start the review", "kick it off", "go", a
+previous run in this session). When in doubt, ask.
 
 ### 4. Launch in the background
 
 ```bash
 "$RUN_SH" <PR_NUMBER> --repo <REPO_SLUG> --max <N> --converge <N>
+# or, when the user gave a URL (works for GitHub and GitLab):
+"$RUN_SH" <PR_OR_MR_URL> --max <N> --converge <N>
 ```
 
 Append any context the user supplied, e.g.
@@ -199,7 +261,8 @@ When the background `run.sh` completes, summarize:
 
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
-(prompts, agent stdout/stderr, fetched thread, codex verdict file).
+(GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
+stdout/stderr, fetched thread, codex verdict file).
 
 ## Resumability
 

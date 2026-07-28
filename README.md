@@ -4,6 +4,9 @@ Two-agent autonomous PR review loop, designed to be driven by an AI agent.
 Codex reviews; Claude responds (fix code or push back); they iterate until
 Codex approves or the loop converges on NIT-only findings.
 
+Works on **GitHub pull requests** and **GitLab merge requests** (gitlab.com
+or self-hosted) — see [GitLab support](#gitlab-support).
+
 The primary interface is a **Claude Code skill** (`ai-pr-review`) shipped
 in this repo. Ask an AI agent to review a PR, the skill takes care of the
 orchestration. The underlying `run.sh` is also runnable directly for
@@ -27,13 +30,17 @@ echo 'export AI_PR_LOOP_HOME=$HOME/ai-pr-loop' >> ~/.bashrc
 
 Requirements on the host:
 
-- `gh` CLI authenticated (`gh auth login` or `GH_TOKEN`/`GITHUB_TOKEN`
-  with `repo` scope on the target repo).
+- For GitHub repos: `gh` CLI authenticated (`gh auth login` or
+  `GH_TOKEN`/`GITHUB_TOKEN` with `repo` scope on the target repo).
+- For GitLab repos: `glab` CLI + `curl`, with `GITLAB_TOKEN` set or a
+  PAT-backed `glab auth login --hostname <host>` done for the target host
+  (the token needs `api` scope; OAuth web/device glab sessions are
+  rejected — see [GitLab support](#gitlab-support)).
 - `codex` CLI installed and logged in.
 - `claude` CLI installed and logged in.
 - `git`, `jq` available on `$PATH`.
 
-No NVIDIA / org-specific config — works on any GitHub repo the
+No NVIDIA / org-specific config — works on any GitHub/GitLab repo the
 authenticated user can comment on and push to.
 
 ## Use it (the intended way)
@@ -41,6 +48,8 @@ authenticated user can comment on and push to.
 In Claude Code, just ask:
 
 > Review https://github.com/owner/repo/pull/42
+
+> Review https://gitlab-master.example.com/group/project/-/merge_requests/17
 
 > Run the AI review on PR 17 of owner/repo, don't stop until they agree.
 
@@ -52,8 +61,10 @@ per-iteration progress (verdicts, issue counts, errors) back into the
 conversation. When the loop terminates it reports the final verdict, the
 per-iter wall time, and a link to the PR.
 
-The agent will only act under your gh-authed identity, only on the PR you
-named, and will ask you to confirm the first time it's about to post.
+The agent only acts on the PR/MR you named, posting comments under your
+forge API identity (gh PAT on GitHub, GitLab token on GitLab) and pushing
+commits through the checkout's git credential (which may be a different
+account), and will ask you to confirm the first time it's about to post.
 
 ## What the agents do
 
@@ -88,6 +99,88 @@ named, and will ask you to confirm the first time it's about to post.
 Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
 Codex `exec resume`), so internal memory persists across iterations on top
 of the publicly auditable PR thread.
+
+## GitLab support
+
+The loop runs on GitLab merge requests — gitlab.com or self-hosted — with
+the same two agents, markers, verdicts, and resume behavior. Point it at an
+MR URL and everything (forge, host, project, iid) is derived from the link:
+
+```bash
+~/ai-pr-loop/run.sh https://gitlab.com/group/subgroup/project/-/merge_requests/42
+
+# Self-hosted:
+~/ai-pr-loop/run.sh https://gitlab-master.example.com/omniverse/kit/-/merge_requests/123
+
+# Or spell it out (numeric iid + project path + host):
+~/ai-pr-loop/run.sh 123 --repo omniverse/kit --host gitlab-master.example.com
+```
+
+- `--forge gitlab` / `--host HOST` select the forge explicitly; a non-github
+  `--host` implies GitLab on its own. Defaults: `github` / `gitlab.com`.
+- `--repo` takes the **full project path**, subgroups included
+  (`group/subgroup/project`).
+- Auth: `GITLAB_TOKEN` env var wins; otherwise the token is read from the
+  glab config for that host (`glab auth login --hostname <host>`,
+  authenticated **with a personal access token** — OAuth web/device glab
+  sessions are rejected at preflight, because their tokens are only valid
+  as a `Bearer` header and expire mid-loop while everything here sends
+  `PRIVATE-TOKEN`). The token needs `api` scope, plus push access to the
+  MR's source branch. `GITLAB_TOKEN` is the **only** environment credential
+  honored: glab's other token env vars (`GITLAB_ACCESS_TOKEN`,
+  `OAUTH_TOKEN`, `GLAB_TOKEN`) and its config-override vars for the keys
+  the loop reads (`GLAB_IS_OAUTH2`, `GITLAB_IS_OAUTH2`) are explicitly
+  cleared when reading the glab config, so an ambient token minted for some
+  other host can't masquerade as this host's PAT and an ambient override
+  can't mask an OAuth session.
+- All GitLab REST calls — the orchestrator's and the agents' — go through
+  `curl` with a `PRIVATE-TOKEN` header, **not** `glab api`: `glab api`
+  silently drops `position[...]` payloads when posting inline (line-anchored)
+  MR discussions (the comment lands as a general note with HTTP 200) and
+  rejects `--input` JSON bodies. `glab` is used only for token resolution,
+  the initial clone, and read-only `mr view`.
+- Inline findings post as positioned discussions
+  (`POST /projects/:id/merge_requests/:iid/discussions` with
+  `diff_refs`-based positions); replies thread via
+  `POST .../discussions/:discussion_id/notes`. The bots never flip a
+  thread's resolved state — a `Resolved.` reply is the signal, humans
+  resolve.
+- Pushes go to `origin/<source_branch>` of the same project; **cross-fork
+  MRs are not supported** (the loop refuses them at startup).
+- Clones use `glab repo clone`, which follows your glab `git_protocol`
+  (ssh or https). Make sure a non-interactive push path exists for that
+  host — ssh keys or a git credential helper — since the Claude implementer
+  pushes headlessly.
+- The GitLab token is exported into both agents' environments as
+  `GITLAB_TOKEN` (they post their own comments with it), same trust model
+  as `GH_TOKEN` on the GitHub path.
+- HTTP-only self-hosts work: the scheme of the MR URL (or of
+  `--host http://gitlab.lab`) is preserved through every orchestrator API
+  call and both agents' prompts; the default is https. Pass the URL (or the
+  scheme-qualified `--host`) on re-runs too — the scheme isn't persisted.
+  First-use managed clones of an HTTP-only host use plain
+  `git clone http://…` (glab can't be steered to HTTP), so a private repo
+  needs ambient git credentials for that host — the same requirement as
+  the loop's headless pushes. For HTTP(S) origins the checkout guard
+  matches the **full endpoint** (`scheme://host:port`, default ports
+  collapsed — `http://gl.example` and `https://gl.example` are different
+  endpoints), and it validates **every fetch and push URL** of `origin`
+  (a divergent `remote.origin.pushurl` would otherwise deliver the
+  implementer's commits elsewhere). A `--dir` clone whose origin uses a
+  different name for the same instance (e.g. a search-domain short name
+  like `http://gitlab/…`) is rejected — point the remote at the canonical
+  authority the MR URL uses. The scheme is part of the stored per-PR
+  identity marker too. A glab `api_host`/`api_protocol` config
+  pointing the API at a *different* host than the web UI is not supported;
+  the API is always `<scheme>://<MR host>/api/v4`.
+
+Terminology mapping, everywhere in state paths and logs: PR == MR, the PR
+number == the MR iid. State lives at
+`state/<host>__<group>__<subgroup>__<project>/pr-<iid>/` and managed clones
+at `checkouts/<host>__<group>__<subgroup>__<project>/` — GitLab identities
+are namespaced by host so a same-slug repo on another forge/host can never
+share a checkout, state, or agent sessions (GitHub keeps the legacy
+`<owner>__<name>` layout).
 
 ## Additional context (web links, notes, files)
 
@@ -209,9 +302,10 @@ high-signal.
 
 ## How agents are distinguished
 
-Both bots post under the same human PAT (whichever account the local `gh`
-is logged in as — resolved at startup via `gh api user`). The loop tags
-every artifact three ways:
+Both bots post under the same human token (GitHub: whichever account the
+local `gh` is logged in as, resolved at startup via `gh api user`; GitLab:
+the `GITLAB_TOKEN`/glab account, resolved via `/api/v4/user`). The loop
+tags every artifact three ways:
 
 | Signal | Codex Reviewer | Claude Implementer |
 |---|---|---|
@@ -219,9 +313,11 @@ every artifact three ways:
 | Visible banner | `**[AI · Codex Reviewer · iter N]**` | `**[AI · Claude Implementer · iter N]**` |
 | Git commit author (Claude only) | — | `claude-implementer (ai-bot) <claude-implementer+bot@users.noreply.github.com>` |
 
-`fetch_ai_thread` (in `lib/common.sh`) pulls both surfaces
-(`/issues/N/comments` + `/pulls/N/comments`) and emits NDJSON tagged with
-`surface=issue|inline` plus `id`, `path`, `line`, `in_reply_to_id`.
+`fetch_ai_thread` (in `lib/common.sh`) pulls both surfaces (GitHub:
+`/issues/N/comments` + `/pulls/N/comments`; GitLab: the MR `/discussions`
+endpoint, where a DiffNote is inline and anything else is top-level) and
+emits NDJSON tagged with `surface=issue|inline` plus `id`, `discussion_id`
+(GitLab thread id, null on GitHub), `path`, `line`, `in_reply_to_id`.
 Comments are never edited or deleted by the bots.
 
 ## Termination
@@ -283,9 +379,21 @@ comments and continues from the high-water mark:
 | Codex iter K but no Claude reply | Run claude at iter K first, then continue from K+1. |
 | Codex APPROVED at iter K, new commits since | Plain re-run is a no-op. Pass `--restart` to start a new round at iter K+1, codex first. |
 
+Only each bot's **summary** comment counts toward the high-water mark,
+identified **structurally**: the hidden marker must be the entire first
+line and the alert opener + banner line the first visible content. Neither
+the marker alone nor a banner *quoted in prose* counts — a tagged general
+note (e.g. an inline finding that lost its diff position, or a restatement
+that cites the banner text) is not a summary. The summary is a turn's
+completion contract (posted last, after every inline comment, and
+re-verified by the orchestrator after each turn), so a turn that died
+after inline-only posts — or whose summary POST failed — is re-run at the
+same iteration instead of being skipped past.
+
 Per-PR session ids for both agents are stored under
-`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`,
-so resumed runs also restore the agents' internal memory.
+`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`
+(GitLab: `state/<host>__<slug...>/...`), so resumed runs also restore the
+agents' internal memory.
 
 ## Direct CLI (advanced)
 
@@ -295,6 +403,10 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 # Minimal: PR number + repo slug. The loop manages its own clone at
 # ~/ai-pr-loop/checkouts/<owner>__<name>/ (created on first use).
 ~/ai-pr-loop/run.sh 42 --repo owner/repo
+
+# Or hand it the PR/MR URL — forge, host, repo, and number all derived:
+~/ai-pr-loop/run.sh https://github.com/owner/repo/pull/42
+~/ai-pr-loop/run.sh https://gitlab.com/group/sub/proj/-/merge_requests/7
 
 # Uncapped, with convergence on 3 consecutive NIT-only iters:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --max 0 --converge 3
@@ -340,9 +452,11 @@ flag validation.
 
 ## Notes
 
-- The gh-authed user's PAT is used for all GitHub mutations (comments +
-  pushes). Don't run on PRs you don't intend the bots to act on under
-  that identity.
+- The authenticated user's token (gh PAT on GitHub, `GITLAB_TOKEN`/glab on
+  GitLab) is used for all API mutations (comments). Pushes go through the
+  checkout's own git credential — SSH key or credential helper — which may
+  belong to a different account. Don't run on PRs/MRs you don't intend the
+  bots to act on under those identities.
 - Claude never force-pushes, amends, or rebases — only adds new commits
   to the PR head ref.
 - Managed checkouts live at `~/ai-pr-loop/checkouts/<owner>__<name>/`

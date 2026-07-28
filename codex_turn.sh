@@ -39,15 +39,28 @@ else
   CONTEXT_NOTE=''
 fi
 
-# Render the prompt template.
+# Render the prompt template. GitLab loops use the gitlab prompt variant —
+# same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
+# instead of gh.
+#
+# BASE_REF/HEAD_REF are NOT sed-substituted: they come from forge metadata
+# (a Git-valid branch name can contain sed/shell metacharacters — e.g. a
+# name that closes the replacement and enables GNU sed's `e` flag executes
+# during rendering). The templates reference the exported $BASE_REF /
+# $HEAD_REF shell variables instead, which the agent's shell expands
+# safely; both are exported to this process's environment by run.sh.
+PROMPT_TEMPLATE="$HERE/prompts/codex.md"
+[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/codex.gitlab.md"
 PROMPT_FILE="$ID/codex.prompt.md"
 sed \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
+  -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
+  -e "s|{{FORGE_HOST}}|${FORGE_HOST:-github.com}|g" \
+  -e "s|{{FORGE_SCHEME}}|${FORGE_SCHEME:-https}|g" \
+  -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
-  -e "s|{{BASE_REF}}|${BASE_REF}|g" \
-  -e "s|{{HEAD_REF}}|${HEAD_REF}|g" \
   -e "s|{{ITER}}|${ITER}|g" \
   -e "s|{{PREV_ITER}}|${PREV_ITER}|g" \
   -e "s|{{MAX_ITER}}|${MAX_ITER}|g" \
@@ -55,7 +68,7 @@ sed \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$HERE/prompts/codex.md" > "$PROMPT_FILE"
+  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"
 
@@ -169,6 +182,18 @@ if [[ $RC -ne 0 ]]; then
   log "codex stderr (tail):"
   tail -20 "$ID/codex.stderr" >&2 || true
   return 2>/dev/null || exit 1
+fi
+
+# The summary comment is the turn's completion contract (the prompt posts it
+# last, after every inline note). Trusting stdout alone is not enough: a run
+# can print its verdict even though the summary POST failed, or die after
+# posting only inline notes. Refetch the thread and require this iteration's
+# summary before recording any counts or verdict — failing here (rather than
+# advancing) means the next invocation re-reviews at this same iteration,
+# since the resume high-water also only counts summaries.
+if ! verify_ai_summary codex "$ITER"; then
+  log "codex: iter $ITER summary comment not found on the PR — failing the turn (stdout verdict ignored)"
+  exit 1
 fi
 
 # Parse issue counts (last occurrence wins). Missing line → counts unknown,

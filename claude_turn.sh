@@ -18,31 +18,38 @@ fetch_ai_thread > "$THREAD_FILE" || true
 # Extract this iter's codex output split by surface:
 #   - LATEST_REVIEW_FILE  → summary issue-comment body (cross-cutting + verdict)
 #   - LATEST_INLINE_FILE  → NDJSON of inline findings, one per line:
-#                            { id, path, line, body }
-#     id is needed when Claude posts in_reply_to replies.
+#                            { id, discussion_id, path, line, body }
+#     GitHub: id is what Claude's in_reply_to replies target (discussion_id
+#     is null). GitLab: replies POST to discussions/<discussion_id>/notes.
 LATEST_REVIEW_FILE="$ID/codex-review.md"
 LATEST_INLINE_FILE="$ID/codex-inline.ndjson"
 
-jq -r --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
-    select(.tag==$t and .iter==$it and .surface=="issue") | .body' \
+# Same structural summary predicate as latest_ai_comment_iter /
+# ai_summary_posted: a tagged general note without the summary wrapper —
+# even one quoting the banner in its prose, e.g. an inline finding that
+# lost its position — must not be mistaken for the review to answer.
+jq -r --arg t "$CODEX_MARKER_TAG" --arg a "$CODEX_SUMMARY_ALERT" \
+   --arg b "$CODEX_SUMMARY_BANNER_PFX" --argjson it "$ITER" \
+   "$AI_SUMMARY_JQ_DEF"'
+    select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
+    | select(is_summary($t; $a; $b; $it))
+    | .body' \
     "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
 
 jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
     select(.tag==$t and .iter==$it and .surface=="inline")
-    | {id, path, line, body}' \
+    | {id, discussion_id, path, line, body}' \
     "$THREAD_FILE" > "$LATEST_INLINE_FILE"
 
+# No fallback to an older summary here. Reaching this turn means codex's
+# iter-$ITER summary exists (codex_turn verifies it after posting, and the
+# resume high-water counts only summaries), so failing to extract it means
+# the fetch is broken or the thread is inconsistent — and answering a stale
+# review would advance the loop past an incomplete one. Die instead; the
+# next invocation resumes at this same iteration.
+# (Missing inline is different: no inline findings is a valid outcome.)
 if [[ ! -s "$LATEST_REVIEW_FILE" ]]; then
-  # Summary missing for this iter — fall back to the latest codex summary so
-  # Claude has *something*. (Doesn't affect inline; missing inline = no inline
-  # findings this iter, which is a valid outcome.)
-  jq -r --arg t "$CODEX_MARKER_TAG" '
-      select(.tag==$t and .surface=="issue") | .body' "$THREAD_FILE" \
-    | tail -n 200 > "$LATEST_REVIEW_FILE"
-fi
-
-if [[ ! -s "$LATEST_REVIEW_FILE" ]]; then
-  die "no codex review found on PR — cannot run claude turn"
+  die "codex summary for iter $ITER not found on the PR — cannot run claude turn"
 fi
 
 # Optional human-supplied reference material (web links / notes / files),
@@ -54,15 +61,26 @@ else
   CONTEXT_NOTE=''
 fi
 
-# Render the prompt.
+# Render the prompt. GitLab loops use the gitlab prompt variant — same
+# implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
+# instead of gh.
+#
+# BASE_REF/HEAD_REF are NOT sed-substituted (see codex_turn.sh): a
+# forge-supplied branch name can carry sed/shell metacharacters, so the
+# templates reference the exported $BASE_REF / $HEAD_REF shell variables
+# and the agent's shell expands them safely.
+PROMPT_TEMPLATE="$HERE/prompts/claude.md"
+[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/claude.gitlab.md"
 PROMPT_FILE="$ID/claude.prompt.md"
 sed \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
+  -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
+  -e "s|{{FORGE_HOST}}|${FORGE_HOST:-github.com}|g" \
+  -e "s|{{FORGE_SCHEME}}|${FORGE_SCHEME:-https}|g" \
+  -e "s|{{PROJECT_ENC}}|${PROJECT_ENC:-}|g" \
   -e "s|{{PR_NUMBER}}|${PR_NUMBER}|g" \
   -e "s|{{REPO_DIR}}|${REPO_DIR}|g" \
-  -e "s|{{BASE_REF}}|${BASE_REF}|g" \
-  -e "s|{{HEAD_REF}}|${HEAD_REF}|g" \
   -e "s|{{ITER}}|${ITER}|g" \
   -e "s|{{MAX_ITER}}|${MAX_ITER}|g" \
   -e "s|{{LATEST_REVIEW_FILE}}|${LATEST_REVIEW_FILE}|g" \
@@ -70,7 +88,7 @@ sed \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$HERE/prompts/claude.md" > "$PROMPT_FILE"
+  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"
 
@@ -298,10 +316,19 @@ if [[ $RC -ne 0 ]]; then
   exit 1
 fi
 
-if grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
-  log "claude: turn complete"
-  exit 0
-else
+if ! grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
   log "claude: missing [CLAUDE_TURN: COMPLETE] marker — assuming partial"
   exit 1
 fi
+
+# The stdout marker alone isn't proof of completion: the summary comment is
+# the turn's contract (posted last, after every inline reply), and a failed
+# POST or a crash after inline-only replies would otherwise advance the loop
+# past a half-posted response. Refetch and require this iteration's summary.
+if ! verify_ai_summary claude "$ITER"; then
+  log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
+  exit 1
+fi
+
+log "claude: turn complete"
+exit 0

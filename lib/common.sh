@@ -1,10 +1,29 @@
 # Shared helpers for the AI PR loop.
 # Sourced by codex_turn.sh, claude_turn.sh, run.sh.
 
+# --- Forge selection ------------------------------------------------------------
+#
+# The loop speaks to one of two forges, selected by $FORGE (github | gitlab)
+# with $FORGE_HOST carrying the hostname (github.com, or the GitLab host —
+# gitlab.com or self-hosted). GitLab terminology note: "PR" == MR and
+# PR_NUMBER == the MR iid throughout; state lives under the same layout.
+#
+# GitHub access goes through the gh CLI (authed via GH_TOKEN/GITHUB_TOKEN).
+# GitLab access goes through curl against the REST API v4 with a
+# PRIVATE-TOKEN header; glab is used only for auth/token resolution and the
+# initial clone. Rationale: `glab api` silently drops `position[...]`
+# payloads when posting inline (line-anchored) MR discussions — the comment
+# lands as a general note with HTTP 200 — and rejects `--input` JSON bodies
+# with HTTP 400, so curl is the only reliable path for MR mutations. The
+# orchestrator (and the agent prompts) therefore standardize on curl for
+# every GitLab REST call.
+
+FORGE="${FORGE:-github}"
+
 # --- Identity / marker scheme -------------------------------------------------
 #
-# Both bots authenticate to GitHub via the same user PAT (the human's), so we
-# distinguish them inside comment bodies in two ways:
+# Both bots authenticate to the forge via the same user token (the human's),
+# so we distinguish them inside comment bodies in two ways:
 #
 #   1. A hidden HTML marker the orchestrator can grep:
 #        <!-- ai-loop:codex-reviewer    iter=N -->
@@ -19,6 +38,36 @@
 
 CODEX_MARKER_TAG="ai-loop:codex-reviewer"
 CLAUDE_MARKER_TAG="ai-loop:claude-implementer"
+
+# Exact summary wrapper every summary comment must open with (see
+# prompts/*): the bot's marker as the ENTIRE first line, then — blank lines
+# aside — the alert opener and the banner line as the first visible
+# content. The wrapper, not just the hidden marker, is what distinguishes a
+# summary from any other tagged top-level note: on GitLab an attempted
+# inline finding that loses its position lands as a general (issue-surface,
+# root) note carrying the same marker, and counting that as a summary would
+# let a turn that crashed before its real summary advance the resume
+# high-water. All three summary consumers (high-water, post-turn
+# verification, claude_turn's extraction) share the is_summary predicate
+# below.
+CODEX_SUMMARY_ALERT='> [!IMPORTANT]'
+CLAUDE_SUMMARY_ALERT='> [!NOTE]'
+CODEX_SUMMARY_BANNER_PFX='**AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration '
+CLAUDE_SUMMARY_BANNER_PFX='**AUTOMATED REPLY — AI agent (Claude Implementer), iteration '
+
+# jq prelude: the structural summary predicate. Deliberately NOT a
+# substring check — restatement comments legitimately QUOTE the banner in
+# their prose (Codex's own do), so contains() would let a quoted banner in
+# a tagged general note pass as a completed summary. Structure is enforced
+# instead: marker line first, alert + exact banner line as the first
+# visible lines. \r and trailing whitespace are normalized; nothing else.
+AI_SUMMARY_JQ_DEF='
+  def is_summary($m; $alert; $bpfx; $it):
+    (((.body // "") | gsub("\r"; "") | split("\n")) | map(sub("[[:space:]]+$"; ""))) as $l
+    | ($l[0] == "<!-- " + $m + " iter=" + ($it|tostring) + " -->")
+      and (([ $l[1:][] | select(. != "") ])[0:2] ==
+           [$alert, "> " + $bpfx + ($it|tostring) + ".**"]);
+'
 
 CODEX_LABEL="AI · Codex Reviewer"
 CLAUDE_LABEL="AI · Claude Implementer"
@@ -37,34 +86,460 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+# Read a host-scoped glab config value with glab's environment overrides
+# cleared — both the token vars (GITLAB_TOKEN / GITLAB_ACCESS_TOKEN /
+# OAUTH_TOKEN / GLAB_TOKEN: any of them shadows every host's configured
+# token, so an ambient OAUTH_TOKEN minted for some other host would be
+# returned as this host's "token", sail past the is_oauth2 guard, and be
+# sent as a PRIVATE-TOKEN it was never meant to be) and the generic
+# GLAB_<KEY>/GITLAB_<KEY> config overrides for the keys we read
+# (GLAB_IS_OAUTH2=false would otherwise mask a stored OAuth session right
+# before its token gets exported). The loop's only supported environment
+# credential is GITLAB_TOKEN, which preflight consumes before ever reaching
+# the glab-config fallback.
+# The host key defaults to $FORGE_HOST; preflight may pin $GLAB_HOST_KEY
+# to an equivalent stored spelling instead (glab keys host config by the
+# exact authority string used at login, so a PAT stored under
+# 'gl.example:443' or 'GL.EXAMPLE' is invisible under the canonical
+# 'gl.example').
+glab_config_get() {
+  env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN -u OAUTH_TOKEN -u GLAB_TOKEN \
+      -u GLAB_IS_OAUTH2 -u GITLAB_IS_OAUTH2 \
+    glab config get "$1" --host "${GLAB_HOST_KEY:-$FORGE_HOST}" 2>/dev/null
+}
+
+# The config file the glab BINARY actually reads: $GLAB_CONFIG_DIR wins;
+# a Snap-installed glab is confined to its own remapped HOME
+# (~/snap/glab/current/.config/glab-cli), invisible at the caller's
+# default path — snapd launches from /snap/bin or, on distributions
+# without the /snap symlink, from /var/lib/snapd/snap/bin; then glab's
+# legacy location ($HOME/.config/glab-cli) when it EXISTS — glab prefers
+# it over an XDG_CONFIG_HOME override — and the XDG default last.
+glab_config_file() {
+  if [[ -n "${GLAB_CONFIG_DIR:-}" ]]; then
+    printf '%s/config.yml\n' "$GLAB_CONFIG_DIR"
+    return
+  fi
+  case "$(command -v glab 2>/dev/null)" in
+    /snap/*|/var/lib/snapd/snap/*)
+      printf '%s/snap/glab/current/.config/glab-cli/config.yml\n' "${HOME:-}"
+      ;;
+    *)
+      if [[ -f "${HOME:-}/.config/glab-cli/config.yml" ]]; then
+        printf '%s/.config/glab-cli/config.yml\n' "${HOME:-}"
+      else
+        printf '%s/glab-cli/config.yml\n' "${XDG_CONFIG_HOME:-${HOME:-}/.config}"
+      fi
+      ;;
+  esac
+}
+
+# List the EXACT host-key spellings configured in glab (one per line).
+# glab exposes no list command, so read the hosts: section of its config
+# file directly — host keys are the 4-space-indented `key:` lines between
+# `hosts:` and the next top-level key, with one layer of YAML quoting
+# stripped (glab quotes keys like '[abcd::1]'). Used only as a candidate
+# source for the preflight probe (the values are still read through the
+# glab binary), so an unreadable/moved config degrades to the enumerated
+# candidates.
+glab_config_host_keys() {
+  local cfg
+  cfg=$(glab_config_file)
+  [[ -r "$cfg" ]] || return 0
+  awk '
+    /^hosts:[[:space:]]*$/ { in_hosts = 1; next }
+    in_hosts && /^[^[:space:]]/ { in_hosts = 0 }
+    in_hosts && /^    [^[:space:]].*:[[:space:]]*$/ {
+      k = $0
+      sub(/^    /, "", k); sub(/:[[:space:]]*$/, "", k)
+      if (k ~ /^\047.*\047$/ || k ~ /^".*"$/) k = substr(k, 2, length(k) - 2)
+      print k
+    }' "$cfg" 2>/dev/null
+}
+
 preflight() {
-  require_cmd gh
   require_cmd codex
   require_cmd claude
   require_cmd git
   require_cmd jq
-  [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "GH_TOKEN/GITHUB_TOKEN not set"
-  # Resolve the authenticated user so prompts can render the banner with the
-  # right @handle (instead of a hardcoded one). Also doubles as an auth check.
-  export GH_USER
-  GH_USER=$(gh api user --jq .login 2>/dev/null) \
-    || die "gh is not authenticated; run 'gh auth login' or set a valid GH_TOKEN"
-  [[ -n "$GH_USER" ]] || die "gh api user returned empty login"
+  case "$FORGE" in
+    github)
+      require_cmd gh
+      [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "GH_TOKEN/GITHUB_TOKEN not set"
+      # Resolve the authenticated user so prompts can render the banner with
+      # the right @handle (instead of a hardcoded one). Also doubles as an
+      # auth check.
+      export GH_USER
+      GH_USER=$(gh api user --jq .login 2>/dev/null) \
+        || die "gh is not authenticated; run 'gh auth login' or set a valid GH_TOKEN"
+      [[ -n "$GH_USER" ]] || die "gh api user returned empty login"
+      ;;
+    gitlab)
+      require_cmd glab
+      require_cmd curl
+      # A raw token is required: every GitLab REST call — orchestrator and
+      # agents alike — goes through curl (see the forge note above). Env
+      # wins; otherwise pull the host's token out of the glab config.
+      # The glab fallback only works for PAT-backed sessions: a web/device
+      # OAuth login stores an OAuth access token, which the REST API accepts
+      # only as "Authorization: Bearer" (PRIVATE-TOKEN reads it as a PAT →
+      # 401) and which expires mid-loop unless glab's own refresh runs.
+      # Detect that configuration and reject it with instructions rather
+      # than failing obscurely on /user (or hours later on token expiry).
+      if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+        # FORGE_HOST is canonical (host lowercased, port numerically
+        # normalized), but glab keys its host config by the EXACT string
+        # used at login — a PAT stored under 'gl.example:443' or
+        # 'gl.example:0443' is invisible under 'gl.example'. Probe the
+        # canonical key, then the invocation's original validated spelling
+        # (run.sh's ORIG_HOST), then EVERY accepted zero-padded spelling of
+        # the endpoint's port (the validator caps ports at 5 digits, so
+        # the paddings are finite), and pin ONE key for the paired
+        # is_oauth2/token reads so the auth mode and the token can never
+        # come from different sessions.
+        local _glab_cand _glab_base _glab_obase _glab_b _glab_port _glab_pad _glab_seen _glab_bare
+        GLAB_HOST_KEY="$FORGE_HOST"
+        _glab_base="$FORGE_HOST"; _glab_port=''; _glab_bare=1
+        if [[ "$FORGE_HOST" =~ ^(.+):([0-9]+)$ ]]; then
+          _glab_base="${BASH_REMATCH[1]}"; _glab_port="${BASH_REMATCH[2]}"; _glab_bare=0
+        else
+          case "${FORGE_SCHEME:-https}" in
+            http)  _glab_port=80  ;;
+            https) _glab_port=443 ;;
+          esac
+        fi
+        # glab stores login spellings verbatim and case-preserved, so when
+        # the invocation's original host part differs in case from the
+        # lowercased canonical base, its spellings must be enumerated too.
+        _glab_obase="${ORIG_HOST:-}"
+        if [[ "$_glab_obase" =~ ^(.+):([0-9]+)$ ]]; then
+          _glab_obase="${BASH_REMATCH[1]}"
+        fi
+        [[ "$_glab_obase" == "$_glab_base" ]] && _glab_obase=''
+        if [[ -z "$(glab_config_get token)" ]]; then
+          _glab_seen=" $GLAB_HOST_KEY "
+          set -- "${ORIG_HOST:-}"
+          for _glab_b in "$_glab_base" "$_glab_obase"; do
+            [[ -n "$_glab_b" ]] || continue
+            # The bare spelling is equivalent only when the endpoint sits
+            # on the scheme's default port (the canonical bare form was
+            # already probed; this adds the original-cased one).
+            if [[ "$_glab_bare" == 1 && "$_glab_b" != "$_glab_base" ]]; then
+              set -- "$@" "$_glab_b"
+            fi
+            _glab_pad="$_glab_port"
+            while [[ -n "$_glab_pad" && ${#_glab_pad} -le 5 ]]; do
+              set -- "$@" "${_glab_b}:${_glab_pad}"
+              _glab_pad="0${_glab_pad}"
+            done
+          done
+          # Last: DISCOVER configured host keys and keep those whose
+          # canonical authority is this endpoint — covers spellings no
+          # enumeration can (arbitrary case mixed with padding, e.g. a PAT
+          # logged in under 'GL.EXAMPLE' probed from a lowercase run).
+          while IFS= read -r _glab_cand; do
+            [[ -n "$_glab_cand" ]] || continue
+            [[ "$(canon_authority "$_glab_cand" "${FORGE_SCHEME:-https}")" == "$FORGE_HOST" ]] \
+              && set -- "$@" "$_glab_cand"
+          done < <(glab_config_host_keys)
+          for _glab_cand in "$@"; do
+            [[ -n "$_glab_cand" ]] || continue
+            [[ "$_glab_seen" == *" $_glab_cand "* ]] && continue
+            _glab_seen="${_glab_seen}${_glab_cand} "
+            if [[ -n "$(GLAB_HOST_KEY="$_glab_cand"; glab_config_get token)" ]]; then
+              log "glab config: PAT stored under host key '$_glab_cand' — using that key"
+              GLAB_HOST_KEY="$_glab_cand"
+              break
+            fi
+          done
+        fi
+        if [[ "$(glab_config_get is_oauth2)" == "true" ]]; then
+          die "glab session for $GLAB_HOST_KEY is OAuth-backed (web/device login) — its token cannot be sent as PRIVATE-TOKEN and expires mid-loop. Set GITLAB_TOKEN to a personal access token (api scope), or re-run 'glab auth login --hostname $FORGE_HOST' and authenticate with a token instead"
+        fi
+        GITLAB_TOKEN=$(glab_config_get token) || GITLAB_TOKEN=''
+      fi
+      [[ -n "${GITLAB_TOKEN:-}" ]] \
+        || die "no GitLab token for $FORGE_HOST: set GITLAB_TOKEN or run 'glab auth login --hostname $FORGE_HOST'"
+      export GITLAB_TOKEN
+      # URL-encoded project path ("group/sub/proj" -> "group%2Fsub%2Fproj"),
+      # the id segment every /projects/:id API path needs.
+      export PROJECT_ENC
+      PROJECT_ENC=$(jq -rn --arg s "$REPO_SLUG" '$s|@uri')
+      # GH_USER doubles as the forge login on GitLab (kept under one name so
+      # prompts and turn scripts stay forge-agnostic). Doubles as auth check.
+      export GH_USER
+      GH_USER=$(gl_api_get user 2>/dev/null | jq -r '.username // empty') \
+        || GH_USER=''
+      [[ -n "$GH_USER" ]] \
+        || die "GitLab auth failed against ${FORGE_SCHEME:-https}://$FORGE_HOST/api/v4/user (token invalid or wrong host?)"
+      ;;
+    *) die "unknown forge: $FORGE (expected github or gitlab)" ;;
+  esac
 }
 
-# Ensure $REPO_DIR contains a clone of $REPO_OWNER/$REPO_NAME. If it doesn't
-# exist (or is an empty directory), clone via `gh repo clone` so the loop is
-# self-contained — the caller never has to pre-clone the repo. If $REPO_DIR
-# already holds a different repo, fail rather than mangle it.
+# Normalize a git remote URL to its repo slug: ssh://git@host[:port]/PATH(.git),
+# [user@]host:PATH(.git), and https://host/PATH(.git) all reduce to PATH,
+# which may contain subgroups on GitLab (group/sub/proj). The ssh:// form
+# strips through the first / (the host part may carry :port); the scp-style
+# forms strip through the first : (the userless form only when nothing
+# before the colon contains a slash — i.e. it is a host, not a local path,
+# matching git's own interpretation).
+normalize_remote_slug() {
+  # In order: ssh://[user@]host[:port]/PATH; [user@][v6bracket]:PATH and
+  # [user@]host:PATH (scp-style); http(s)://[cred@]host/PATH; userless
+  # host:PATH (scp-style — only when the char after the colon isn't '/',
+  # so scheme prefixes like file:// and absolute scp paths are left intact
+  # for the mismatch report). Bracketed IPv6 strips before the general scp
+  # expressions, whose [^:/]+ would otherwise stop at the first colon
+  # inside the brackets.
+  sed -E 's#^ssh://[^/]+/##; s#^[^/:@]+@\[[^]]+\]:##; s#^[^/:@]+@[^:/]+:##; s#^https?://[^/]+/##; s#^\[[^]]+\]:([^/])#\1#; s#^[^/:@]+:([^/])#\1#; s#\.git$##; s#^/##' <<<"$1"
+}
+
+# Validate a forge authority before it is ever embedded in an API URL: a
+# bare hostname (dot-separated alphanumeric/hyphen labels) or a bracketed
+# IPv6 literal, plus an optional numeric port — nothing else. The authority
+# is captured from a user-supplied MR URL / --host and pasted verbatim into
+# every curl target, so URL-grammar tricks must die here: in
+# https://gitlab.example.com@attacker.invalid/g/p/-/merge_requests/1 the
+# "host" segment parses as gitlab.example.com@attacker.invalid, which curl
+# reads as userinfo@attacker.invalid — a crafted MR link would send the
+# PRIVATE-TOKEN header (the PAT) to the attacker's server.
+validate_forge_authority() {
+  local a="$1"
+  # Labels admit underscores (common on intranet DNS, harmless here) and a
+  # single trailing dot (an absolute FQDN) — neither can smuggle userinfo
+  # or path characters.
+  [[ "$a" =~ ^([A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?)*\.?|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$ ]] \
+    || die "invalid forge host '$a' — expected host[:port] (userinfo, paths, or other URL characters are not allowed)"
+}
+
+# Lowercase a host string: DNS reg-names (and IPv6 hex digits) are
+# case-insensitive, so GL.EXAMPLE and gl.example are one endpoint. bash 3.2
+# (stock macOS) lacks ${var,,}, hence tr.
+lc_host() { LC_ALL=C tr '[:upper:]' '[:lower:]' <<<"$1"; }
+
+# Comparable DNS-host form: lowercased, with one trailing dot — the
+# absolute-FQDN spelling of the same name — stripped. IP literals
+# (bracketed or bare IPv6) only lowercase.
+canon_dns_host() {
+  local h
+  h=$(lc_host "$1")
+  if [[ "$h" != \[* && "$h" != *:* && "$h" == *. ]]; then h="${h%.}"; fi
+  printf '%s\n' "$h"
+}
+
+# Canonicalize an http(s) authority for a scheme: the host lowercases (DNS
+# matching is case-insensitive) and the port normalizes NUMERICALLY —
+# leading zeros drop (:0443 is :443 — curl parses the number), the scheme's
+# default port drops entirely, any other port keeps its canonical digits.
+# The single normalizer behind target-identity canonicalization, remote
+# comparison, and legacy-state discovery — equivalent spellings must agree
+# everywhere or they fork identity at whichever layer was missed.
+canon_authority() {
+  local a="$1" scheme="$2" host port def=''
+  case "$scheme" in http) def=80 ;; https) def=443 ;; esac
+  if [[ "$a" =~ ^(.+):([0-9]+)$ ]]; then
+    host=$(canon_dns_host "${BASH_REMATCH[1]}"); port=$((10#${BASH_REMATCH[2]}))
+    if [[ -n "$def" ]] && (( port == def )); then
+      printf '%s\n' "$host"
+    else
+      printf '%s:%s\n' "$host" "$port"
+    fi
+  else
+    canon_dns_host "$a"
+  fi
+}
+
+# Drop a trailing :port from a host string (IPv6 bracket literals unwrap to
+# their address) and reduce to the comparable DNS form (lowercased, one
+# trailing dot stripped). This is the form normalize_remote_host emits —
+# hostname comparisons are case- and absolute-FQDN-insensitive.
+host_sans_port() {
+  local h="$1"
+  if [[ "$h" == \[* ]]; then
+    h="${h#[}"; h="${h%%]*}"
+  else
+    h="${h%%:*}"
+  fi
+  canon_dns_host "$h"
+}
+
+# Hostname of a git remote URL: scheme://[user@]host[:port]/path and the
+# scp-style [user@]host:path both reduce to host (:port stripped — an ssh
+# remote's port legitimately differs from the web port; a userless
+# host:path counts as scp-style only when no slash precedes the colon,
+# matching git's own URL interpretation). Prints nothing when no host can
+# be parsed (local path, file://, exotic transport) — callers must treat
+# that as NOT the forge, not as unknown-but-fine.
+normalize_remote_host() {
+  local url="$1" head
+  case "$url" in
+    ssh://*|git://*|http://*|https://*)
+      url="${url#*://}"; url="${url%%/*}"; url="${url#*@}"
+      host_sans_port "$url"
+      ;;
+    *://*)
+      # Unknown transport (file://, ftp://, ...) — not a forge endpoint.
+      : ;;
+    *@*:*)
+      url="${url#*@}"
+      if [[ "$url" == \[* ]]; then
+        # scp-style with a bracketed IPv6 host: git@[::1]:path
+        head="${url%%]*}"; lc_host "${head#[}"
+      else
+        canon_dns_host "${url%%:*}"
+      fi
+      ;;
+    \[*\]:*)
+      # userless bracketed IPv6: [::1]:path
+      head="${url%%]*}"; lc_host "${head#[}"
+      ;;
+    [!/]*:*)
+      head="${url%%:*}"
+      if [[ "$head" != */* ]]; then canon_dns_host "$head"; fi
+      ;;
+    *)
+      : ;;
+  esac
+}
+
+# Authority (host[:port], userinfo stripped, the port canonicalized
+# numerically per scheme) of an http(s) git remote; prints nothing for any
+# other transport. Unlike ssh — where the transport port is unrelated to
+# the web port — an HTTP(S) port is part of the instance identity:
+# gitlab.lab:8929 and gitlab.lab:9999 are different GitLabs, while
+# gl.example:0443 and gl.example are the same https endpoint.
+normalize_remote_http_authority() {
+  local url="$1" scheme authority
+  case "$url" in
+    http://*)  scheme=http  ;;
+    https://*) scheme=https ;;
+    *) return 0 ;;
+  esac
+  authority="${url#*://}"; authority="${authority%%/*}"; authority="${authority#*@}"
+  canon_authority "$authority" "$scheme"
+}
+
+# $FORGE_HOST normalized the same way, so the two sides of the http(s)
+# authority comparison agree (a no-op when run.sh already canonicalized).
+forge_http_authority() {
+  canon_authority "$FORGE_HOST" "${FORGE_SCHEME:-https}"
+}
+
+# Ensure $REPO_DIR contains a clone of $REPO_SLUG. If it doesn't exist (or is
+# an empty directory), clone via the forge CLI (`gh repo clone` /
+# `glab repo clone`) so the loop is self-contained — the caller never has to
+# pre-clone the repo. If $REPO_DIR already holds a different repo, fail rather
+# than mangle it.
+# Validate ONE remote URL of the checkout against the loop's target repo.
+# $1 = the URL, $2 = its role (fetch|push, for messages). Same-slug projects
+# on different forges/hosts are different repositories (github.com/g/p vs
+# gitlab.example/g/p); fetching or pushing this checkout while posting to
+# the other host's PR would mangle both. The comparison is scheme-aware:
+#   - http(s) URL → scheme AND full authority must match (default ports
+#     dropped per scheme on both sides): an HTTP(S) endpoint is identified
+#     by scheme://host:port, so gitlab.lab:8929 vs gitlab.lab:9999 — and
+#     http://gl.example (port 80) vs https://gl.example (port 443) — never
+#     pass as each other.
+#   - ssh/scp/git URL → hostnames only (a transport port is unrelated to
+#     the web port), with the forges' documented alternate ssh endpoints
+#     (ssh.github.com, altssh.gitlab.com) counting as their host, and a
+#     dotless parsed host treated as a ~/.ssh/config alias — unverifiable,
+#     so the slug check has to carry it alone.
+# A mismatch dies: if the URL reaches the right host through an alias or
+# rewrite, point it at the canonical authority, or use a fresh --dir and
+# let the loop clone canonically itself.
+validate_origin_url() {
+  local url="$1" kind="$2"
+  local remote_slug remote_host remote_auth remote_scheme want_host want_auth
+  remote_slug=$(normalize_remote_slug "$url")
+  if [[ -n "$remote_slug" && "$remote_slug" != "$REPO_SLUG" ]]; then
+    die "REPO_DIR=$REPO_DIR origin $kind URL is a clone of '$remote_slug', not '$REPO_SLUG'"
+  fi
+  remote_auth=$(normalize_remote_http_authority "$url")
+  if [[ -n "$remote_auth" ]]; then
+    remote_scheme="${url%%://*}"
+    want_auth=$(forge_http_authority)
+    [[ "${remote_scheme}://${remote_auth}" == "${FORGE_SCHEME:-https}://${want_auth}" ]] \
+      || die "REPO_DIR=$REPO_DIR origin $kind URL points at '${remote_scheme}://${remote_auth}', not '${FORGE_SCHEME:-https}://${want_auth}' — same slug on a different forge/scheme/host/port is a different repository (same instance under another name, e.g. a search-domain short name? point origin at the canonical authority, or use a fresh --dir)"
+  else
+    remote_host=$(normalize_remote_host "$url")
+    want_host=$(host_sans_port "${FORGE_HOST:-github.com}")
+    if [[ -z "$remote_host" ]]; then
+      # No parseable endpoint at all: a local/relative path or file://
+      # mirror. That is definitively NOT the forge — a matching slug
+      # (e.g. origin 'g/p.git' for gl.example/g/p) would let the loop
+      # review and push a local mirror while its comments go to the MR.
+      die "REPO_DIR=$REPO_DIR origin $kind URL '$url' has no forge endpoint (local path or unsupported transport) — the loop must fetch/push the MR's repository; point origin at the forge, or use a fresh --dir"
+    fi
+    # The public forges' documented alternate ssh endpoints are SPECIFIC
+    # literal mappings — ssh.github.com is github.com, altssh.gitlab.com is
+    # gitlab.com — not a general "<prefix>.<host>" rule: on a self-host,
+    # ssh.gl.example is just another DNS name that need not route to
+    # gl.example, so a prefixed form there is a different endpoint and must
+    # be rejected like any other mismatch. '/' is an impossible hostname,
+    # used as the no-alternate placeholder.
+    local alt_host='/'
+    case "$want_host" in
+      github.com) alt_host='ssh.github.com'    ;;
+      gitlab.com) alt_host='altssh.gitlab.com' ;;
+    esac
+    case "$remote_host" in
+      "$want_host"|"$alt_host")
+        : ;;
+      *.*)
+        die "REPO_DIR=$REPO_DIR origin $kind URL points at host '$remote_host', not '$want_host' — same slug on a different forge/host is a different repository (ssh alias or URL rewrite for the right host? point origin at the canonical hostname, or use a fresh --dir)"
+        ;;
+      *:*)
+        # An IP literal is an exact endpoint, never a ~/.ssh/config alias —
+        # a nonmatching IPv6 origin must not ride the dotless-name
+        # leniency below ([::2] is simply a different server than [::1]).
+        # The comparison is TEXTUAL: hextet spellings are not
+        # canonicalized, so [0:0:0:0:0:0:0:1] does not equal [::1] here —
+        # the remediation names that case.
+        die "REPO_DIR=$REPO_DIR origin $kind URL points at IPv6 host '[$remote_host]', not '[$want_host]' — same slug on a different host is a different repository (IPv6 literals compare textually: if this is the same address in another spelling, point origin at the target's exact spelling)"
+        ;;
+      *)
+        # A dotless ALL-NUMERIC name is an IP literal in disguise —
+        # decimal (2130706433), legacy octal (017700000001), or hex
+        # (0x7f000001) spellings of an IPv4 address that the resolver
+        # happily connects to. Those are endpoints, not ~/.ssh/config
+        # aliases, and must never ride the alias leniency below.
+        if [[ "$remote_host" =~ ^(0[xX][0-9a-fA-F]+|[0-9]+)$ ]]; then
+          die "REPO_DIR=$REPO_DIR origin $kind URL host '$remote_host' is a numeric IP spelling, not '$want_host' — same slug on a different host is a different repository"
+        fi
+        log "origin $kind host '$remote_host' looks like an ssh alias — cannot verify it matches $want_host (slug check passed)"
+        ;;
+    esac
+  fi
+}
+
 ensure_repo_clone() {
   if [[ -d "$REPO_DIR/.git" ]]; then
-    local origin_url remote_slug
-    origin_url=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)
-    # Normalize git@github.com:OWNER/NAME(.git) and https://github.com/OWNER/NAME(.git)
-    remote_slug=$(sed -E 's#^(git@[^:]+:|https?://[^/]+/)##; s#\.git$##' <<<"$origin_url")
-    if [[ -n "$remote_slug" && "$remote_slug" != "${REPO_OWNER}/${REPO_NAME}" ]]; then
-      die "REPO_DIR=$REPO_DIR is a clone of '$remote_slug', not '${REPO_OWNER}/${REPO_NAME}'"
-    fi
+    local url n_urls=0
+    # Validate every fetch AND push URL of origin: the loop's `git push
+    # origin` honors remote.origin.pushurl (which can differ arbitrarily
+    # from the fetch URL, and can be multi-valued), so a checkout fetching
+    # the right repo but pushing elsewhere would pass a fetch-only check
+    # and then deliver the implementer's commits to the wrong server.
+    # `get-url --push` falls back to the fetch URL when no pushurl is set —
+    # a harmless double-validation.
+    while IFS= read -r url; do
+      if [[ -n "$url" ]]; then
+        validate_origin_url "$url" fetch
+        n_urls=$((n_urls + 1))
+      fi
+    done < <(git -C "$REPO_DIR" remote get-url --all origin 2>/dev/null || true)
+    while IFS= read -r url; do
+      if [[ -n "$url" ]]; then
+        validate_origin_url "$url" push
+        n_urls=$((n_urls + 1))
+      fi
+    done < <(git -C "$REPO_DIR" remote get-url --push --all origin 2>/dev/null || true)
+    # A repo with no origin URL at all can't be validated — and can't serve
+    # the loop, which fetches and pushes origin to track the MR branch.
+    (( n_urls > 0 )) \
+      || die "REPO_DIR=$REPO_DIR has no origin remote URL — the loop fetches/pushes origin to reach the MR's source branch; clone the repository properly or use a fresh --dir"
     log "using existing clone at $REPO_DIR"
     return
   fi
@@ -75,44 +550,338 @@ ensure_repo_clone() {
     die "REPO_DIR exists and is non-empty but is not a git repo: $REPO_DIR"
   fi
   mkdir -p "$(dirname "$REPO_DIR")"
-  log "cloning ${REPO_OWNER}/${REPO_NAME} into $REPO_DIR"
-  gh repo clone "${REPO_OWNER}/${REPO_NAME}" "$REPO_DIR" >&2 \
-    || die "failed to clone ${REPO_OWNER}/${REPO_NAME}"
+  log "cloning $REPO_SLUG into $REPO_DIR"
+  case "$FORGE" in
+    gitlab)
+      if [[ "${FORGE_SCHEME:-https}" == "http" ]]; then
+        # glab can't be steered to plain HTTP without per-host config (a
+        # scheme inside GITLAB_HOST is stripped and it still speaks https),
+        # so clone with git directly. Auth for a private repo — and for the
+        # pushes this remote will take later — comes from the ambient git
+        # credential setup, the same non-interactive push-path requirement
+        # the loop already documents.
+        git clone "http://${FORGE_HOST}/${REPO_SLUG}.git" "$REPO_DIR" >&2 \
+          || die "failed to clone $REPO_SLUG from http://$FORGE_HOST"
+      else
+        GITLAB_HOST="$FORGE_HOST" glab repo clone "$REPO_SLUG" "$REPO_DIR" >&2 \
+          || die "failed to clone $REPO_SLUG from $FORGE_HOST"
+      fi
+      ;;
+    *)
+      gh repo clone "$REPO_SLUG" "$REPO_DIR" >&2 \
+        || die "failed to clone $REPO_SLUG"
+      ;;
+  esac
 }
 
-# --- GitHub helpers -----------------------------------------------------------
+# Move $REPO_DIR's working tree to the EXACT PR/MR head — clean and
+# detached — or die. Called before every turn so the agents never operate
+# on (or commit) anything outside the PR. Hazards it defends against:
+#   - Option-like / ambiguous forge branch names. `refs/heads/-f` and `@`
+#     are valid refs, but `git checkout "$HEAD_REF"` reads `-f` as a flag
+#     (silently NOT switching, rc 0) and `@` as HEAD. We resolve the head
+#     to a literal COMMIT and detach onto it — a SHA can't be reparsed as
+#     an option.
+#   - Branch-derived tracking-ref destinations. A branch literally named
+#     `HEAD` (forges allow it) maps to `refs/remotes/origin/HEAD`, normally
+#     a SYMREF to origin/<default> — fetching into it follows the symref
+#     and corrupts the base tracking ref instead (alternating checkouts).
+#     We fetch into fixed, private refs (refs/ai-pr-loop/*), which branch
+#     names can never alias — and clear each destination with a --no-deref
+#     delete first, so even a pre-planted symref AT the destination cannot
+#     redirect the fetch onto some other ref.
+#   - A force-rewound remote (B→A) leaving a stale local HEAD at B. The
+#     leading-'+' refspec force-updates our private ref to mirror the
+#     remote, then we detach onto it.
+#   - Leftover working-tree state. An agent turn runs `git add`/`commit`,
+#     so any staged/unstaged/untracked file lying around would be published
+#     with the PR. A managed clone (the loop's own) is force-reset and
+#     cleaned before every turn. A caller-supplied --dir clone is checked
+#     ONCE, on the first sync of this invocation: ANY dirt (probed with
+#     --untracked-files=normal, so a caller's status.showUntrackedFiles=no
+#     can't hide files) or a HEAD that is not an ancestor of the fetched
+#     head (local-ahead/divergent) dies rather than have caller work
+#     discarded or committed. After that first clean sync the invocation
+#     owns the clone: later syncs force-reset and clean it like a managed
+#     one, so build/test artifacts the loop's own agent turns leave behind
+#     are dropped instead of wedging the loop or being committed.
+#   - Swallowed failures. No `|| true`; every step `|| die`, and HEAD is
+#     asserted equal to the fetched head at the end.
+
+# Internal sentinel: 1 after the first verified-clean --dir sync of THIS
+# process. Reset at source time — an inherited environment value must never
+# be able to skip the first-sync safety checks.
+SYNC_DIR_TRUSTED=0
+
+sync_repo_to_pr_head() {
+  local d="$REPO_DIR" target head dirt r
+  # The fetch destinations must be DIRECT refs: git dereferences a
+  # pre-existing symref destination and would force-rewrite whatever local
+  # branch it points at. --no-deref delete removes the symref itself (rc 0
+  # when absent), so the fetch below always creates fresh direct refs.
+  for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
+    git -C "$d" update-ref --no-deref -d "$r" \
+      || die "could not clear stale ref $r in $d"
+  done
+  git -C "$d" fetch --quiet origin \
+      "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
+      "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
+    || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
+  target=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
+    || die "could not resolve the PR head (refs/ai-pr-loop/head) after fetch"
+  if [[ "${MANAGED_CLONE:-1}" == "1" || "$SYNC_DIR_TRUSTED" == "1" ]]; then
+    # Unconditionally (even when HEAD already matches): --force drops
+    # staged/unstaged changes; clean -ffd drops untracked files including
+    # embedded git repos (single -f leaves those, and `git add -A` would
+    # publish one as a gitlink). Ignored files may stay — `git add -A`
+    # never commits them. core.hooksPath=/dev/null: no caller-installed
+    # hook may run (a post-checkout hook could recreate artifacts right
+    # after cleanup).
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --force --detach "$target" \
+      || die "could not check out the PR head $target in $d"
+    git -C "$d" -c core.fsmonitor=false clean -qffd \
+      || die "could not remove untracked files in $d"
+    # An initialized submodule left on a different commit would be staged
+    # by `git add -A` as a changed gitlink; put every initialized one back
+    # on the recorded commit, and drop untracked artifacts inside them —
+    # not publishable through a superproject commit, but they change
+    # builds, tests, and what the agents analyze. --checkout: the update
+    # strategy must never come from the just-checked-out .gitmodules
+    # (update=merge/rebase would create commits instead of detaching).
+    # (Both are no-ops when there are no submodules.)
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule update --quiet --checkout --recursive --force \
+      || die "could not reset initialized submodules in $d"
+    git -C "$d" submodule --quiet foreach --recursive git -c core.fsmonitor=false clean -qffd \
+      || die "could not clean initialized submodules in $d"
+    # Fail closed on anything the cleanup above did not cover.
+    # --ignore-submodules=dirty is config-independent where it matters: it
+    # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
+    # GITLINK (publishable via `git add -A`), while tolerating
+    # submodule-internal worktree state — which cannot be published through
+    # a superproject commit, and whose eol/filter non-idempotent variant no
+    # cleanup could ever silence (dying on it would wedge the loop). A
+    # top-level ' M' here includes checkout-non-idempotent eol/filter
+    # content: an agent's ordinary `git add -A` would stage that
+    # renormalization diff, publishing content the turn did not author —
+    # refusing to run is the only way to keep the commit invariant; the
+    # repo owner can fix the branch with `git add --renormalize . && git
+    # commit`.
+    # core.fsmonitor=false: a formerly---dir clone keeps its caller config,
+    # and a "nothing changed" fsmonitor answer must not fake this probe.
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+      || die "git status failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
+  else
+    # Probe config-independently: a caller's submodule.<name>.ignore=all
+    # would otherwise hide a drifted gitlink from this check, and a turn's
+    # `git add -A` would stage it. core.fsmonitor=false: a caller's
+    # fsmonitor hook/daemon claiming "nothing changed" would make status
+    # skip the real worktree and report a tracked edit as clean.
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git status failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
+    # Probe every initialized submodule's own worktree as well: the
+    # superproject probe recurses using EACH SUBMODULE's config, so a
+    # submodule-local status.showUntrackedFiles=no (or a nested
+    # submodule.<name>.ignore=all) could hide caller state that this
+    # invocation's later trusted syncs would clean away.
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git submodule status probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
+    # An active sparse checkout marks every out-of-cone file skip-worktree,
+    # hiding it from the status probes; refuse it with accurate guidance
+    # (the generic index-bits advice below would only mislead here).
+    if [[ "$(git -C "$d" config --get core.sparseCheckout 2>/dev/null)" == "true" ]]; then
+      die "REPO_DIR=$d uses sparse-checkout, which the loop cannot safely run on (out-of-cone files are hidden from its safety probes) — run 'git sparse-checkout disable' first, or omit --dir to use a managed checkout"
+    fi
+    # assume-unchanged / skip-worktree index bits make status skip a file
+    # entirely: a caller edit behind one would pass the probes above and be
+    # destroyed by this invocation's later forced syncs. ls-files -v tags
+    # them (lowercase = assume-unchanged, 'S'/'s' = skip-worktree); refuse
+    # both, in the superproject and in every initialized submodule.
+    dirt=$(git -C "$d" ls-files -v | { grep -E '^(S|[a-z]) ' || true; }) \
+      || die "git ls-files probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries that hide edits from status — clear them (git update-index --no-assume-unchanged/--no-skip-worktree) before running with --dir: $dirt"
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             'git ls-files -v | { grep -E "^(S|[a-z]) " || true; }') \
+      || die "git submodule ls-files probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries inside initialized submodules — clear them before running with --dir: $dirt"
+    head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
+    if [[ -n "$head" && "$head" != "$target" ]] \
+       && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
+      die "REPO_DIR=$d HEAD ($head) is not an ancestor of the PR head ($target) — refusing to discard local work in a --dir clone; reconcile it manually or omit --dir to use a managed checkout"
+    fi
+    # Detach even when the SHA already matches, so a turn's commit can
+    # never advance a caller's local branch. --no-overwrite-ignore: an
+    # ignored caller file whose path the PR head starts tracking must fail
+    # the checkout (fail closed), not be silently replaced — the porcelain
+    # probe above cannot see ignored files. core.hooksPath=/dev/null: a
+    # caller-installed post-checkout hook must not run (it could create
+    # artifacts a turn's `git add -A` would publish).
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$target" \
+      || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
+    # Align each initialized submodule with the gitlink its (just-updated)
+    # superproject records, exactly as the superproject was treated: a
+    # literal detached checkout with --no-overwrite-ignore, so an ignored
+    # caller file inside a submodule whose path the new gitlink starts
+    # tracking fails closed instead of being silently replaced
+    # ('submodule update --force' has no such protection). $sha1 is
+    # foreach's recorded-gitlink variable — single quotes are deliberate.
+    # Not honoring .gitmodules update strategies is also what keeps a
+    # PR-supplied update=merge/rebase from committing onto caller branches.
+    # If the recorded commit is not fetched yet (e.g. the caller set
+    # fetch.recurseSubmodules=false), try to fetch it best-effort first —
+    # 'submodule update' used to do this; the checkout still fails closed
+    # if the commit stays unavailable.
+    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule --quiet foreach --recursive \
+        'git rev-parse --verify --quiet "$sha1^{commit}" >/dev/null 2>&1 \
+           || git -c core.hooksPath=/dev/null fetch --quiet origin "$sha1" 2>/dev/null \
+           || git -c core.hooksPath=/dev/null fetch --quiet origin 2>/dev/null \
+           || true; \
+         git -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$sha1"' \
+      || die "could not align initialized submodules with the PR head in $d (a caller file inside a submodule may collide with a path the PR tracks, or a recorded commit could not be fetched; reconcile manually)"
+    # Config-independent post-check (superproject and submodule
+    # worktrees): nothing — hook output, submodule drift, filter effects —
+    # may have appeared between the pre-check and here. Caller-preserving:
+    # on failure we die without cleaning.
+    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git status failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d is not clean after checking out the PR head (a hook or filter may have produced state a turn could publish): $dirt"
+    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+      || die "git submodule status probe failed in $d"
+    [[ -z "$dirt" ]] \
+      || die "REPO_DIR=$d has state inside initialized submodules after checking out the PR head: $dirt"
+    # The caller's clone was verified clean; from here this invocation owns
+    # it, and later syncs clean the loop's own turn artifacts (above).
+    SYNC_DIR_TRUSTED=1
+  fi
+  [[ "$(git -C "$d" rev-parse HEAD)" == "$target" ]] \
+    || die "post-sync HEAD in $d is not the PR head $target"
+}
+
+# --- GitLab API helper ----------------------------------------------------------
+
+# GET a path (with optional query) under $FORGE_SCHEME://$FORGE_HOST/api/v4/.
+# $FORGE_SCHEME (default https) comes from the MR URL / --host, so an
+# HTTP-only self-hosted GitLab is reached on the scheme it actually serves.
+# curl -f: HTTP >= 400 exits non-zero so callers can `|| die`.
+gl_api_get() {
+  curl -sSf -H "PRIVATE-TOKEN: ${GITLAB_TOKEN:-}" \
+    "${FORGE_SCHEME:-https}://${FORGE_HOST:-gitlab.com}/api/v4/$1"
+}
+
+# --- Forge helpers --------------------------------------------------------------
 
 # Fetch every AI-marked comment on the PR — both surfaces:
-#   - `surface=issue`  → top-level PR comments (the summary / verdict comment)
+#   - `surface=issue`  → top-level PR/MR comments (the summary / verdict comment)
 #   - `surface=inline` → review comments attached to a specific file+line
 # Output: NDJSON, one comment per line, fields:
-#   { tag, iter, surface, id, path, line, in_reply_to_id, created_at, body }
-# `id` is the GitHub comment id (needed for `in_reply_to` on inline replies).
-# `path` / `line` / `in_reply_to_id` are null for issue comments.
+#   { tag, iter, surface, id, discussion_id, path, line, in_reply_to_id,
+#     created_at, body }
+# `id` is the forge comment id. On GitHub, inline replies target it via
+# `in_reply_to` and `discussion_id` is null. On GitLab, replies POST to
+# `discussions/<discussion_id>/notes` instead, so every note carries its
+# thread's discussion id. `path` / `line` / `in_reply_to_id` are null for
+# issue comments.
 fetch_ai_thread() {
-  {
-    gh api --paginate \
-      "repos/${REPO_OWNER}/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
-      --jq '.[]
-            | select(.body | test("<!-- ai-loop:"))
-            | {surface:"issue", id:.id, path:null, line:null,
-               in_reply_to_id:null, created_at, body}'
-    gh api --paginate \
-      "repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments" \
-      --jq '.[]
-            | select(.body | test("<!-- ai-loop:"))
-            | {surface:"inline", id:.id, path:.path,
-               line:(.line // .original_line),
-               in_reply_to_id:(.in_reply_to_id // null),
-               created_at, body}'
-  } \
+  case "$FORGE" in
+    gitlab) fetch_ai_thread_gitlab ;;
+    *)      fetch_ai_thread_github ;;
+  esac \
   | jq -c '
       . as $c
       | ($c.body | capture("<!-- (?<tag>ai-loop:[a-z-]+)\\s+iter=(?<iter>[0-9]+) -->") ) as $m
       | { tag: $m.tag, iter: ($m.iter|tonumber),
-          surface: $c.surface, id: $c.id, path: $c.path, line: $c.line,
+          surface: $c.surface, id: $c.id,
+          discussion_id: ($c.discussion_id // null),
+          path: $c.path, line: $c.line,
           in_reply_to_id: $c.in_reply_to_id,
           created_at: $c.created_at, body: $c.body }'
+}
+
+# The ai-loop marker is PUBLIC — anyone who can comment on the PR can post
+# a comment bearing an exact bot wrapper. Trusting it by marker alone lets
+# an attacker forge a summary at a high iteration (steering resume
+# high-water so the real bot turn is skipped) or a review body the
+# write-enabled implementer then acts on. So EVERY record is filtered to
+# the authenticated posting identity ($GH_USER, resolved from the token in
+# preflight) before any marker/summary parsing: on GitHub the comment
+# author is `.user.login`. `env.GH_USER` reads the exported value; if it
+# were empty the comparison excludes everything — fail closed.
+fetch_ai_thread_github() {
+  gh api --paginate \
+    "repos/${REPO_OWNER}/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
+    --jq '.[]
+          | select(.user.login == env.GH_USER)
+          | select(.body | test("<!-- ai-loop:"))
+          | {surface:"issue", id:.id, path:null, line:null,
+             in_reply_to_id:null, created_at, body}'
+  gh api --paginate \
+    "repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments" \
+    --jq '.[]
+          | select(.user.login == env.GH_USER)
+          | select(.body | test("<!-- ai-loop:"))
+          | {surface:"inline", id:.id, path:.path,
+             line:(.line // .original_line),
+             in_reply_to_id:(.in_reply_to_id // null),
+             created_at, body}'
+}
+
+# GitLab: one endpoint carries both surfaces. /discussions groups notes into
+# threads; a thread whose ROOT is a DiffNote (has a position) is an inline
+# discussion, anything else a top-level MR note. Surface, path, and line are
+# computed once from the root and INHERITED by every note in the thread:
+# replies in a diff discussion arrive as unpositioned DiscussionNote objects
+# (and some servers echo DiffNote replies), so classifying each note by its
+# own type/position would strip inline replies of their diff context and
+# misfile them as issue-surface notes. System notes (push/merge events) are
+# skipped, and — like the GitHub reader — every note is filtered to the
+# authenticated posting identity (`.author.username == $GH_USER`) so a
+# forged bot marker from another commenter can't steer resume state or the
+# implementer. The first note of a thread is its root; later notes map to
+# in_reply_to_id=<root id>. Pagination is manual (curl has no --paginate):
+# fetch 100-per-page until a short page. API failures (curl non-2xx,
+# non-array body) RETURN NON-ZERO rather than ending the loop quietly: a
+# swallowed failure here would make resume detection see an empty thread and
+# restart a live MR at iter 1 (double-posting), or silently truncate a
+# >100-note thread mid-pagination — the GitHub path aborts on the equivalent
+# gh failure, and this must too.
+fetch_ai_thread_gitlab() {
+  local page=1 chunk
+  while :; do
+    chunk=$(gl_api_get "projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/discussions?per_page=100&page=${page}") \
+      || return 1
+    jq -e 'type == "array"' <<<"$chunk" >/dev/null 2>&1 || return 1
+    jq -c '
+      .[]
+      | .id as $did
+      | (.notes[0]) as $rootnote
+      | ($rootnote.id) as $root
+      | (if $rootnote.type == "DiffNote" then "inline" else "issue" end) as $surface
+      | ($rootnote.position.new_path // $rootnote.position.old_path // null) as $path
+      | ($rootnote.position.new_line // $rootnote.position.old_line // null) as $line
+      | .notes[]?
+      | select((.system // false) | not)
+      | select(.author.username == env.GH_USER)
+      | select(.body | test("<!-- ai-loop:"))
+      | { surface: $surface,
+          id: .id,
+          discussion_id: $did,
+          path: $path,
+          line: $line,
+          in_reply_to_id: (if .id == $root then null else $root end),
+          created_at, body }' <<<"$chunk"
+    (( $(jq 'length' <<<"$chunk") < 100 )) && break
+    page=$((page + 1))
+  done
 }
 
 post_ai_comment() {
@@ -127,21 +896,74 @@ post_ai_comment() {
   local wrapped
   wrapped=$(printf '<!-- %s iter=%d -->\n**[%s · iteration %d]**\n\n%s' \
             "$tag" "$iter" "$label" "$iter" "$body")
-  gh pr comment "$PR_NUMBER" --repo "${REPO_OWNER}/${REPO_NAME}" --body "$wrapped" >/dev/null
+  case "$FORGE" in
+    gitlab)
+      jq -n --arg body "$wrapped" '{body: $body}' \
+      | curl -sSf -X POST -H "PRIVATE-TOKEN: ${GITLAB_TOKEN:-}" \
+          -H 'Content-Type: application/json' --data @- \
+          "${FORGE_SCHEME:-https}://${FORGE_HOST}/api/v4/projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/notes" \
+          >/dev/null
+      ;;
+    *)
+      gh pr comment "$PR_NUMBER" --repo "${REPO_OWNER}/${REPO_NAME}" --body "$wrapped" >/dev/null
+      ;;
+  esac
 }
 
-# Returns the most recent comment with the given tag (codex|claude) on PR.
+# Highest iteration for which the bot's SUMMARY comment exists on the PR.
+# A summary is an issue-surface thread ROOT whose body opens with the bot's
+# structural summary wrapper for its own iteration (is_summary above): the
+# summary is each turn's completion contract (posted last, after every
+# inline note), so a turn that crashed after inline-only posts — or whose
+# summary POST was rejected, or whose inline note degraded into a general
+# note (even one QUOTING the banner in its prose) — must not advance the
+# resume high-water. run.sh would otherwise skip the codex turn of an
+# incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local marker
+  local marker alert banner
   case "$tag" in
-    codex)  marker="$CODEX_MARKER_TAG"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG" ;;
+    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown tag: $tag" ;;
   esac
   fetch_ai_thread \
-    | jq -r --arg t "$marker" 'select(.tag==$t) | .iter' \
+    | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+        "$AI_SUMMARY_JQ_DEF"'
+         select(.tag==$t and .surface=="issue" and .in_reply_to_id==null)
+         | select(is_summary($t; $a; $b; .iter))
+         | .iter' \
     | sort -n | tail -1
+}
+
+# True iff the bot's iteration-$2 summary comment exists on the PR right now
+# (same structural definition as latest_ai_comment_iter). The turn scripts
+# call this after each turn instead of trusting the agent's stdout markers
+# alone: an agent can print its verdict/completion marker even though the
+# summary POST failed, or die after posting only inline notes. A failed
+# thread fetch (or an empty thread) returns non-zero — fail closed.
+ai_summary_posted() {
+  local who="$1" iter="$2" marker alert banner
+  case "$who" in
+    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    *) die "unknown bot tag: $who" ;;
+  esac
+  fetch_ai_thread \
+    | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
+        "$AI_SUMMARY_JQ_DEF"'
+         any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
+                  and is_summary($t; $a; $b; $it))' \
+    >/dev/null
+}
+
+# Post-turn completion check with one short retry, absorbing forge
+# read-after-write lag on the comment list endpoints just after the POST.
+verify_ai_summary() {
+  local who="$1" iter="$2"
+  ai_summary_posted "$who" "$iter" && return 0
+  sleep 5
+  ai_summary_posted "$who" "$iter"
 }
 
 # --- Portable watchdog ----------------------------------------------------------
@@ -195,11 +1017,63 @@ resolve_codex_effort() {
   esac
 }
 
-# --- State dirs ---------------------------------------------------------------
+# --- Repo identity / state dirs -------------------------------------------------
+
+# Canonical directory name for the repo's managed checkout and state: path
+# components join with __, and any non-github.com forge prefixes its host so
+# same-slug repositories on different forges/hosts (github.com/g/p,
+# gitlab.com/g/p, gitlab.internal/g/p) can never share a checkout, state, or
+# sessions. GitHub keeps the legacy <owner>__<name> layout so existing
+# checkouts/state keep working. The flat name is still NOT injective in
+# corner cases (a GitLab path with a literal "__" component; a dotless
+# intranet hostname colliding with a GitHub owner), so the state marker and
+# the clone origin check both validate the full identity and fail loudly
+# rather than silently share.
+repo_ident_name() {
+  if [[ "${FORGE:-github}" == "github" ]]; then
+    printf '%s\n' "${REPO_SLUG//\//__}"
+  else
+    printf '%s__%s\n' "$FORGE_HOST" "${REPO_SLUG//\//__}"
+  fi
+}
+
+# Full repo identity for marker files. GitHub keeps the bare slug (the
+# pre-gitlab marker format, so existing state dirs validate unchanged);
+# other forges record forge + scheme://host + slug. The scheme is part of
+# the canonical identity: http://gl.example (port 80) and https://gl.example
+# (port 443) are different endpoints, and the flat directory name alone
+# cannot tell them apart.
+repo_ident() {
+  if [[ "${FORGE:-github}" == "github" ]]; then
+    printf '%s\n' "$REPO_SLUG"
+  else
+    printf '%s %s://%s %s\n' "$FORGE" "${FORGE_SCHEME:-https}" "$FORGE_HOST" "$REPO_SLUG"
+  fi
+}
 
 ensure_state_dir() {
-  STATE_DIR="$LOOP_HOME/state/${REPO_OWNER}__${REPO_NAME}/pr-${PR_NUMBER}"
+  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
   mkdir -p "$STATE_DIR"
+  local marker="$STATE_DIR/.repo-slug" owner want
+  want=$(repo_ident)
+  if [[ -s "$marker" ]]; then
+    owner=$(<"$marker")
+    # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
+    # the scheme joined the identity) is AMBIGUOUS: it could belong to the
+    # host's http or https endpoint, and nothing persisted proves which.
+    # Refuse it rather than adopt the current invocation's scheme — silently
+    # attaching one endpoint's sessions/context/history to the other would
+    # recreate the very identity confusion the scheme exists to prevent.
+    # The operator, who knows which endpoint the old runs used, migrates
+    # explicitly (one command, preserving sessions) or cleans the dir.
+    if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
+      die "state dir $STATE_DIR carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
+    fi
+    [[ "$owner" == "$want" ]] \
+      || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
+  else
+    printf '%s\n' "$want" > "$marker"
+  fi
 }
 
 iter_dir() {
