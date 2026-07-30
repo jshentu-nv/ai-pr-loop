@@ -74,6 +74,25 @@ null on GitHub).
      branch name may silently fail to switch.
    - One commit per iteration is preferred; if multiple logical fixes
      warrant multiple commits, that's fine.
+   - **Keep the PR title and description true.** After committing, reread
+     both against what the PR now does. If your change made either stale —
+     a renamed flag, a dropped or added behaviour, a test count, a
+     described approach you replaced — update it in the same turn:
+     ```bash
+     gh pr edit {{PR_NUMBER}} --repo {{REPO_OWNER}}/{{REPO_NAME}} \
+       --title "<title>" --body "$(cat <<'BODY'
+     <full description>
+     BODY
+     )"
+     ```
+     Edit only what your changes made wrong, and preserve everything else
+     verbatim — checklists, ticket links, review notes, and any block the
+     repo's PR template requires. `--body` replaces the whole description,
+     so read the current one first (`gh pr view {{PR_NUMBER}} --repo
+     {{REPO_OWNER}}/{{REPO_NAME}} --json title,body`) and edit from it
+     rather than composing a new one. Do not rewrite the author's voice or
+     restructure sections you didn't invalidate. Note the edit in your
+     summary comment so humans see the description moved.
 
 4. **Reply inline to each inline finding.** For every entry in
    `{{LATEST_INLINE_FILE}}`, post a threaded reply on the same line via
@@ -185,8 +204,10 @@ null on GitHub).
 - **Do not** force-push, rebase, amend, or rewrite history. Only add new
   commits.
 - **Do not** push to `$BASE_REF` or any branch other than `$HEAD_REF`.
-- **Do not** open new PRs, close this one, or change PR metadata
-  (title, labels, assignees, reviewers).
+- **Do not** open new PRs, close this one, or change PR labels,
+  assignees, or reviewers. Title and description are the exception: keep
+  them true to the code (step 3), and change nothing in them your own
+  commits didn't invalidate.
 - If you cannot understand or address an issue, push back honestly with
   what you tried — don't fabricate a fix.
 - Be terse in the reply comment. Diff speaks for itself.

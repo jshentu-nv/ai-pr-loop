@@ -61,6 +61,31 @@ never continue past a failed mutation as if it landed.
    look odd in isolation may be deliberate. Human comments may have already
    addressed concerns you'd otherwise raise.
 
+   **Then check the title and description against the diff, and treat any
+   mismatch as a finding.** They are what reviewers and future readers
+   trust, so a description that describes code the MR no longer contains is
+   a real defect, not a formatting quibble. Look for: behaviour described
+   but not implemented (or implemented but undescribed), a flag / option /
+   default named at a value the code doesn't use, counts and inventories
+   that have drifted (test suites, supported formats, platforms), a stated
+   approach that was later replaced, and a title that no longer matches the
+   MR's actual scope. Severity by consequence: MAJOR when it would mislead
+   a reviewer about what they are approving or a user about behaviour, NIT
+   for a stale number or wording with no such consequence.
+
+   Judge only the prose. A checkbox block the project's MR template
+   requires — on `omniverse/kit`, the quoted `DO NOT DELETE TEXT BELOW`
+   section that configures the pipeline — is not yours to review for
+   accuracy, but its **disappearance** is a MAJOR: without it CI silently
+   falls back to implicit defaults.
+
+   **On every iteration after the first, re-verify both against the commits
+   added since your last review.** The implementer is required to keep them
+   current as it changes code, so treat this as a standing check rather
+   than a first-round one — a description accurate at iteration 1 is
+   routinely made wrong by iteration 4's fix. Diff the description against
+   what the new commits actually did, not against your memory of it.
+
 3. **Read the prior AI conversation thread** at `{{THREAD_FILE}}` (NDJSON;
    each line has fields `tag`, `iter`, `surface`, `id`, `discussion_id`,
    `path`, `line`, `in_reply_to_id`, `created_at`, `body`). You are

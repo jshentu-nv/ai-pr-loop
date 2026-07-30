@@ -92,6 +92,32 @@ past a failed mutation as if it landed.
      branch name may silently fail to switch.
    - One commit per iteration is preferred; if multiple logical fixes
      warrant multiple commits, that's fine.
+   - **Keep the MR title and description true.** After committing, reread
+     both against what the MR now does. If your change made either stale —
+     a renamed flag, a dropped or added behaviour, a test count, a
+     described approach you replaced — update it in the same turn. Read the
+     current values first and edit from them; the API replaces the whole
+     description:
+     ```bash
+     curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+       "$API/merge_requests/{{PR_NUMBER}}" | jq -r '.title, .description'
+     # then, with the edited text in desc.txt:
+     jq -n --arg t "<title>" --rawfile d desc.txt '{title:$t, description:$d}' \
+       | curl -sSf -X PUT -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+           -H "Content-Type: application/json" --data @- \
+           "$API/merge_requests/{{PR_NUMBER}}"
+     ```
+     Edit only what your changes made wrong, and preserve everything else
+     verbatim. **Never drop a block the project's MR template requires** —
+     on `omniverse/kit` that is the quoted `DO NOT DELETE TEXT BELOW`
+     checkbox section, which is the only way to configure the MR's
+     pipeline; without it CI silently falls back to implicit defaults.
+     Never introduce a line starting with `/` (`/draft`, `/todo`) — GitLab
+     runs those as quick actions. After the PUT, confirm `draft` is still
+     `false` and any required template block is still present. Do not
+     rewrite the author's voice or restructure sections you didn't
+     invalidate. Note the edit in your summary comment so humans see the
+     description moved.
 
 4. **Reply inline to each inline finding.** For every entry in
    `{{LATEST_INLINE_FILE}}`, post a threaded reply on that finding's
@@ -208,8 +234,10 @@ past a failed mutation as if it landed.
 - **Do not** force-push, rebase, amend, or rewrite history. Only add new
   commits.
 - **Do not** push to `$BASE_REF` or any branch other than `$HEAD_REF`.
-- **Do not** open new MRs, close or merge this one, or change MR metadata
-  (title, labels, assignees, reviewers, approvals).
+- **Do not** open new MRs, close or merge this one, or change MR labels,
+  assignees, reviewers, or approvals. Title and description are the
+  exception: keep them true to the code (step 3), and change nothing in
+  them your own commits didn't invalidate.
 - If you cannot understand or address an issue, push back honestly with
   what you tried — don't fabricate a fix.
 - Be terse in the reply comment. Diff speaks for itself.
