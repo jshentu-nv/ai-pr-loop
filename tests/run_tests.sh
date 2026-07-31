@@ -2701,6 +2701,89 @@ t "run.sh: explicit effort wins through run.sh's resolution"
 run_run_sh --repo o/n --codex-model gpt-oss-120b --codex-effort high --print-config
 assert_prints 'codex: model=gpt-oss-120b effort=high tier=fast'
 
+# --- prompt rendering ------------------------------------------------------
+# The agent prompts are one source per agent, shared by every forge. These
+# guard the split: a forge block that leaks (or silently vanishes) would ship
+# an agent the wrong posting recipe, which no other test would catch.
+
+assert_render_has()   { if grep -Fq -- "$2" <<<"$1"; then ok; else bad "render missing '$2'"; fi; }
+assert_render_lacks() { if grep -Fq -- "$2" <<<"$1"; then bad "render leaked '$2'"; else ok; fi; }
+
+render_fixture() {  # body on stdin -> rendered for forge $1
+  local forge="$1" f="$WORK/frag.md"
+  cat > "$f"
+  render_forge_blocks "$f" "$forge"
+}
+
+t "render_forge_blocks: keeps the matching forge, drops the other"
+_r=$(printf 'a\n{{#github}}\ngh-only\n{{/github}}\n{{#gitlab}}\nglab-only\n{{/gitlab}}\nz\n' \
+     | render_fixture github)
+assert_eq "$_r" "$(printf 'a\ngh-only\nz')"
+
+t "render_forge_blocks: same template, other forge"
+_r=$(printf 'a\n{{#github}}\ngh-only\n{{/github}}\n{{#gitlab}}\nglab-only\n{{/gitlab}}\nz\n' \
+     | render_fixture gitlab)
+assert_eq "$_r" "$(printf 'a\nglab-only\nz')"
+
+t "render_forge_blocks: unclosed block is an error, not a silent truncation"
+printf 'a\n{{#github}}\nx\n' > "$WORK/bad.md"
+if render_forge_blocks "$WORK/bad.md" github >/dev/null 2>&1; then
+  bad "unclosed block exited 0"; else ok; fi
+
+t "render_forge_blocks: unmatched close is an error"
+printf 'a\n{{/github}}\n' > "$WORK/bad.md"
+if render_forge_blocks "$WORK/bad.md" github >/dev/null 2>&1; then
+  bad "unmatched close exited 0"; else ok; fi
+
+t "render_forge_blocks: nested blocks are an error"
+printf '{{#github}}\n{{#gitlab}}\nx\n{{/gitlab}}\n{{/github}}\n' > "$WORK/bad.md"
+if render_forge_blocks "$WORK/bad.md" github >/dev/null 2>&1; then
+  bad "nested block exited 0"; else ok; fi
+
+t "forge_vocab: github nouns"
+FORGE=github REPO_SLUG=o/n PR_NUMBER=7 FORGE_HOST=github.com forge_vocab
+assert_eq "$PR_NOUN|$SUMMARY_NOUN|$TOKEN_NOUN" 'PR|issue-comment|PAT'
+
+t "forge_vocab: gitlab nouns"
+FORGE=gitlab REPO_SLUG=g/s/p PR_NUMBER=7 FORGE_HOST=gl.example.com forge_vocab
+assert_eq "$PR_NOUN|$SUMMARY_NOUN|$TOKEN_NOUN" 'MR|MR note|GitLab token'
+
+t "forge_vocab: gitlab reference carries the host"
+assert_eq "$PR_REF" '`g/s/p!7` on `gl.example.com`'
+
+for _agent in claude codex; do
+  [[ "$_agent" == claude ]] && _tag=ai-loop:claude-implementer || _tag=ai-loop:codex-reviewer
+  for _forge in github gitlab; do
+    _out=$(render_forge_blocks "$ROOT/prompts/$_agent.md" "$_forge") || _out=''
+
+    t "prompts/$_agent.md [$_forge]: renders and leaves no block markers"
+    if [[ -n "$_out" ]] && ! grep -qE '\{\{[#/]' <<<"$_out"; then ok
+    else bad "empty render or leftover {{#…}} markers"; fi
+
+    t "prompts/$_agent.md [$_forge]: orchestrator's comment marker survives"
+    assert_render_has "$_out" "$_tag"
+
+    t "prompts/$_agent.md [$_forge]: runtime-validation mandate survives"
+    assert_render_has "$_out" 'A missing toolchain is not an excuse'
+
+    if [[ "$_forge" == github ]]; then
+      t "prompts/$_agent.md [github]: no GitLab mechanics leak"
+      assert_render_lacks "$_out" 'PRIVATE-TOKEN'
+      t "prompts/$_agent.md [github]: uses the gh CLI"
+      assert_render_has "$_out" 'gh '
+    else
+      t "prompts/$_agent.md [gitlab]: no GitHub mechanics leak"
+      assert_render_lacks "$_out" 'gh api'
+      t "prompts/$_agent.md [gitlab]: uses curl with the token header"
+      assert_render_has "$_out" 'PRIVATE-TOKEN'
+    fi
+  done
+done
+
+t "prompts: the forked per-forge copies are gone"
+if [[ -e "$ROOT/prompts/claude.gitlab.md" || -e "$ROOT/prompts/codex.gitlab.md" ]]; then
+  bad "a *.gitlab.md prompt fork still exists"; else ok; fi
+
 # --- summary ---------------------------------------------------------------
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

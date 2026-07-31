@@ -1208,3 +1208,67 @@ resolve_codex_root_session_id() {
   done
   return 1
 }
+
+# ---------------------------------------------------------------------------
+# Prompt rendering
+# ---------------------------------------------------------------------------
+# The two agent prompts (prompts/claude.md, prompts/codex.md) are a single
+# source shared by every forge. Passages that differ are wrapped in
+# forge blocks whose open/close markers sit alone on their own lines:
+#
+#   {{#github}}
+#   ...GitHub-only text...
+#   {{/github}}
+#
+# render_forge_blocks keeps the blocks matching $2 and drops the others; text
+# outside any block is always kept. It runs BEFORE placeholder substitution,
+# so block bodies may use {{PLACEHOLDER}} freely. Blocks do not nest, and an
+# unclosed or unmatched marker is an error rather than a silent mis-render —
+# a dropped block would quietly strip an agent's posting recipe.
+render_forge_blocks() {
+  local template="$1" want="$2"
+  awk -v want="$want" '
+    function fail(msg) { printf("prompt template %s: %s (line %d)\n", FILENAME, msg, FNR) > "/dev/stderr"; exit 3 }
+    /^[[:space:]]*\{\{#[a-z]+\}\}[[:space:]]*$/ {
+      tag = $0; sub(/^[[:space:]]*\{\{#/, "", tag); sub(/\}\}[[:space:]]*$/, "", tag)
+      if (depth) fail("nested forge block {{#" tag "}}")
+      depth = 1; keep = (tag == want); next
+    }
+    /^[[:space:]]*\{\{\/[a-z]+\}\}[[:space:]]*$/ {
+      tag = $0; sub(/^[[:space:]]*\{\{\//, "", tag); sub(/\}\}[[:space:]]*$/, "", tag)
+      if (!depth) fail("unmatched {{/" tag "}}")
+      depth = 0; next
+    }
+    { if (!depth || keep) print }
+    END { if (depth) fail("unclosed forge block") }
+  ' "$template"
+}
+
+# Export the forge-specific vocabulary the shared prompts interpolate, so the
+# agent reads its own forge's nouns ("merge request", "MR note") rather than
+# the other forge's. Callers must have FORGE, REPO_SLUG, PR_NUMBER and (for
+# gitlab) FORGE_HOST set.
+forge_vocab() {
+  local slug="${REPO_SLUG:-${REPO_OWNER:-}/${REPO_NAME:-}}"
+  if [[ "${FORGE:-github}" == "gitlab" ]]; then
+    FORGE_NAME='GitLab'
+    PR_NOUN='MR'
+    PR_NOUN_LONG='GitLab merge request'
+    PR_REF="\`${slug}!${PR_NUMBER}\` on \`${FORGE_HOST}\`"
+    SUMMARY_NOUN='MR note'
+    INLINE_NOUN='inline diff notes'
+    INLINE_NOUN_TITLE='Inline diff notes'
+    TOKEN_NOUN='GitLab token'
+    AUTOLINK_SIGILS='`#N` or `!N`'
+  else
+    FORGE_NAME='GitHub'
+    PR_NOUN='PR'
+    PR_NOUN_LONG='GitHub pull request'
+    PR_REF="\`${slug}#${PR_NUMBER}\`"
+    SUMMARY_NOUN='issue-comment'
+    INLINE_NOUN='inline review comments'
+    INLINE_NOUN_TITLE='Inline review comments'
+    TOKEN_NOUN='PAT'
+    AUTOLINK_SIGILS='`#N`'
+  fi
+}

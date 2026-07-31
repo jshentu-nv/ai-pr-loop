@@ -50,9 +50,19 @@ fi
 # $HEAD_REF shell variables instead, which the agent's shell expands
 # safely; both are exported to this process's environment by run.sh.
 PROMPT_TEMPLATE="$HERE/prompts/codex.md"
-[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/codex.gitlab.md"
 PROMPT_FILE="$ID/codex.prompt.md"
-sed \
+forge_vocab
+render_forge_blocks "$PROMPT_TEMPLATE" "${FORGE:-github}" \
+| sed \
+  -e "s|{{FORGE_NAME}}|${FORGE_NAME}|g" \
+  -e "s|{{PR_NOUN_LONG}}|${PR_NOUN_LONG}|g" \
+  -e "s|{{PR_NOUN}}|${PR_NOUN}|g" \
+  -e "s|{{PR_REF}}|${PR_REF}|g" \
+  -e "s|{{SUMMARY_NOUN}}|${SUMMARY_NOUN}|g" \
+  -e "s|{{INLINE_NOUN_TITLE}}|${INLINE_NOUN_TITLE}|g" \
+  -e "s|{{INLINE_NOUN}}|${INLINE_NOUN}|g" \
+  -e "s|{{TOKEN_NOUN}}|${TOKEN_NOUN}|g" \
+  -e "s|{{AUTOLINK_SIGILS}}|${AUTOLINK_SIGILS}|g" \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
   -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
@@ -68,7 +78,7 @@ sed \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
+  > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"
 

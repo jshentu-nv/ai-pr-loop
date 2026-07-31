@@ -70,9 +70,19 @@ fi
 # templates reference the exported $BASE_REF / $HEAD_REF shell variables
 # and the agent's shell expands them safely.
 PROMPT_TEMPLATE="$HERE/prompts/claude.md"
-[[ "${FORGE:-github}" == "gitlab" ]] && PROMPT_TEMPLATE="$HERE/prompts/claude.gitlab.md"
 PROMPT_FILE="$ID/claude.prompt.md"
-sed \
+forge_vocab
+render_forge_blocks "$PROMPT_TEMPLATE" "${FORGE:-github}" \
+| sed \
+  -e "s|{{FORGE_NAME}}|${FORGE_NAME}|g" \
+  -e "s|{{PR_NOUN_LONG}}|${PR_NOUN_LONG}|g" \
+  -e "s|{{PR_NOUN}}|${PR_NOUN}|g" \
+  -e "s|{{PR_REF}}|${PR_REF}|g" \
+  -e "s|{{SUMMARY_NOUN}}|${SUMMARY_NOUN}|g" \
+  -e "s|{{INLINE_NOUN_TITLE}}|${INLINE_NOUN_TITLE}|g" \
+  -e "s|{{INLINE_NOUN}}|${INLINE_NOUN}|g" \
+  -e "s|{{TOKEN_NOUN}}|${TOKEN_NOUN}|g" \
+  -e "s|{{AUTOLINK_SIGILS}}|${AUTOLINK_SIGILS}|g" \
   -e "s|{{REPO_OWNER}}|${REPO_OWNER}|g" \
   -e "s|{{REPO_NAME}}|${REPO_NAME}|g" \
   -e "s|{{REPO_SLUG}}|${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}|g" \
@@ -88,7 +98,7 @@ sed \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  "$PROMPT_TEMPLATE" > "$PROMPT_FILE"
+  > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"
 
