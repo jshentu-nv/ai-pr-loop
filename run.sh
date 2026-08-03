@@ -158,7 +158,8 @@
 #                 that log, so foreground output is the same as an inline
 #                 run. --print-config and --preflight-only always run
 #                 inline. Requires setsid or perl for the detached
-#                 session; with neither the loop runs inline, with a
+#                 session AND flock or perl for the single-supervisor
+#                 lock; missing either, the loop runs inline, with a
 #                 warning.
 #   --no-auto-resume
 #                 Run the loop in this process. Nothing restarts it.
@@ -524,6 +525,9 @@ fi
 #   worker.progress  iterations + convergence streak this invocation has
 #                    used, across relaunches, plus the invocation's starting
 #                    iteration (the budget baseline); cleared per invocation
+#   context.applied  touched once a worker applies this invocation's context
+#                    intent; until then relaunches replay the --context*
+#                    flags instead of dropping them; cleared per invocation
 #   stop             stop sentinel; the supervisor stops and does not relaunch
 #
 # Every entry point that touches this dir validates the .repo-slug identity
@@ -651,8 +655,45 @@ write_worker_status() {
 # nonzero exit leaves RUNS behind the public thread).
 persist_worker_progress() {
   [[ "$ROLE" == "worker" ]] || return 0
-  printf 'RUNS=%s\nSTREAK=%s\nBASE=%s\n' \
-    "$RUNS" "$CONVERGE_STREAK" "$RUNS_BASE_ITER" > "$STATE_DIR/worker.progress"
+  printf 'RUNS=%s\nSTREAK=%s\nSTREAK_AT=%s\nBASE=%s\n' \
+    "$RUNS" "$CONVERGE_STREAK" "$STREAK_AT" "$RUNS_BASE_ITER" \
+    > "$STATE_DIR/worker.progress"
+}
+
+# Convergence accounting for iter $1 from its persisted issue_counts.
+# Returns 0 when the streak has reached CONVERGE_N — the caller exits the
+# loop as converged. Runs after a fresh codex turn AND when a relaunch
+# resumes past a codex review that landed before a crash: qualifying
+# reviews count either way. STREAK_AT records the last iteration accounted,
+# so a relaunch replaying the same landed review cannot count it twice.
+update_converge_streak() {
+  local it="$1" counts_file ib im
+  (( CONVERGE_N > 0 )) || return 1
+  (( it > STREAK_AT )) || return 1
+  counts_file="$STATE_DIR/$(printf 'iter-%02d' "$it")/issue_counts"
+  if [[ ! -f "$counts_file" ]]; then
+    log "convergence: no issue_counts file for iter $it — streak unchanged"
+    return 1
+  fi
+  ib=$(awk -F= '/^BLOCKER=/{print $2}' "$counts_file")
+  im=$(awk -F= '/^MAJOR=/{print $2}'   "$counts_file")
+  STREAK_AT="$it"
+  if [[ "$ib" == "0" && "$im" == "0" ]]; then
+    CONVERGE_STREAK=$((CONVERGE_STREAK + 1))
+    persist_worker_progress
+    log "convergence: iter $it BLOCKER=0 MAJOR=0 (streak $CONVERGE_STREAK / $CONVERGE_N)"
+    if (( CONVERGE_STREAK >= CONVERGE_N )); then
+      log "convergence: $CONVERGE_N consecutive NIT-only iterations — exiting"
+      return 0
+    fi
+  else
+    if (( CONVERGE_STREAK > 0 )); then
+      log "convergence: streak reset (BLOCKER=$ib MAJOR=$im at iter $it)"
+    fi
+    CONVERGE_STREAK=0
+    persist_worker_progress
+  fi
+  return 1
 }
 
 # --stop: write the sentinel and signal the supervisor — or, when a SIGKILL
@@ -897,19 +938,23 @@ if [[ "$ROLE" == "supervise" ]]; then
   trap supervisor_signalled TERM HUP
 
   log "auto-resume: supervisor started (pid $$, budget $AUTO_RESUME restart(s))"
-  # Relaunches must not replay the context flags: the --context* inputs may
-  # name temporary paths, and their content is already persisted — a retry
-  # reuses the context.md the first worker wrote. --restart stays: its
-  # resume branch is half-step-aware, so replaying it is safe and keeps the
-  # forced round alive across retries.
+  # Once a worker has applied this invocation's context intent (the
+  # context.applied stamp: snapshot rendered, cleared, or reuse confirmed),
+  # relaunches drop the context flags — the --context* inputs may name
+  # temporary paths, and their content is persisted in context.md. Until
+  # then relaunches replay the flags: a replacement that failed mid-render
+  # must be retried (and fail loudly on a dead source), never quietly
+  # papered over with the previous invocation's stored context. --restart
+  # stays either way: its resume branch is half-step-aware, so replaying
+  # it is safe.
   strip_context_worker_flags ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"}
   RETRY_ARGV=(${STRIPPED_ARGV[@]+"${STRIPPED_ARGV[@]}"})
   if (( ${#RETRY_ARGV[@]} != ${#WORKER_ARGV[@]} )); then
-    log "auto-resume: relaunches drop the context flags (--context / --context-url / --context-file / --clear-context) and reuse the stored context"
+    log "auto-resume: relaunches reuse the stored context once a worker lands this invocation's snapshot (context flags dropped); until then they replay the context flags"
   fi
-  # The iteration budget and convergence streak span relaunches; only a new
-  # invocation grants a fresh count.
-  rm -f "$PR_STATE_DIR/worker.progress"
+  # The iteration budget, convergence streak, and context stamp span
+  # relaunches; only a new invocation grants a fresh count.
+  rm -f "$PR_STATE_DIR/worker.progress" "$PR_STATE_DIR/context.applied"
   ATTEMPT=0
   QUICK=0          # consecutive short-lived workers; drives the backoff
   while :; do
@@ -922,7 +967,7 @@ if [[ "$ROLE" == "supervise" ]]; then
     fi
     rm -f "$PR_STATE_DIR/worker.status" "$PR_STATE_DIR/worker.started"
     WORKER_AT=$(date +%s)
-    if (( ATTEMPT == 0 )); then
+    if (( ATTEMPT == 0 )) || [[ ! -e "$PR_STATE_DIR/context.applied" ]]; then
       bash "$0" --_worker ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} &
     else
       bash "$0" --_worker ${RETRY_ARGV[@]+"${RETRY_ARGV[@]}"} &
@@ -1109,6 +1154,12 @@ elif [[ -s "$CONTEXT_FILE" ]]; then
   log "context: reusing stored context at $CONTEXT_FILE (no --context* flags this run; --clear-context to drop)"
 fi
 export CONTEXT_FILE HAS_CONTEXT
+# The invocation's context intent is applied — rendered, cleared, or reuse
+# confirmed. From here the supervisor may drop the context flags from
+# relaunches; a worker dying before this point is retried with them.
+if [[ "$ROLE" == "worker" ]]; then
+  : > "$STATE_DIR/context.applied"
+fi
 
 log "------------------------------------------------------------"
 log "AI PR loop starting"
@@ -1223,6 +1274,7 @@ fi
 FINAL_STATUS="unknown"
 RUNS=0
 CONVERGE_STREAK=0   # consecutive codex iters with BLOCKER=0 MAJOR=0
+STREAK_AT=0         # last iteration the streak accounted
 RUNS_BASE_ITER="$ITER"
 
 # A relaunched worker continues the invocation's budget. The supervisor
@@ -1235,9 +1287,11 @@ RUNS_BASE_ITER="$ITER"
 if [[ "$ROLE" == "worker" && -f "$STATE_DIR/worker.progress" ]]; then
   RUNS=$(awk -F= '/^RUNS=/{print $2}' "$STATE_DIR/worker.progress")
   CONVERGE_STREAK=$(awk -F= '/^STREAK=/{print $2}' "$STATE_DIR/worker.progress")
+  STREAK_AT=$(awk -F= '/^STREAK_AT=/{print $2}' "$STATE_DIR/worker.progress")
   RUNS_BASE_ITER=$(awk -F= '/^BASE=/{print $2}' "$STATE_DIR/worker.progress")
   [[ "$RUNS" =~ ^[0-9]+$ ]] || RUNS=0
   [[ "$CONVERGE_STREAK" =~ ^[0-9]+$ ]] || CONVERGE_STREAK=0
+  [[ "$STREAK_AT" =~ ^[0-9]+$ ]] || STREAK_AT=0
   [[ "$RUNS_BASE_ITER" =~ ^[0-9]+$ ]] || RUNS_BASE_ITER="$ITER"
   LANDED=$(( ITER - RUNS_BASE_ITER ))
   if (( LANDED > RUNS )); then
@@ -1246,6 +1300,15 @@ if [[ "$ROLE" == "worker" && -f "$STATE_DIR/worker.progress" ]]; then
   fi
   if (( RUNS > 0 || CONVERGE_STREAK > 0 )); then
     log "auto-resume: this invocation already ran $RUNS of $MAX_ITER iteration(s) (converge streak $CONVERGE_STREAK) — continuing on the remaining budget"
+  fi
+  # A streak at the threshold means the run converged and was killed in
+  # the moment between persisting the streak and writing its status. The
+  # outcome already happened; report it instead of running more turns on
+  # a converged review.
+  if (( CONVERGE_N > 0 && CONVERGE_STREAK >= CONVERGE_N )); then
+    log "convergence: restored streak $CONVERGE_STREAK already meets $CONVERGE_N — the run converged before this relaunch; nothing to do"
+    write_worker_status converged_no_major
+    exit 0
   fi
 elif [[ "$ROLE" == "worker" ]]; then
   # First worker of the invocation: record the baseline immediately, so a
@@ -1261,6 +1324,14 @@ while (( RUNS < MAX_ITER )); do
   if (( RESUME_CLAUDE_FIRST == 1 )); then
     log "skipping codex turn — codex already posted at iter $ITER in a prior run"
     RESUME_CLAUDE_FIRST=0
+    # The skipped turn's review is landed and counts: reconcile the streak
+    # from its persisted issue_counts so a qualifying review posted right
+    # before a crash is not lost from convergence (STREAK_AT keeps replays
+    # of the same landed review from counting twice).
+    if update_converge_streak "$ITER"; then
+      FINAL_STATUS="converged_no_major"
+      break
+    fi
   else
     # Codex review.
     set +e
@@ -1283,30 +1354,9 @@ while (( RUNS < MAX_ITER )); do
     esac
 
     # Convergence check (NITs only for N consecutive iterations).
-    if (( CONVERGE_N > 0 )); then
-      COUNTS_FILE="$STATE_DIR/$(printf 'iter-%02d' "$ITER")/issue_counts"
-      if [[ -f "$COUNTS_FILE" ]]; then
-        IB=$(awk -F= '/^BLOCKER=/{print $2}' "$COUNTS_FILE")
-        IM=$(awk -F= '/^MAJOR=/{print $2}'   "$COUNTS_FILE")
-        if [[ "$IB" == "0" && "$IM" == "0" ]]; then
-          CONVERGE_STREAK=$((CONVERGE_STREAK + 1))
-          persist_worker_progress
-          log "convergence: iter $ITER BLOCKER=0 MAJOR=0 (streak $CONVERGE_STREAK / $CONVERGE_N)"
-          if (( CONVERGE_STREAK >= CONVERGE_N )); then
-            log "convergence: $CONVERGE_N consecutive NIT-only iterations — exiting"
-            FINAL_STATUS="converged_no_major"
-            break
-          fi
-        else
-          if (( CONVERGE_STREAK > 0 )); then
-            log "convergence: streak reset (BLOCKER=$IB MAJOR=$IM at iter $ITER)"
-          fi
-          CONVERGE_STREAK=0
-          persist_worker_progress
-        fi
-      else
-        log "convergence: no issue_counts file for iter $ITER — streak unchanged"
-      fi
+    if update_converge_streak "$ITER"; then
+      FINAL_STATUS="converged_no_major"
+      break
     fi
 
     # Re-sync to the PR head in case anything landed remotely between turns.

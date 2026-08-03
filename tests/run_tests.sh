@@ -32,12 +32,16 @@
 #     budget exhaustion, the long-run backoff reset, a relaunch reusing the
 #     stored context.md after its --context-file path vanished, the
 #     iteration budget spanning relaunches (and reconciling with summaries
-#     already landed on the PR), --restart resuming a pending claude
-#     half-step (bumping a completed round, including an approval whose
-#     codex>claude shape mimics a half-step), a failed context render
-#     leaving no truncated snapshot, state-path identity collisions refused
-#     by --stop and by starts, and inline fallback (with a warning) when
-#     setsid/perl (session) or flock/perl (lock) are missing
+#     already landed on the PR), a landed qualifying review counting toward
+#     convergence on the resumed half-step (once — STREAK_AT), --restart
+#     resuming a pending claude half-step (bumping a completed round,
+#     including an approval whose codex>claude shape mimics a half-step), a
+#     failed context render leaving no truncated snapshot and a failed
+#     replacement retried instead of falling back to stale stored context,
+#     state-path identity collisions refused by --stop and by starts
+#     (first-touch elected atomically — 40 racing pairs), and inline
+#     fallback (with a warning) when setsid/perl (session) or flock/perl
+#     (lock) are missing
 #   - auto-resume, orphan recovery: --stop TERMs the recorded worker group
 #     after a supervisor SIGKILL leaves the tree alive
 #   - auto-resume, live runs: a reaped front-end leaves the supervisor and
@@ -3000,7 +3004,7 @@ run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
   https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 1 \
   --context-file "$AR_CTX_FILE"
 SUP_PATH=""
-assert_substr "$AR_GL_LOG" "auto-resume: relaunches drop the context flags"
+assert_substr "$AR_GL_LOG" "auto-resume: relaunches reuse the stored context once a worker lands this invocation's snapshot"
 t "run.sh: the retried worker reads the persisted context.md"
 assert_substr "$AR_GL_LOG" "context: reusing stored context"
 t "run.sh: the retry does not die on the vanished --context-file path"
@@ -3012,8 +3016,9 @@ rm -rf "$ROOT/state/gl.example__g__p"
 # --- auto-resume: a render that dies mid-read leaves no partial context ------
 # The snapshot lands via rename, whole or not at all: a source read that
 # emits part of its content and then fails kills that worker with only the
-# .tmp written, so the retry runs with no context rather than silently
-# trusting a truncated one.
+# .tmp written. No context.applied stamp lands, so the retry replays the
+# context flags and retries the replacement — failing loudly when the
+# source keeps failing — instead of running on partial or absent context.
 
 t "run.sh: a failed context render leaves no truncated context.md"
 AR_PC_BIN="$WORK/ar-partialctx-bin"
@@ -3046,11 +3051,35 @@ SUP_PATH=""
 if [[ -e "$ROOT/state/gl.example__g__p/pr-9/context.md" ]]; then
   bad "a truncated context.md landed as the trusted snapshot"
 else ok; fi
-t "run.sh: the retry after a failed render runs with no context, not partial"
-assert_substr "$AR_GL_LOG" "ctx:   none"
+t "run.sh: the retry replays the context flags and retries the replacement"
 if grep -Fq 'reusing stored context' "$AR_GL_LOG"; then
-  bad "the retry adopted a partial snapshot as stored context"
+  bad "the retry adopted stored context instead of retrying the replacement"
 else ok; fi
+assert_substr "$AR_GL_LOG" "budget exhausted"
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: a failed replacement never falls back to the old stored context"
+# An existing context.md is being REPLACED; the replacement read keeps
+# failing. No worker may run against the old material — the run retries
+# the replacement and stops, and the old file survives untouched for the
+# operator.
+AR_STALE_STATE="$ROOT/state/gl.example__g__p/pr-9"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_STALE_STATE"
+printf 'OLD-CONTEXT-SHOULD-NOT-BE-USED\n' > "$AR_STALE_STATE/context.md"
+printf 'fresh replacement\n' > "$AR_PC_FILE"
+SUP_PATH="$AR_PC_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  STUB_CTX_PARTIAL="$AR_PC_FILE" \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 1 \
+  --context-file "$AR_PC_FILE"
+SUP_PATH=""
+if grep -Fq 'AI PR loop starting' "$AR_GL_LOG"; then
+  bad "a worker ran while the replacement snapshot never landed"
+else ok; fi
+t "run.sh: the failed replacement leaves the old context.md intact"
+if grep -Fxq 'OLD-CONTEXT-SHOULD-NOT-BE-USED' "$AR_STALE_STATE/context.md" 2>/dev/null; then ok
+else bad "the old context.md was clobbered by the failed replacement"; fi
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- auto-resume: a stale supervisor.pid -----------------------------------
@@ -3202,6 +3231,54 @@ t "run.sh: a supervised start refuses a colliding state dir"
 run_run_sh_supervised 1 --repo o/c__r
 assert_dies_with "belongs to 'o__c/r', not 'o/c__r'"
 rm -rf "$ROOT/state/o__c__r"
+
+t "run.sh: simultaneous first-touch stops elect exactly one identity"
+# The marker is hard-linked into place, so among racing first-touchers of
+# one fresh colliding dir the kernel picks one winner; the loser validates
+# the winner's marker and dies. Exactly one of each pair may succeed.
+AR_RACE_BAD=0
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+          21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  rm -rf "$ROOT/state/race__o__r"
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    1 --repo 'race__o/r' --stop >/dev/null 2>"$WORK/race.a.err" &
+  _pa=$!
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    1 --repo 'race/o__r' --stop >/dev/null 2>"$WORK/race.b.err" &
+  _pb=$!
+  _ra=0; wait "$_pa" || _ra=$?
+  _rb=0; wait "$_pb" || _rb=$?
+  if [[ "$_ra" -eq 0 && "$_rb" -eq 0 ]]; then AR_RACE_BAD=$((AR_RACE_BAD + 1)); fi
+  if [[ "$_ra" -ne 0 && "$_rb" -ne 0 ]]; then AR_RACE_BAD=$((AR_RACE_BAD + 1)); fi
+done
+if [[ "$AR_RACE_BAD" -eq 0 ]]; then ok
+else bad "$AR_RACE_BAD of 40 racing pairs did not elect exactly one owner"; fi
+rm -rf "$ROOT/state/race__o__r"
+
+t "run.sh: first-touch anchoring survives a filesystem without hard links"
+# When ln cannot make hard links, the anchor falls back to a plain write —
+# sequential validation must keep working.
+AR_LN_BIN="$WORK/ar-noln-bin"
+mkdir -p "$AR_LN_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$AR_LN_BIN/ln"
+chmod +x "$AR_LN_BIN/ln"
+rm -rf "$ROOT/state/o__n"
+SUP_PATH="$AR_LN_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised 1 --repo o/n --stop
+SUP_PATH=""
+if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "--stop failed under a failing ln (rc=$RUN_RC)"; fi
+t "run.sh: the no-hard-link fallback still writes the identity marker"
+assert_eq "$(cat "$AR_GH_STATE/.repo-slug" 2>/dev/null)" "o/n"
+rm -rf "$ROOT/state/o__n"
+
+t "run.sh: an empty identity marker is repaired on the next touch"
+rm -rf "$ROOT/state/o__n"
+mkdir -p "$AR_GH_STATE"
+: > "$AR_GH_STATE/.repo-slug"
+run_run_sh_supervised 1 --repo o/n --stop
+if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "--stop failed on an empty marker (rc=$RUN_RC)"; fi
+assert_eq "$(cat "$AR_GH_STATE/.repo-slug" 2>/dev/null)" "o/n"
+rm -rf "$ROOT/state/o__n"
 
 # --- auto-resume: a live supervised run ------------------------------------
 # The git stub blocks in the PR-head fetch and records its own pid, standing
@@ -3679,6 +3756,65 @@ if grep -Fq '===== Iteration' "$WORK/wk2.err"; then
 else ok; fi
 t "run.sh: the reconciled run reports max_iterations_reached"
 assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" max_iterations_reached
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: a landed review counts toward convergence -------------------
+# A qualifying codex review that posted right before its worker died is
+# skipped on resume (claude runs first), but its persisted issue_counts
+# still feed the streak — including the converged exit, taken before the
+# claude half-step just as a live turn would.
+
+t "run.sh: a landed codex review counts toward convergence on the resumed half-step"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-01"
+printf 'BLOCKER=0\nMAJOR=0\nNIT=1\n' > "$AR_LIVE_STATE/iter-01/issue_counts"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-conv-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cv.out" 2> "$WORK/cv.err"
+assert_substr "$WORK/cv.err" "convergence: iter 1 BLOCKER=0 MAJOR=0 (streak 1 / 1)"
+t "run.sh: the reconciled streak converges before the claude half-step"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" converged_no_major
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: a relaunch after convergence landed exits converged without a turn"
+# A kill between persisting the threshold streak and writing the status
+# loses only the status; the relaunch must report the convergence that
+# already happened, not spend more turns on a converged review.
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE"
+printf 'RUNS=1\nSTREAK=1\nSTREAK_AT=1\nBASE=1\n' > "$AR_LIVE_STATE/worker.progress"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-conv-argv" \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cv3.out" 2> "$WORK/cv3.err"
+assert_substr "$WORK/cv3.err" "restored streak 1 already meets 1"
+t "run.sh: the replayed convergence reports converged_no_major"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" converged_no_major
+if grep -Fq '===== Iteration' "$WORK/cv3.err"; then
+  bad "the relaunch ran a turn on an already-converged review"
+else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: a relaunch does not count the same landed review twice"
+# STREAK_AT records the last accounted iteration; a second relaunch over
+# the same landed review leaves the streak alone.
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-01"
+printf 'BLOCKER=0\nMAJOR=0\nNIT=1\n' > "$AR_LIVE_STATE/iter-01/issue_counts"
+printf 'RUNS=0\nSTREAK=1\nSTREAK_AT=1\nBASE=1\n' > "$AR_LIVE_STATE/worker.progress"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-conv-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 STUB_FAIL_MIDRUN=1 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 2 > "$WORK/cv2.out" 2> "$WORK/cv2.err"
+if grep -Fq 'streak 2 / 2' "$WORK/cv2.err"; then
+  bad "the relaunch double-counted the already-accounted review"
+else ok; fi
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------

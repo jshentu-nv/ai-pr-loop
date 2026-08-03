@@ -1156,14 +1156,37 @@ check_state_marker() {
 
 # Validate an existing marker or stamp ours: the first process to touch a
 # state dir anchors its identity, so later collisions fail loudly instead
-# of sharing pid records, sentinels, and sessions.
+# of sharing pid records, sentinels, and sessions. Election is atomic —
+# the marker is written aside and hard-linked into place, so it only ever
+# appears with its full content and ln(2) picks exactly one winner among
+# simultaneous first-touchers; every loser falls through and validates the
+# winner's identity like any later toucher.
 claim_state_marker() {
-  local dir="$1" marker="$1/.repo-slug"
-  if [[ -s "$marker" ]]; then
-    check_state_marker "$dir"
-  else
-    repo_ident > "$marker"
+  local dir="$1" marker="$1/.repo-slug" tmp
+  tmp="$marker.claim.$$"
+  if [[ ! -e "$marker" ]]; then
+    repo_ident > "$tmp"
+    if ln "$tmp" "$marker" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    rm -f "$tmp"
+    if [[ ! -e "$marker" ]]; then
+      # ln failed with the marker still absent: this filesystem has no
+      # hard links. Keep the anchor with a plain write — sequential
+      # validation still holds, only the simultaneous-first-touch election
+      # is unavailable here.
+      repo_ident > "$marker"
+      return 0
+    fi
+  elif [[ ! -s "$marker" ]]; then
+    # An empty marker anchors nothing and would pass every check. Replace
+    # it whole — mv is atomic, so no reader ever sees a partial identity.
+    repo_ident > "$tmp"
+    mv -f "$tmp" "$marker"
+    return 0
   fi
+  check_state_marker "$dir"
 }
 
 ensure_state_dir() {

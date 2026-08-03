@@ -434,11 +434,18 @@ after a run that lasted more than ten minutes.
 
 `--max` and `--converge` span relaunches: a relaunched loop keeps the
 invocation's remaining iteration budget and convergence streak
-(`worker.progress`) instead of starting a fresh count. Relaunches drop the
-`--context*` flags and reuse the `context.md` persisted at launch — the
-original paths may be temporary. `--restart` replays safely: a relaunch
-that finds a codex iteration without its claude reply resumes that
-half-step instead of bumping the round again.
+(`worker.progress`) instead of starting a fresh count, and reconciles both
+with what already landed on the PR — an iteration or qualifying review
+posted right before a crash still counts. Once a worker lands the context
+snapshot (`context.applied`), relaunches drop the `--context*` flags and
+reuse the persisted `context.md` — the original paths may be temporary;
+until then they replay the flags, so a failed replacement is retried
+rather than papered over with stale stored context. `--restart` replays
+safely: a relaunch that finds a codex iteration without its claude reply
+resumes that half-step — unless the persisted verdict marks that
+iteration APPROVED (claude never answers an approval): a prior approval
+starts a fresh round, and an approval earned by this invocation's own
+forced round ends the run as approved.
 
 The supervisor is an ordinary process on the host, so a reboot ends the
 review along with it — there is no boot-time hook. Re-run the same
