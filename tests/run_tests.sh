@@ -24,17 +24,25 @@
 #     inline notes, replies, banner-quoting prose, and misplaced markers
 #     are excluded; both turn scripts fail when their iteration summary
 #     never landed
-#   - auto-resume: the restart decision table and the backoff curve as
-#     helpers, plus real front-end/supervisor/worker runs — default budget,
-#     inline --no-auto-resume, --print-config/--preflight-only never
-#     supervising, argv forwarded verbatim (newline + quote, flag-shaped
-#     values), the stop sentinel, and budget exhaustion
+#   - auto-resume: the restart decision table, the backoff curve, and the
+#     context-flag stripper as helpers, plus real front-end/supervisor/
+#     worker runs — default budget, inline --no-auto-resume,
+#     --print-config/--preflight-only never supervising, argv forwarded
+#     verbatim (newline + quote, flag-shaped values), the stop sentinel,
+#     budget exhaustion, the long-run backoff reset, a relaunch reusing the
+#     stored context.md after its --context-file path vanished, the
+#     iteration budget spanning relaunches, --restart resuming a pending
+#     claude half-step (and bumping only a completed round), and inline
+#     fallback (with a warning) when neither setsid nor perl exists
 #   - auto-resume, live runs: a reaped front-end leaves the supervisor and
 #     its worker running, --stop and a signalled supervisor both reach the
 #     agent under the worker, a stale supervisor.pid is neither signalled
-#     nor obeyed, a second run on the same PR refuses to start, a worker
-#     that finishes reports a terminal status, and a SIGKILLed front-end
-#     leaves no tail behind
+#     nor obeyed (including a recycled pid whose argv matches but whose
+#     start time does not), simultaneous starts elect exactly one
+#     supervisor, a second run on the same PR refuses to start, a real
+#     SIGINT to the front-end group stops everything with exit 130, a
+#     worker that finishes reports a terminal status, and a SIGKILLed
+#     front-end leaves no tail behind
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -276,8 +284,8 @@ case "$method $url" in
     fi
     cat <<PAYLOAD
 [
- {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\n\n> [!IMPORTANT]\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration ${ITER:-1}.**\nStub codex review.","position":null}]},
- {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${ITER:-1} -->\n\n> [!NOTE]\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration ${ITER:-1}.**\nStub claude reply.","position":null}]},
+ {"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=${STUB_GL_CODEX_ITER:-${ITER:-1}} -->\n\n> [!IMPORTANT]\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration ${STUB_GL_CODEX_ITER:-${ITER:-1}}.**\nStub codex review.","position":null}]},
+ {"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=${STUB_GL_CLAUDE_ITER:-${ITER:-1}} -->\n\n> [!NOTE]\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration ${STUB_GL_CLAUDE_ITER:-${ITER:-1}}.**\nStub claude reply.","position":null}]},
  {"id":"disc-inline","notes":[
    {"id":301,"type":"DiffNote","system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:01Z","body":"<!-- ai-loop:codex-reviewer iter=${ITER:-1} -->\nInline finding.","position":{"new_path":"src/a.c","new_line":12}},
    {"id":302,"type":"DiscussionNote","system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:02Z","body":"<!-- ai-loop:claude-implementer iter=0 -->\nOld reply.","position":null}]},
@@ -2768,6 +2776,29 @@ assert_eq "$(auto_resume_backoff 4)" 160
 assert_eq "$(auto_resume_backoff 5)" 300
 assert_eq "$(auto_resume_backoff 40)" 300
 
+# --- auto-resume: context flags dropped from relaunch argv -------------------
+# A retry that replays --context-file re-reads a path that may be gone; the
+# supervisor relaunches with the context flags stripped and the worker
+# reuses the persisted context.md. --restart passes through — its resume
+# branch is half-step-aware, so replaying it is safe and keeps the forced
+# round alive across retries.
+
+t "auto-resume: relaunch argv drops --context-file with its value, keeps --restart"
+strip_context_worker_flags 5 --repo o/n --restart --context-file /tmp/x --max 3
+assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "5 --repo o/n --restart --max 3"
+
+t "auto-resume: relaunch argv drops a newline-holding --context value intact"
+strip_context_worker_flags --context "$(printf 'a\nb')" 7 --converge 2 --clear-context
+assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "7 --converge 2"
+
+t "auto-resume: a flag-shaped --context-file value is dropped with its flag"
+strip_context_worker_flags 1 --context-file --no-auto-resume --repo o/n
+assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "1 --repo o/n"
+
+t "auto-resume: relaunch argv without context flags is unchanged"
+strip_context_worker_flags 5 --repo o/n --max 3 --review-only
+assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "5 --repo o/n --max 3 --review-only"
+
 # --- auto-resume: run.sh roles ---------------------------------------------
 # These start a real detached supervisor. Every case here kills the loop
 # early (missing token, missing context file, failing fetch), so no case
@@ -2889,16 +2920,118 @@ t "run.sh: a supervised run that never finished exits non-zero"
 if [[ "$RUN_RC" -ne 0 ]]; then ok; else bad "front-end exited 0"; fi
 rm -rf "$ROOT/state/gl.example__g__p"
 
+# --- auto-resume: a long-lived worker resets the backoff --------------------
+# Two quick deaths double the backoff; a worker that then outlives
+# AUTO_RESUME_LONG_RUN is not a crash loop, so the next restart waits the
+# floor again. The git stub counts fetches and makes the third one slow.
+
+t "run.sh: a worker that outlives the long-run threshold resets the backoff"
+AR_LR_BIN="$WORK/ar-longrun-bin"
+mkdir -p "$AR_LR_BIN"
+cat > "$AR_LR_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+# Real git everywhere except the PR-head fetch: count the attempts, make
+# attempt $STUB_FETCH_SLOW_ON outlive the long-run threshold, fail them all.
+for a in "$@"; do
+  if [[ "$a" == "fetch" ]]; then
+    n=0; [[ -s "$STUB_FETCH_COUNT_FILE" ]] && n=$(cat "$STUB_FETCH_COUNT_FILE")
+    n=$((n + 1)); printf '%s\n' "$n" > "$STUB_FETCH_COUNT_FILE"
+    if [[ "$n" == "$STUB_FETCH_SLOW_ON" ]]; then sleep "$STUB_FETCH_SLOW_SECS"; fi
+    exit 1
+  fi
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$AR_LR_BIN/git"
+rm -rf "$ROOT/state/gl.example__g__p"
+# A leftover progress file from some earlier invocation must not eat the new
+# invocation's budget; the supervisor clears it before its first worker.
+mkdir -p "$ROOT/state/gl.example__g__p/pr-9"
+printf 'RUNS=9\nSTREAK=9\n' > "$ROOT/state/gl.example__g__p/pr-9/worker.progress"
+rm -f "$WORK/ar-lr-count"
+SUP_PATH="$AR_LR_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  AUTO_RESUME_LONG_RUN=3 STUB_FETCH_COUNT_FILE="$WORK/ar-lr-count" \
+  STUB_FETCH_SLOW_ON=3 STUB_FETCH_SLOW_SECS=4 \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 3
+SUP_PATH=""
+assert_substr "$AR_GL_LOG" "restart 2/3 in 2s"
+t "run.sh: the post-long-run restart waits the floor again"
+assert_substr "$AR_GL_LOG" "restart 3/3 in 1s"
+t "run.sh: a fresh supervised invocation clears a stale worker.progress"
+if [[ -e "$ROOT/state/gl.example__g__p/pr-9/worker.progress" ]]; then
+  bad "the stale worker.progress survived a new invocation"
+else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: a relaunch reuses the stored context -----------------------
+# --context* inputs are read once, at launch. A relaunch must not re-read
+# the original paths — here the temporary file is gone by the time the
+# retry runs — it reuses the context.md the first worker persisted.
+
+t "run.sh: a relaunch reuses stored context instead of re-reading --context-file"
+AR_CTX_BIN="$WORK/ar-ctx-bin"
+mkdir -p "$AR_CTX_BIN"
+cat > "$AR_CTX_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+# Real git everywhere except the PR-head fetch: remove the temporary
+# context file — its content is already persisted to context.md — and fail.
+for a in "$@"; do
+  if [[ "$a" == "fetch" ]]; then
+    rm -f "$STUB_CTX_KILL"
+    exit 1
+  fi
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$AR_CTX_BIN/git"
+AR_CTX_FILE="$WORK/ar-ctx-note.md"
+printf 'temporary trusted context\n' > "$AR_CTX_FILE"
+rm -rf "$ROOT/state/gl.example__g__p"
+SUP_PATH="$AR_CTX_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  STUB_CTX_KILL="$AR_CTX_FILE" \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 1 \
+  --context-file "$AR_CTX_FILE"
+SUP_PATH=""
+assert_substr "$AR_GL_LOG" "auto-resume: relaunches drop the context flags"
+t "run.sh: the retried worker reads the persisted context.md"
+assert_substr "$AR_GL_LOG" "context: reusing stored context"
+t "run.sh: the retry does not die on the vanished --context-file path"
+if grep -Fq 'not found or not a regular file' "$AR_GL_LOG"; then
+  bad "the retry revalidated the removed --context-file path"
+else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
 # --- auto-resume: a stale supervisor.pid -----------------------------------
 # A supervisor killed with SIGKILL leaves its pid file behind, and that pid
 # ends up owned by something else. The decoy leads its own session, so a
 # group kill aimed at it would take down a whole unrelated process group.
 
+# Run "$@" as the leader of its own session, in the background; the pid
+# lands in SESSION_PID. perl is preferred over setsid(1) even where both
+# exist: a background job of a non-job-control shell starts with SIGINT
+# ignored, a signal ignored at entry cannot be re-trapped by a child bash,
+# and the Ctrl-C case below needs the front-end's INT trap armed — perl
+# restores the default disposition before detaching, which setsid(1)
+# cannot do.
+spawn_in_session() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '$SIG{INT} = "DEFAULT"; use POSIX qw(setsid); setsid();
+             exec @ARGV or exit 127' -- "$@" &
+  elif command -v setsid >/dev/null 2>&1; then
+    setsid "$@" &
+  else
+    "$@" &
+  fi
+  SESSION_PID=$!
+}
+
 t "run.sh: a stale supervisor.pid does not block a fresh run"
 rm -rf "$ROOT/state/o__n"
 mkdir -p "$AR_GH_STATE"
-setsid sleep 120 &
-AR_DECOY=$!
+spawn_in_session sleep 120
+AR_DECOY=$SESSION_PID
 printf '%s\n' "$AR_DECOY" > "$AR_GH_STATE/supervisor.pid"
 run_run_sh_supervised 1 --repo o/n
 assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
@@ -2914,6 +3047,64 @@ assert_substr "$WORK/run.err" "stop: no live supervisor"
 kill "$AR_DECOY" 2>/dev/null
 wait "$AR_DECOY" 2>/dev/null
 rm -rf "$ROOT/state/o__n"
+
+# --- auto-resume: a recycled pid that looks like a supervisor ---------------
+# The OS can hand a dead supervisor's pid to ANOTHER loop's supervisor: the
+# argv matches, but the start time does not. The decoy carries --_supervise
+# in its argv and a pid-file token from another incarnation; neither --stop
+# nor a fresh start may treat it as this PR's supervisor.
+
+t "run.sh: --stop leaves a recycled pid with a matching argv alone"
+rm -rf "$ROOT/state/o__n"
+mkdir -p "$AR_GH_STATE"
+# The compound command keeps bash resident (a single command would be
+# exec-optimized into a bare `sleep`, losing --_supervise from the argv and
+# making these cases pass on the argv check alone).
+spawn_in_session bash -c 'sleep 120; :' decoy --_supervise
+AR_DECOY2=$SESSION_PID
+if ps -o args= -p "$AR_DECOY2" 2>/dev/null | grep -q -- '--_supervise'; then
+  printf '%s\nWed Jan 1 00:00:00 2020\n' "$AR_DECOY2" > "$AR_GH_STATE/supervisor.pid"
+  run_run_sh_supervised 1 --repo o/n --stop
+  if [[ "$RUN_RC" -eq 0 ]] && kill -0 "$AR_DECOY2" 2>/dev/null; then ok
+  else bad "--stop signalled a recycled pid from another incarnation"; fi
+  assert_substr "$WORK/run.err" "stop: no live supervisor"
+else
+  bad "fixture: decoy argv lost --_supervise"
+fi
+
+t "run.sh: a recycled pid with a matching argv does not block a fresh run"
+rm -rf "$ROOT/state/o__n"
+mkdir -p "$AR_GH_STATE"
+printf '%s\nWed Jan 1 00:00:00 2020\n' "$AR_DECOY2" > "$AR_GH_STATE/supervisor.pid"
+run_run_sh_supervised 1 --repo o/n
+assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
+kill "$AR_DECOY2" 2>/dev/null
+wait "$AR_DECOY2" 2>/dev/null
+rm -rf "$ROOT/state/o__n"
+
+# --- auto-resume: no session primitive → inline, loudly ---------------------
+# Without setsid or perl there is no detached session: a supervisor would
+# share the caller's process group and die with it. The front-end must say
+# so and run the loop in this process instead of spawning a supervisor that
+# provides no isolation.
+
+t "run.sh: no setsid and no perl runs the loop inline with a warning"
+AR_NP_BIN="$WORK/ar-noprim-bin"
+mkdir -p "$AR_NP_BIN"
+for _c in bash sh dirname date mkdir rmdir rm cat head tail grep sed awk tr \
+          wc sleep ps git jq sort uniq cut ls env mktemp touch mv ln uname \
+          id; do
+  _p=$(command -v "$_c" 2>/dev/null) && ln -s "$_p" "$AR_NP_BIN/$_c"
+done
+rm -rf "$ROOT/state/o__n"
+env -i PATH="$STUBS:$AR_NP_BIN" HOME="$WORK" \
+  bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
+RUN_RC=$?
+assert_dies_with "auto-resume: disabled — neither setsid nor perl found"
+t "run.sh: the no-primitive inline run proceeds to the normal flow"
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+t "run.sh: the no-primitive run starts no supervisor"
+if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a session primitive"; else ok; fi
 
 # --- auto-resume: a live supervised run ------------------------------------
 # The git stub blocks in the PR-head fetch and records its own pid, standing
@@ -2958,13 +3149,13 @@ live_gone() {  # pid — up to 15s for it to exit
 live_start() {  # [extra PATH dir]
   local extra="${1:-}"
   rm -rf "$ROOT/state/gl.example__g__p" "$AR_LIVE_AGENT_FILE"
-  setsid env -i PATH="${extra:+$extra:}$AR_LIVE_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  spawn_in_session env -i PATH="${extra:+$extra:}$AR_LIVE_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
     STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
     STUB_FETCH_PID_FILE="$AR_LIVE_AGENT_FILE" \
     bash "$ROOT/run.sh" https://gl.example/g/p/-/merge_requests/9 \
       --dir "$AR_LIVE_REPO" \
-    > "$WORK/live.out" 2> "$WORK/live.err" &
-  LIVE_FRONT=$!
+    > "$WORK/live.out" 2> "$WORK/live.err"
+  LIVE_FRONT=$SESSION_PID
   [[ "$(ps -o pgid= -p "$LIVE_FRONT" 2>/dev/null | tr -d ' ')" == "$LIVE_FRONT" ]] || return 1
   live_wait "$AR_LIVE_AGENT_FILE" || return 1
   LIVE_AGENT=$(head -1 "$AR_LIVE_AGENT_FILE")
@@ -3009,6 +3200,41 @@ if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
 else bad "the supervisor or the agent survived --stop"; fi
 live_cleanup
 
+# --- auto-resume: simultaneous starts --------------------------------------
+# Several front-ends starting the same PR at once race the supervisor lock;
+# the kernel elects exactly one. The losers either refuse or attach to the
+# winner as observers — none may start a second supervisor.
+
+t "run.sh: simultaneous starts elect exactly one supervisor"
+rm -rf "$ROOT/state/gl.example__g__p" "$AR_LIVE_AGENT_FILE"
+AR_SIM_PIDS=()
+for _i in 1 2 3 4 5 6; do
+  env -i PATH="$AR_LIVE_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+    STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+    STUB_FETCH_PID_FILE="$AR_LIVE_AGENT_FILE" \
+    bash "$ROOT/run.sh" https://gl.example/g/p/-/merge_requests/9 \
+      --dir "$AR_LIVE_REPO" \
+    > "$WORK/sim.$_i.out" 2> "$WORK/sim.$_i.err" &
+  AR_SIM_PIDS+=($!)
+done
+if live_wait "$AR_LIVE_AGENT_FILE"; then
+  sleep 2   # let every straggler finish its start attempt
+  AR_SIM_STARTED=$(grep -c 'auto-resume: supervisor started' "$AR_LIVE_STATE/supervisor.log")
+  if [[ "$AR_SIM_STARTED" == 1 ]]; then ok
+  else bad "expected exactly 1 supervisor, got $AR_SIM_STARTED"; fi
+else
+  bad "no supervisor's worker ever reached the blocking fetch"
+fi
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+  9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
+# Front-ends observing the stopped supervisor drain on their own; TERM any
+# straggler so a regression here cannot hang the suite.
+for _p in ${AR_SIM_PIDS[@]+"${AR_SIM_PIDS[@]}"}; do
+  live_gone "$_p" || kill -TERM "$_p" 2>/dev/null
+  wait "$_p" 2>/dev/null
+done
+rm -rf "$ROOT/state/gl.example__g__p"
+
 t "run.sh: signalling the supervisor alone still ends the agent below the worker"
 if live_start; then
   kill -TERM "$LIVE_SUP" 2>/dev/null
@@ -3018,6 +3244,47 @@ else
   bad "the supervised run never reached the blocking fetch"
 fi
 live_cleanup
+
+# --- auto-resume: a real Ctrl-C ---------------------------------------------
+# SIGINT to the front-end's process group is what a terminal Ctrl-C
+# delivers (the supervisor sits in another session and only hears about it
+# from the trap). The whole contract in one shot: exit 130, sentinel
+# written, supervisor and agent down, pid file removed, nothing relaunched.
+# Needs perl: only spawn_in_session's perl arm restores the default SIGINT
+# disposition a background-launched shell starts without, and bash cannot
+# re-trap a signal that was ignored at entry.
+
+if ! command -v perl >/dev/null 2>&1; then
+  printf 'SKIP: Ctrl-C live cases need perl to arm SIGINT in the fixture\n' >&2
+else
+
+t "run.sh: Ctrl-C exits 130 and writes the stop sentinel"
+if live_start; then
+  kill -INT -- "-$LIVE_FRONT" 2>/dev/null
+  if live_gone "$LIVE_FRONT"; then
+    AR_INT_RC=0; wait "$LIVE_FRONT" 2>/dev/null || AR_INT_RC=$?
+    if [[ "$AR_INT_RC" -eq 130 && -e "$AR_LIVE_STATE/stop" ]]; then ok
+    else bad "rc=$AR_INT_RC, sentinel $([[ -e "$AR_LIVE_STATE/stop" ]] && echo present || echo missing)"; fi
+  else
+    bad "the front-end survived SIGINT"
+  fi
+  t "run.sh: Ctrl-C takes the supervisor and the agent down"
+  if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
+  else bad "the supervisor or the agent survived Ctrl-C"; fi
+  t "run.sh: Ctrl-C leaves no pid file and no relaunch behind"
+  if [[ ! -e "$AR_LIVE_STATE/supervisor.pid" ]] \
+     && ! grep -Fq 'auto-resume: restart' "$AR_LIVE_STATE/supervisor.log"; then ok
+  else bad "supervisor.pid survived Ctrl-C, or the supervisor relaunched"; fi
+else
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: Ctrl-C takes the supervisor and the agent down"
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: Ctrl-C leaves no pid file and no relaunch behind"
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+fi  # perl guard for the Ctrl-C live cases
 
 t "run.sh: the stop sentinel stops a live supervisor instead of relaunching"
 if live_start; then
@@ -3154,6 +3421,58 @@ if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "front-end exited rc=$RUN_RC"; fi
 
 t "run.sh: the front-end reports the finished run's status"
 assert_substr "$WORK/run.err" "supervisor exited; last worker status: approved"
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: the iteration budget spans relaunches ----------------------
+# worker.progress carries what earlier workers of the same invocation spent.
+# A relaunched worker (run directly here, seeded the way a supervisor retry
+# finds the file) that already spent --max reports max_iterations_reached
+# without running another agent turn — the cap is per invocation, not per
+# worker process.
+
+t "run.sh: a relaunched worker resumes the invocation's spent budget"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE"
+printf 'RUNS=2\nSTREAK=0\n' > "$AR_LIVE_STATE/worker.progress"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 > "$WORK/wk.out" 2> "$WORK/wk.err"
+assert_substr "$WORK/wk.err" "already ran 2 of 2 iteration(s)"
+t "run.sh: a worker with no remaining budget runs no agent turn"
+if grep -Fq '===== Iteration' "$WORK/wk.err"; then
+  bad "the worker started an iteration past the invocation cap"
+else ok; fi
+t "run.sh: the over-budget relaunch reports max_iterations_reached"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" max_iterations_reached
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: --restart is half-step-aware --------------------------------
+# --restart bypasses a prior APPROVED verdict, but must not skip work the
+# thread still owes: when codex posted an iteration claude never answered
+# (the restarted round died mid-way and this is the relaunch), the claude
+# half-step runs first. Only a completed round bumps to a fresh one. The
+# stub knobs pin the two summary iterations independently.
+
+t "run.sh: --restart resumes a pending claude half-step instead of skipping it"
+rm -rf "$ROOT/state/gl.example__g__p"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-restart-argv" \
+  STUB_GL_CODEX_ITER=2 STUB_GL_CLAUDE_ITER=1 STUB_FAIL_MIDRUN=1 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --restart > "$WORK/rs.out" 2> "$WORK/rs.err"
+assert_substr "$WORK/rs.err" "--restart: codex iter=2 awaits a claude reply — running the half-step first"
+
+t "run.sh: --restart with a completed round starts the next round codex-first"
+rm -rf "$ROOT/state/gl.example__g__p"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-restart-argv" \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --restart > "$WORK/rs2.out" 2> "$WORK/rs2.err"
+assert_substr "$WORK/rs2.err" "--restart: bypassing prior APPROVED state — starting fresh at iter 2 (codex first)"
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------

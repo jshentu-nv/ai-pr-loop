@@ -407,7 +407,13 @@ same as before. When the loop dies without finishing, the supervisor
 launches it again; each relaunch picks up at the PR's high-water mark
 above.
 
-On by default, budget 10 restarts.
+On by default, budget 10 restarts. One supervisor per PR: the supervisor
+holds a kernel lock (`supervisor.lock`) for its lifetime, so simultaneous
+starts elect exactly one and the rest refuse. `supervisor.pid` records the
+pid together with its start time, so a recycled pid is neither signalled
+by `--stop` nor blocks a new run. It needs `setsid` or `perl` for the
+detached session; with neither on `PATH` the loop runs inline, with a
+warning.
 
 | After a run ends | Auto-resume |
 |---|---|
@@ -419,6 +425,14 @@ On by default, budget 10 restarts.
 
 Backoff between restarts is 10s, doubling to a 300s cap, back to 10s
 after a run that lasted more than ten minutes.
+
+`--max` and `--converge` span relaunches: a relaunched loop keeps the
+invocation's remaining iteration budget and convergence streak
+(`worker.progress`) instead of starting a fresh count. Relaunches drop the
+`--context*` flags and reuse the `context.md` persisted at launch — the
+original paths may be temporary. `--restart` replays safely: a relaunch
+that finds a codex iteration without its claude reply resumes that
+half-step instead of bumping the round again.
 
 The supervisor is an ordinary process on the host, so a reboot ends the
 review along with it — there is no boot-time hook. Re-run the same
@@ -441,9 +455,10 @@ clears the sentinel.
 
 **Where it logs.** `state/<owner>__<name>/pr-<N>/supervisor.log` (GitLab:
 `state/<host>__<slug...>/...`), appended across invocations. Restart lines
-carry the word `auto-resume`. The same directory holds `supervisor.pid`
-while a supervisor is live, plus `worker.started` / `worker.status` — the
-files the restart decision reads.
+carry the word `auto-resume`. The same directory holds `supervisor.lock`,
+`supervisor.pid` while a supervisor is live, plus `worker.started` /
+`worker.status` / `worker.progress` — the files the restart decision and
+the relaunch budget read.
 
 Pass `--no-auto-resume` to run the loop in the invoking process with
 nothing supervising it, or `--auto-resume N` to change the budget (`0`
@@ -506,7 +521,9 @@ record their argv, and assertions check the recorded vectors (model /
 effort / tier mapping, `off` omission, the adaptive Codex effort default,
 explicit-level precedence, fresh-vs-resumed session flags) plus `run.sh`'s
 flag validation. The auto-resume cases start real supervisors against the
-same stubs; every one of them dies before an agent turn.
+same stubs; most die before an agent turn, and the terminal-status cases
+drive the Codex stub through an approved run to prove the supervisor stops
+on an end state.
 
 ```bash
 ~/ai-pr-loop/tests/run_tests.sh

@@ -1063,6 +1063,25 @@ auto_resume_decision() {
   esac
 }
 
+# Drop the context flags a relaunch must not replay from a worker argv,
+# into STRIPPED_ARGV: --clear-context, and the --context* inputs with
+# their values — a retry reuses the context.md the first worker persisted,
+# and the original paths may be temporary. Values may be flag-shaped or
+# hold newlines; positionals and every other flag (including --restart,
+# whose resume branch is half-step-aware and safe to replay) pass through
+# untouched.
+strip_context_worker_flags() {
+  STRIPPED_ARGV=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --clear-context) shift ;;
+      --context|--context-url|--context-file)
+        if (( $# >= 2 )); then shift 2; else shift; fi ;;
+      *) STRIPPED_ARGV+=("$1"); shift ;;
+    esac
+  done
+}
+
 # Seconds to wait before restart number $1 (0-based) of a crash loop: the
 # floor, doubled per attempt, capped.
 auto_resume_backoff() {
