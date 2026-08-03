@@ -74,8 +74,11 @@
 #                 Free-text note to attach for both agents. Repeatable.
 #   --context-file FILE
 #                 Local file whose contents are injected verbatim as context
-#                 for both agents. Read at launch (not referenced later), so
-#                 the path need not survive to later re-runs. Repeatable.
+#                 for both agents. Read at launch and snapshotted to the
+#                 PR's context.md; once that snapshot lands, the path is
+#                 never read again (auto-resume relaunches replay the flag
+#                 — and re-read the file — only until the snapshot
+#                 succeeds). Repeatable.
 #   --clear-context
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
@@ -172,9 +175,10 @@
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
 # the stored context, or --clear-context to drop it. An auto-resume relaunch
-# never re-reads --context* inputs; it reuses the context.md persisted by
-# the first run, so a temporary path passed at launch stays valid for the
-# whole supervised run.
+# replays the --context* flags (re-reading their inputs) only until a worker
+# lands the invocation's snapshot; after that it reuses the persisted
+# context.md and never reads the paths again, so a temporary file stays
+# valid for the rest of the supervised run.
 #
 # Credentials — one per forge:
 #   GitHub: GH_TOKEN/GITHUB_TOKEN (the gh CLI must be logged in). Works on
@@ -593,12 +597,14 @@ read_pid_record() {
   REC_TOKEN=$(sed -n '2p' "$1")
 }
 
-# True when a session primitive exists. Without one there is no detached
-# session: the supervisor would share the caller's process group, so the
-# group kill this feature exists to survive would take it down too, and
-# kill_worker_tree could not signal the agents under the worker.
+# True when a session primitive exists that spawn_detached can actually
+# use: setsid must support -f (fork/reparent — a plain setsid leaves the
+# supervisor inside the caller's descendant tree, where a tree reaper
+# finds it), or perl does the fork+setsid itself. Without one there is no
+# detached session and the loop runs inline instead.
 have_session_primitive() {
-  command -v setsid >/dev/null 2>&1 || command -v perl >/dev/null 2>&1
+  { command -v setsid >/dev/null 2>&1 && setsid -f true 2>/dev/null; } \
+    || command -v perl >/dev/null 2>&1
 }
 
 # True when a tool exists to hold the single-supervisor flock. Supervision
@@ -609,14 +615,19 @@ have_lock_primitive() {
   command -v flock >/dev/null 2>&1 || command -v perl >/dev/null 2>&1
 }
 
-# Run a command in its own session. setsid is util-linux; perl's POSIX::setsid
-# covers hosts without it (macOS). The front-end checks
-# have_session_primitive before spawning, so the last arm is a backstop.
+# Run a command in its own session, REPARENTED out of this process's
+# descendant tree: a task reaper that walks and TERMs the caller's tree
+# must not find the supervisor, and a new session alone does not move a
+# process off its parent. setsid -f forks so the intermediate exits and
+# init adopts the child; the perl arm does the same fork+setsid+exec.
+# The front-end checks have_session_primitive before spawning, so the
+# last arm is a backstop.
 spawn_detached() {
-  if command -v setsid >/dev/null 2>&1; then
-    setsid "$@"
+  if command -v setsid >/dev/null 2>&1 && setsid -f true 2>/dev/null; then
+    setsid -f "$@"
   elif command -v perl >/dev/null 2>&1; then
-    perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or exit 127' -- "$@"
+    perl -e 'exit 0 if fork; use POSIX qw(setsid); setsid();
+             exec @ARGV or exit 127' -- "$@"
   else
     die "spawn_detached: neither setsid nor perl is available"
   fi
@@ -927,13 +938,19 @@ if [[ "$ROLE" == "supervise" ]]; then
       kill -TERM "$WORKER_PID" 2>/dev/null || true
     fi
   }
-  # Forward the signal to the worker and leave the sentinel alone: whoever
-  # sent it decides whether this PR resumes later.
+  # Only the stop sentinel means the review should end: --stop and Ctrl-C
+  # both write it before signalling. A TERM/HUP without it is exactly the
+  # external noise this feature exists to survive — stay up, let the
+  # interrupted wait resume, and relaunch the worker if the signal took it
+  # down too.
   supervisor_signalled() {
-    log "auto-resume: supervisor signalled — shutting down (worker pid ${WORKER_PID:-none})"
-    kill_worker_tree
-    rm -f "$PR_STATE_DIR/supervisor.pid" "$PR_STATE_DIR/worker.pid"
-    exit 143
+    if [[ -e "$PR_STATE_DIR/stop" ]]; then
+      log "auto-resume: supervisor signalled — stop requested; shutting down (worker pid ${WORKER_PID:-none})"
+      kill_worker_tree
+      rm -f "$PR_STATE_DIR/supervisor.pid" "$PR_STATE_DIR/worker.pid"
+      exit 143
+    fi
+    log "auto-resume: supervisor signalled without a stop request — ignoring; the review continues (--stop or Ctrl-C ends it)"
   }
   trap supervisor_signalled TERM HUP
 
@@ -979,7 +996,21 @@ if [[ "$ROLE" == "supervise" ]]; then
     printf '%s\n%s\n' "$WORKER_PID" "$(proc_start_token "$WORKER_PID")" \
       > "$PR_STATE_DIR/worker.pid"
     WORKER_RC=0
-    wait "$WORKER_PID" || WORKER_RC=$?
+    # A trapped signal interrupts wait with 128+sig while the worker may
+    # still be running (the ignored sentinel-less TERM above); only a
+    # reaped worker ends this loop. When the worker vanished during the
+    # interruption itself, the 128+sig may be trap noise rather than the
+    # worker's status — ask the job table once more and keep the stored
+    # status (127 = already collected: the first value was real).
+    while :; do
+      if wait "$WORKER_PID"; then WORKER_RC=0; else WORKER_RC=$?; fi
+      if kill -0 "$WORKER_PID" 2>/dev/null; then continue; fi
+      if (( WORKER_RC > 128 )); then
+        if wait "$WORKER_PID" 2>/dev/null; then WORKER_RC=0
+        else WORKER_RC2=$?; (( WORKER_RC2 == 127 )) || WORKER_RC="$WORKER_RC2"; fi
+      fi
+      break
+    done
     # The worker's shell is gone; anything it started goes with it, or a
     # relaunch would put a second agent on the same checkout and PR.
     kill_worker_tree
@@ -1005,7 +1036,10 @@ if [[ "$ROLE" == "supervise" ]]; then
     BACKOFF=$(auto_resume_backoff "$QUICK")
     QUICK=$(( QUICK + 1 ))
     log "auto-resume: restart $ATTEMPT/$AUTO_RESUME in ${BACKOFF}s — $REASON (worker exit $WORKER_RC after ${RAN_SECS}s)"
-    sleep "$BACKOFF"
+    # Guarded: a group-wide sentinel-less TERM kills this sleep with 143
+    # after the trap above returns, and an unguarded nonzero here would
+    # end the supervisor through set -e — the very signal being ignored.
+    sleep "$BACKOFF" || true
   done
 
   rm -f "$PR_STATE_DIR/supervisor.pid" "$PR_STATE_DIR/worker.pid"

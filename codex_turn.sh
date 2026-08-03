@@ -188,55 +188,69 @@ fi
 
 log "codex: iter $ITER — exit $RC"
 
-if [[ $RC -ne 0 ]]; then
-  log "codex stderr (tail):"
-  tail -20 "$ID/codex.stderr" >&2 || true
-  return 2>/dev/null || exit 1
-fi
-
 # The summary comment is the turn's completion contract (the prompt posts it
 # last, after every inline note). Trusting stdout alone is not enough: a run
 # can print its verdict even though the summary POST failed, or die after
 # posting only inline notes. Refetch the thread and require this iteration's
-# summary before recording any counts or verdict — failing here (rather than
-# advancing) means the next invocation re-reviews at this same iteration,
-# since the resume high-water also only counts summaries.
-if ! verify_ai_summary codex "$ITER"; then
+# summary before recording any counts or verdict — failing without one means
+# the next invocation re-reviews at this same iteration, since the resume
+# high-water also only counts summaries. A summary that LANDED is a real,
+# public review even when the CLI then exited nonzero: persist its counts
+# and verdict before failing the turn, so a relaunch's resume accounts for
+# what the PR already shows (convergence included) instead of losing it.
+SUMMARY_LANDED=0
+verify_ai_summary codex "$ITER" && SUMMARY_LANDED=1
+
+VERDICT=''
+if (( SUMMARY_LANDED == 1 )); then
+  # Parse issue counts (last occurrence wins). Missing line → counts
+  # unknown, orchestrator treats convergence as not-met.
+  ISSUES_LINE=$(grep -Eo '\[CODEX_ISSUES: BLOCKER=[0-9]+ MAJOR=[0-9]+ NIT=[0-9]+\]' \
+                  "$ID/codex.stdout" | tail -1 || true)
+  if [[ -n "$ISSUES_LINE" ]]; then
+    BLOCKER_N=$(grep -Eo 'BLOCKER=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+    MAJOR_N=$(grep -Eo 'MAJOR=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+    NIT_N=$(grep -Eo 'NIT=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+    printf 'BLOCKER=%s\nMAJOR=%s\nNIT=%s\n' "$BLOCKER_N" "$MAJOR_N" "$NIT_N" \
+      > "$ID/issue_counts"
+    log "codex: issue counts BLOCKER=$BLOCKER_N MAJOR=$MAJOR_N NIT=$NIT_N"
+  else
+    log "codex: no [CODEX_ISSUES: ...] marker found — convergence check disabled for this iter"
+  fi
+
+  # Parse the verdict from stdout (last occurrence wins). No marker — e.g.
+  # stdout truncated by the failure that also produced a nonzero exit —
+  # records the conservative CHANGES_REQUESTED, so resume treats the landed
+  # review as a pending half-step rather than guessing an approval.
+  VERDICT=$(grep -Eo '\[CODEX_VERDICT: (APPROVED|CHANGES_REQUESTED)\]' \
+              "$ID/codex.stdout" | tail -1 || true)
+  if [[ "$VERDICT" == *APPROVED* ]]; then
+    echo "APPROVED" > "$ID/verdict"
+    log "codex: VERDICT = APPROVED"
+  elif [[ -n "$VERDICT" ]]; then
+    echo "CHANGES_REQUESTED" > "$ID/verdict"
+    log "codex: VERDICT = CHANGES_REQUESTED"
+  else
+    log "codex: no verdict marker found in stdout — treating as CHANGES_REQUESTED"
+    echo "CHANGES_REQUESTED" > "$ID/verdict"
+  fi
+fi
+
+if [[ $RC -ne 0 ]]; then
+  log "codex stderr (tail):"
+  tail -20 "$ID/codex.stderr" >&2 || true
+  if (( SUMMARY_LANDED == 1 )); then
+    log "codex: the iter $ITER summary landed before the CLI failure — counts and verdict persisted for resume"
+  fi
+  exit 1
+fi
+
+if (( SUMMARY_LANDED == 0 )); then
   log "codex: iter $ITER summary comment not found on the PR — failing the turn (stdout verdict ignored)"
   exit 1
 fi
 
-# Parse issue counts (last occurrence wins). Missing line → counts unknown,
-# orchestrator treats convergence as not-met.
-ISSUES_LINE=$(grep -Eo '\[CODEX_ISSUES: BLOCKER=[0-9]+ MAJOR=[0-9]+ NIT=[0-9]+\]' \
-                "$ID/codex.stdout" | tail -1 || true)
-if [[ -n "$ISSUES_LINE" ]]; then
-  BLOCKER_N=$(grep -Eo 'BLOCKER=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-  MAJOR_N=$(grep -Eo 'MAJOR=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-  NIT_N=$(grep -Eo 'NIT=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-  printf 'BLOCKER=%s\nMAJOR=%s\nNIT=%s\n' "$BLOCKER_N" "$MAJOR_N" "$NIT_N" \
-    > "$ID/issue_counts"
-  log "codex: issue counts BLOCKER=$BLOCKER_N MAJOR=$MAJOR_N NIT=$NIT_N"
-else
-  log "codex: no [CODEX_ISSUES: ...] marker found — convergence check disabled for this iter"
-fi
-
-# Parse verdict from stdout. Take the LAST occurrence to be safe.
-VERDICT=$(grep -Eo '\[CODEX_VERDICT: (APPROVED|CHANGES_REQUESTED)\]' \
-            "$ID/codex.stdout" | tail -1 || true)
-
-if [[ -z "$VERDICT" ]]; then
-  log "codex: no verdict marker found in stdout — treating as CHANGES_REQUESTED"
-  echo "CHANGES_REQUESTED" > "$ID/verdict"
-  exit 2
-fi
-
 if [[ "$VERDICT" == *APPROVED* ]]; then
-  echo "APPROVED" > "$ID/verdict"
-  log "codex: VERDICT = APPROVED"
   exit 0
-else
-  echo "CHANGES_REQUESTED" > "$ID/verdict"
-  log "codex: VERDICT = CHANGES_REQUESTED"
-  exit 2
 fi
+exit 2

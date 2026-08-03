@@ -455,8 +455,11 @@ command afterwards; it continues from the PR's high-water mark.
 writes the stop sentinel and takes the supervisor and the running turn
 down with it. Nothing resumes. An external `SIGTERM`/`SIGHUP` — a task
 runner reaping the shell, a closed terminal — kills only the foreground
-command; the supervisor is in another session and keeps the review going.
-To stop such a run from elsewhere:
+command: the supervisor runs in its own session AND outside the launching
+shell's process tree (it is reparented at spawn), so neither a group kill
+nor a tree-walking reaper finds it. A stray `TERM`/`HUP` that reaches the
+supervisor directly is ignored unless the stop sentinel exists — only
+`--stop` and Ctrl-C mean stop. To stop such a run from elsewhere:
 
 ```bash
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --stop

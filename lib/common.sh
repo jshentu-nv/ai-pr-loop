@@ -1173,11 +1173,25 @@ claim_state_marker() {
     rm -f "$tmp"
     if [[ ! -e "$marker" ]]; then
       # ln failed with the marker still absent: this filesystem has no
-      # hard links. Keep the anchor with a plain write — sequential
-      # validation still holds, only the simultaneous-first-touch election
-      # is unavailable here.
-      repo_ident > "$marker"
-      return 0
+      # hard links. Elect through mkdir instead — atomic everywhere. The
+      # winner writes the marker only when no identity has landed (a
+      # previous winner may have completed and released before this
+      # election); a loser waits for the marker. Everyone then falls
+      # through to validation, so a late second-election winner checks
+      # the first winner's identity instead of overwriting it. A marker
+      # that never appears means a claimant died inside the election —
+      # refuse with a cleanup hint rather than run unanchored.
+      local _w
+      if mkdir "$marker.lck" 2>/dev/null; then
+        [[ -s "$marker" ]] || repo_ident > "$marker"
+        rmdir "$marker.lck" 2>/dev/null || true
+      else
+        for (( _w = 0; _w < 50; _w++ )); do
+          [[ -s "$marker" ]] && break
+          sleep 0.1
+        done
+        [[ -s "$marker" ]] || die "state identity election for $dir did not complete (a claimant died mid-election?); remove $marker.lck and re-run after confirming no other run is live on this dir"
+      fi
     fi
   elif [[ ! -s "$marker" ]]; then
     # An empty marker anchors nothing and would pass every check. Replace

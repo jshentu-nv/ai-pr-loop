@@ -45,7 +45,10 @@
 #   - auto-resume, orphan recovery: --stop TERMs the recorded worker group
 #     after a supervisor SIGKILL leaves the tree alive
 #   - auto-resume, live runs: a reaped front-end leaves the supervisor and
-#     its worker running, --stop and a signalled supervisor both reach the
+#     its worker running, a tree reaper TERMing the front-end's whole
+#     descendant walk leaves the review running (the supervisor is
+#     reparented at spawn), a sentinel-less TERM to the supervisor is
+#     ignored while --stop still works afterwards, --stop reaches the
 #     agent under the worker, a stale supervisor.pid is neither signalled
 #     nor obeyed (including a recycled pid whose argv matches but whose
 #     start time does not), simultaneous starts elect exactly one
@@ -53,6 +56,9 @@
 #     SIGINT to the front-end group stops everything with exit 130, a
 #     worker that finishes reports a terminal status, and a SIGKILLed
 #     front-end leaves no tail behind
+#   - codex_turn: a landed summary followed by a nonzero CLI exit persists
+#     its counts and verdict before the turn fails, and the relaunch
+#     converges from them
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -174,8 +180,9 @@ printf '{"payload":{"id":"foreign-root-uuid","cwd":"/other-checkout","source":"e
   > "$CODEX_HOME/sessions/rollout-a-decoy.jsonl"
 printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
   > "$CODEX_HOME/sessions/rollout-stub.jsonl"
-echo "[CODEX_ISSUES: BLOCKER=0 MAJOR=0 NIT=0]"
-echo "[CODEX_VERDICT: APPROVED]"
+echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
+echo "[CODEX_VERDICT: ${STUB_CODEX_VERDICT:-APPROVED}]"
+exit "${STUB_CODEX_EXIT:-0}"
 EOF
 
 # Faithful `gh api [--paginate] <path> --jq <prog>`: emit a RAW GitHub
@@ -3280,6 +3287,28 @@ if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "--stop failed on an empty marker (r
 assert_eq "$(cat "$AR_GH_STATE/.repo-slug" 2>/dev/null)" "o/n"
 rm -rf "$ROOT/state/o__n"
 
+t "run.sh: racing first-touch stops elect one identity without hard links too"
+# With ln failing, election goes through mkdir — atomic on every
+# filesystem. Same contract as the hard-link path: one winner per pair.
+AR_LNRACE_BAD=0
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+          21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
+  rm -rf "$ROOT/state/race__o__r"
+  env -i PATH="$AR_LN_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    1 --repo 'race__o/r' --stop >/dev/null 2>"$WORK/race.a.err" &
+  _pa=$!
+  env -i PATH="$AR_LN_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    1 --repo 'race/o__r' --stop >/dev/null 2>"$WORK/race.b.err" &
+  _pb=$!
+  _ra=0; wait "$_pa" || _ra=$?
+  _rb=0; wait "$_pb" || _rb=$?
+  if [[ "$_ra" -eq 0 && "$_rb" -eq 0 ]]; then AR_LNRACE_BAD=$((AR_LNRACE_BAD + 1)); fi
+  if [[ "$_ra" -ne 0 && "$_rb" -ne 0 ]]; then AR_LNRACE_BAD=$((AR_LNRACE_BAD + 1)); fi
+done
+if [[ "$AR_LNRACE_BAD" -eq 0 ]]; then ok
+else bad "$AR_LNRACE_BAD of 40 no-hard-link racing pairs did not elect exactly one owner"; fi
+rm -rf "$ROOT/state/race__o__r"
+
 # --- auto-resume: a live supervised run ------------------------------------
 # The git stub blocks in the PR-head fetch and records its own pid, standing
 # in for an agent turn in progress. That pid is how these cases tell whether a
@@ -3409,15 +3438,94 @@ for _p in ${AR_SIM_PIDS[@]+"${AR_SIM_PIDS[@]}"}; do
 done
 rm -rf "$ROOT/state/gl.example__g__p"
 
-t "run.sh: signalling the supervisor alone still ends the agent below the worker"
+# Only the stop sentinel means the review should end; a TERM aimed straight
+# at the supervisor without one is the external noise auto-resume exists to
+# survive.
+t "run.sh: a sentinel-less TERM to the supervisor is ignored — the review continues"
 if live_start; then
   kill -TERM "$LIVE_SUP" 2>/dev/null
+  sleep 1
+  if kill -0 "$LIVE_SUP" 2>/dev/null && kill -0 "$LIVE_AGENT" 2>/dev/null; then ok
+  else bad "a TERM without the stop sentinel took the supervisor or the agent down"; fi
+  t "run.sh: the ignored signal is logged"
+  assert_substr "$AR_LIVE_STATE/supervisor.log" "signalled without a stop request"
+  t "run.sh: --stop still ends a supervisor that ignored a stray TERM"
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
   if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
-  else bad "the agent outlived the supervisor's shutdown"; fi
+  else bad "--stop failed after an ignored stray TERM"; fi
 else
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: the ignored signal is logged"
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: --stop still ends a supervisor that ignored a stray TERM"
   bad "the supervised run never reached the blocking fetch"
 fi
 live_cleanup
+
+# --- auto-resume: a tree reaper ---------------------------------------------
+# Task runners kill jobs by walking the job's process TREE, which a new
+# session alone does not escape. The supervisor is reparented at spawn
+# (setsid -f / perl fork), so the walk must not find it, and TERMing the
+# front-end plus every found descendant must leave the review running.
+
+tree_pids() {  # pid → all its descendant pids, from one ps snapshot
+  ps -eo pid=,ppid= | awk -v root="$1" '
+    { kid[$2] = kid[$2] " " $1 }
+    END {
+      queue = kid[root]
+      while (queue != "") {
+        n = split(queue, q, " "); queue = ""
+        for (i = 1; i <= n; i++) if (q[i] != "") { print q[i]; queue = queue kid[q[i]] }
+      }
+    }'
+}
+
+t "run.sh: the supervisor is not a descendant of the front-end"
+if live_start; then
+  AR_TREE=$(tree_pids "$LIVE_FRONT")
+  if grep -qx "$LIVE_SUP" <<<"$AR_TREE"; then
+    bad "the supervisor is still in the front-end's descendant tree"
+  else ok; fi
+  t "run.sh: a tree reaper TERMing the front-end and descendants leaves the review"
+  for _p in $AR_TREE; do kill -TERM "$_p" 2>/dev/null; done
+  kill -TERM "$LIVE_FRONT" 2>/dev/null
+  wait "$LIVE_FRONT" 2>/dev/null
+  sleep 1
+  if kill -0 "$LIVE_SUP" 2>/dev/null && kill -0 "$LIVE_AGENT" 2>/dev/null; then ok
+  else bad "the tree reap took the supervisor or the agent down"; fi
+else
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: a tree reaper TERMing the front-end and descendants leaves the review"
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+t "run.sh: a sentinel-less group TERM during the backoff is survived"
+# The ignore-trap returns into an interrupted `sleep`, whose 143 must not
+# end the supervisor through set -e; the loop continues to the relaunch.
+rm -rf "$ROOT/state/gl.example__g__p"
+spawn_in_session env -i PATH="$AR_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=6 \
+  bash "$ROOT/run.sh" https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_REPO" --auto-resume 1 > "$WORK/bk.out" 2> "$WORK/bk.err"
+AR_BK_FRONT=$SESSION_PID
+for (( _i = 0; _i < 300; _i++ )); do
+  grep -q 'restart 1/1 in 6s' "$AR_GL_LOG" 2>/dev/null && break
+  sleep 0.1
+done
+AR_BK_SUP=$(head -1 "$ROOT/state/gl.example__g__p/pr-9/supervisor.pid" 2>/dev/null)
+if [[ "$AR_BK_SUP" =~ ^[0-9]+$ ]]; then
+  sleep 1   # land inside the backoff sleep
+  kill -TERM -- "-$AR_BK_SUP" 2>/dev/null
+  wait "$AR_BK_FRONT" 2>/dev/null
+  if grep -Fq 'signalled without a stop request' "$AR_GL_LOG" \
+     && grep -Fq 'budget exhausted' "$AR_GL_LOG"; then ok
+  else bad "the group TERM during the backoff ended the supervisor early"; fi
+else
+  bad "no supervisor pid recorded before the backoff"
+fi
+rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- auto-resume: --stop reaches a worker orphaned by a supervisor SIGKILL --
 # A SIGKILLed supervisor leaves its worker tree alive (holding the lock),
@@ -3815,6 +3923,39 @@ env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
 if grep -Fq 'streak 2 / 2' "$WORK/cv2.err"; then
   bad "the relaunch double-counted the already-accounted review"
 else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- codex_turn: a landed review with a failing CLI persists its record -----
+# The real crash path: the summary posts, then the CLI exits nonzero. The
+# turn still fails, but the counts and verdict from stdout must land on
+# disk first — a relaunch's resume feeds convergence from them.
+
+t "run.sh: a landed review with a failing CLI still persists its counts"
+rm -rf "$ROOT/state/gl.example__g__p"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_CODEX_ISSUES='BLOCKER=0 MAJOR=0 NIT=1' \
+  STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_EXIT=17 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx.out" 2> "$WORK/cx.err"
+assert_substr "$WORK/cx.err" "summary landed before the CLI failure"
+t "run.sh: the failed turn's counts are on disk"
+assert_eq "$(awk -F= '/^NIT=/{print $2}' "$AR_LIVE_STATE/iter-02/issue_counts" 2>/dev/null)" 1
+t "run.sh: the failed turn's verdict is the conservative CHANGES_REQUESTED"
+assert_eq "$(cat "$AR_LIVE_STATE/iter-02/verdict" 2>/dev/null)" CHANGES_REQUESTED
+t "run.sh: the failed turn still reports codex_error"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" codex_error
+
+t "run.sh: the relaunch converges from the failed turn's persisted counts"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=2 STUB_GL_CLAUDE_ITER=1 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx2.out" 2> "$WORK/cx2.err"
+assert_substr "$WORK/cx2.err" "convergence: iter 2 BLOCKER=0 MAJOR=0 (streak 1 / 1)"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" converged_no_major
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------
