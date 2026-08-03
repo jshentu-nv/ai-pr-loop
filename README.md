@@ -409,11 +409,17 @@ above.
 
 On by default, budget 10 restarts. One supervisor per PR: the supervisor
 holds a kernel lock (`supervisor.lock`) for its lifetime, so simultaneous
-starts elect exactly one and the rest refuse. `supervisor.pid` records the
-pid together with its start time, so a recycled pid is neither signalled
-by `--stop` nor blocks a new run. It needs `setsid` or `perl` for the
-detached session; with neither on `PATH` the loop runs inline, with a
-warning.
+starts elect exactly one supervisor. A start that loses the race either
+refuses, or — when the winner's record is already on disk — attaches to
+the winning run as an observer: it tails the same log, its own flags are
+ignored (the winner's invocation governs), and Ctrl-C from it stops the
+shared run, exactly like `--stop`. A sequential second start always
+refuses. `supervisor.pid` records the pid together with its start time,
+so a recycled pid is neither signalled by `--stop` nor blocks a new run;
+`worker.pid` records the live worker the same way, so `--stop` can still
+tear down a worker orphaned by a SIGKILLed supervisor. Auto-resume needs
+`setsid` or `perl` for the detached session and `flock` or `perl` for the
+lock; missing either, the loop runs inline, with a warning.
 
 | After a run ends | Auto-resume |
 |---|---|
@@ -456,9 +462,9 @@ clears the sentinel.
 **Where it logs.** `state/<owner>__<name>/pr-<N>/supervisor.log` (GitLab:
 `state/<host>__<slug...>/...`), appended across invocations. Restart lines
 carry the word `auto-resume`. The same directory holds `supervisor.lock`,
-`supervisor.pid` while a supervisor is live, plus `worker.started` /
-`worker.status` / `worker.progress` — the files the restart decision and
-the relaunch budget read.
+`supervisor.pid` and `worker.pid` while a run is live, plus
+`worker.started` / `worker.status` / `worker.progress` — the files the
+restart decision, `--stop`, and the relaunch budget read.
 
 Pass `--no-auto-resume` to run the loop in the invoking process with
 nothing supervising it, or `--auto-resume N` to change the budget (`0`

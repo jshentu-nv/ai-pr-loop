@@ -245,14 +245,23 @@ Each iteration can take 2–15 minutes depending on repo size and whether
 the per-agent session is being resumed (cold codex run = slow; resumed =
 fast). Don't poll synchronously; rely on the monitor.
 
-A killed run resumes itself. `run.sh` starts a supervisor in its own
-session and tails its log, so the background task's output is unchanged.
-If the task is reaped (SIGTERM/SIGHUP), the supervisor keeps the review
-going and the loop restarts from the PR's high-water mark — the background
-task ends, but the review does not. Watch for `auto-resume:` lines to see
-restarts, and read the final state from the PR thread or
+A killed run resumes itself — when the supervisor is running. `run.sh`
+starts a supervisor in its own session and tails its log, so the
+background task's output is unchanged. If the task is reaped
+(SIGTERM/SIGHUP), the supervisor keeps the review going and the loop
+restarts from the PR's high-water mark — the background task ends, but
+the review does not. Watch for `auto-resume:` lines to see restarts, and
+read the final state from the PR thread or
 `state/<ident>/pr-<N>/supervisor.log` when the task file stops growing. To
 end such a run, call `run.sh <pr> --repo <slug> --stop`.
+
+**Check the launch output for `auto-resume: disabled`.** On a host without
+`setsid`/`perl` (no detached session) or without `flock`/`perl` (no
+single-supervisor lock), `run.sh` prints that warning and runs the loop
+inline in the background task itself. There is no supervisor: a reaped
+task ENDS the review, and nothing restarts it. Treat task death as review
+death in that case — re-run the same command to resume from the PR's
+high-water mark.
 
 ### 5. Stream progress with a Monitor
 

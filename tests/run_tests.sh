@@ -31,9 +31,15 @@
 #     verbatim (newline + quote, flag-shaped values), the stop sentinel,
 #     budget exhaustion, the long-run backoff reset, a relaunch reusing the
 #     stored context.md after its --context-file path vanished, the
-#     iteration budget spanning relaunches, --restart resuming a pending
-#     claude half-step (and bumping only a completed round), and inline
-#     fallback (with a warning) when neither setsid nor perl exists
+#     iteration budget spanning relaunches (and reconciling with summaries
+#     already landed on the PR), --restart resuming a pending claude
+#     half-step (bumping a completed round, including an approval whose
+#     codex>claude shape mimics a half-step), a failed context render
+#     leaving no truncated snapshot, state-path identity collisions refused
+#     by --stop and by starts, and inline fallback (with a warning) when
+#     setsid/perl (session) or flock/perl (lock) are missing
+#   - auto-resume, orphan recovery: --stop TERMs the recorded worker group
+#     after a supervisor SIGKILL leaves the tree alive
 #   - auto-resume, live runs: a reaped front-end leaves the supervisor and
 #     its worker running, --stop and a signalled supervisor both reach the
 #     agent under the worker, a stale supervisor.pid is neither signalled
@@ -3003,6 +3009,50 @@ if grep -Fq 'not found or not a regular file' "$AR_GL_LOG"; then
 else ok; fi
 rm -rf "$ROOT/state/gl.example__g__p"
 
+# --- auto-resume: a render that dies mid-read leaves no partial context ------
+# The snapshot lands via rename, whole or not at all: a source read that
+# emits part of its content and then fails kills that worker with only the
+# .tmp written, so the retry runs with no context rather than silently
+# trusting a truncated one.
+
+t "run.sh: a failed context render leaves no truncated context.md"
+AR_PC_BIN="$WORK/ar-partialctx-bin"
+mkdir -p "$AR_PC_BIN"
+cp "$AR_BIN/git" "$AR_PC_BIN/git"
+chmod +x "$AR_PC_BIN/git"
+# The passthrough path is resolved while writing the stub — cat lives at
+# /usr/bin/cat or /bin/cat depending on the host, and the stub's own PATH
+# entry must not be consulted at run time.
+cat > "$AR_PC_BIN/cat" <<EOF
+#!/usr/bin/env bash
+# Real cat, except the marked context source: emit a truncated read and
+# fail, the shape of a source that vanishes mid-read.
+if [[ "\${1:-}" == "--" && "\${2:-}" == "\${STUB_CTX_PARTIAL:-}" ]]; then
+  printf 'PARTIAL-ONLY'
+  exit 1
+fi
+exec $(command -v cat) "\$@"
+EOF
+chmod +x "$AR_PC_BIN/cat"
+AR_PC_FILE="$WORK/ar-partial-note.md"
+printf 'full trusted context\n' > "$AR_PC_FILE"
+rm -rf "$ROOT/state/gl.example__g__p"
+SUP_PATH="$AR_PC_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  STUB_CTX_PARTIAL="$AR_PC_FILE" \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 1 \
+  --context-file "$AR_PC_FILE"
+SUP_PATH=""
+if [[ -e "$ROOT/state/gl.example__g__p/pr-9/context.md" ]]; then
+  bad "a truncated context.md landed as the trusted snapshot"
+else ok; fi
+t "run.sh: the retry after a failed render runs with no context, not partial"
+assert_substr "$AR_GL_LOG" "ctx:   none"
+if grep -Fq 'reusing stored context' "$AR_GL_LOG"; then
+  bad "the retry adopted a partial snapshot as stored context"
+else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
 # --- auto-resume: a stale supervisor.pid -----------------------------------
 # A supervisor killed with SIGKILL leaves its pid file behind, and that pid
 # ends up owned by something else. The decoy leads its own session, so a
@@ -3105,6 +3155,53 @@ t "run.sh: the no-primitive inline run proceeds to the normal flow"
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: the no-primitive run starts no supervisor"
 if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a session primitive"; else ok; fi
+
+t "run.sh: setsid without flock or perl runs inline with a warning"
+# A session primitive alone is not enough: supervision without a lock tool
+# would run unlocked, so simultaneous starts could all win.
+AR_SO_BIN="$WORK/ar-setsidonly-bin"
+mkdir -p "$AR_SO_BIN"
+for _l in "$AR_NP_BIN"/*; do
+  ln -s "$(readlink "$_l")" "$AR_SO_BIN/$(basename "$_l")"
+done
+# Only `command -v setsid` consults this — the inline path never executes
+# it — so a dummy keeps the case meaningful on hosts without setsid (macOS).
+if _p=$(command -v setsid 2>/dev/null); then
+  ln -s "$_p" "$AR_SO_BIN/setsid"
+else
+  printf '#!/bin/sh\nexit 0\n' > "$AR_SO_BIN/setsid"
+  chmod +x "$AR_SO_BIN/setsid"
+fi
+rm -rf "$ROOT/state/o__n"
+env -i PATH="$STUBS:$AR_SO_BIN" HOME="$WORK" \
+  bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
+RUN_RC=$?
+assert_dies_with "no flock or perl to hold the single-supervisor lock"
+t "run.sh: the setsid-only inline run proceeds to the normal flow"
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+t "run.sh: the setsid-only run starts no supervisor"
+if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a lock primitive"; else ok; fi
+
+# --- auto-resume: state-path identity collisions -----------------------------
+# The flat state path is not injective: o__c/r and o/c__r share a
+# directory. Every entry point validates the .repo-slug marker before
+# touching the dir, so a colliding repo's --stop or start fails loudly
+# instead of stopping or sharing another repository's supervisor.
+
+t "run.sh: --stop refuses a state dir owned by a colliding identity"
+rm -rf "$ROOT/state/o__c__r"
+mkdir -p "$ROOT/state/o__c__r/pr-1"
+printf 'o__c/r\n' > "$ROOT/state/o__c__r/pr-1/.repo-slug"
+run_run_sh_supervised 1 --repo o/c__r --stop
+assert_dies_with "belongs to 'o__c/r', not 'o/c__r'"
+t "run.sh: the colliding --stop writes no sentinel"
+if [[ -e "$ROOT/state/o__c__r/pr-1/stop" ]]; then
+  bad "the sentinel landed in another repository's state dir"
+else ok; fi
+t "run.sh: a supervised start refuses a colliding state dir"
+run_run_sh_supervised 1 --repo o/c__r
+assert_dies_with "belongs to 'o__c/r', not 'o/c__r'"
+rm -rf "$ROOT/state/o__c__r"
 
 # --- auto-resume: a live supervised run ------------------------------------
 # The git stub blocks in the PR-head fetch and records its own pid, standing
@@ -3241,6 +3338,35 @@ if live_start; then
   if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
   else bad "the agent outlived the supervisor's shutdown"; fi
 else
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+# --- auto-resume: --stop reaches a worker orphaned by a supervisor SIGKILL --
+# A SIGKILLed supervisor leaves its worker tree alive (holding the lock),
+# and the worker never reads the stop sentinel. --stop must find the
+# recorded worker, verify its incarnation, and TERM its process group.
+
+t "run.sh: --stop reaches the worker tree after the supervisor is SIGKILLed"
+if live_start; then
+  kill -9 "$LIVE_SUP" 2>/dev/null
+  live_gone "$LIVE_SUP"
+  if kill -0 "$LIVE_AGENT" 2>/dev/null; then
+    env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+      9 --repo g/p --forge gitlab --host gl.example --stop \
+      > "$WORK/orph.out" 2> "$WORK/orph.err"
+    if live_gone "$LIVE_AGENT" && live_gone "$LIVE_WORKER"; then ok
+    else bad "the orphaned worker/agent survived --stop"; fi
+    t "run.sh: the orphan stop names the worker group it signalled"
+    assert_substr "$WORK/orph.err" "signalled the orphaned worker"
+  else
+    bad "fixture: the agent died with the SIGKILLed supervisor"
+    t "run.sh: the orphan stop names the worker group it signalled"
+    bad "fixture: the agent died with the SIGKILLed supervisor"
+  fi
+else
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: the orphan stop names the worker group it signalled"
   bad "the supervised run never reached the blocking fetch"
 fi
 live_cleanup
@@ -3421,6 +3547,11 @@ if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "front-end exited rc=$RUN_RC"; fi
 
 t "run.sh: the front-end reports the finished run's status"
 assert_substr "$WORK/run.err" "supervisor exited; last worker status: approved"
+
+# The stub thread already carries a completed round 1, so this invocation's
+# first worker resumed at iter 2 — that resume point is its budget baseline.
+t "run.sh: the first worker records the invocation's budget baseline"
+assert_eq "$(awk -F= '/^BASE=/{print $2}' "$AR_LIVE_STATE/worker.progress" 2>/dev/null)" 2
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- auto-resume: the iteration budget spans relaunches ----------------------
@@ -3473,6 +3604,81 @@ env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
   bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
     --dir "$AR_APP_REPO" --restart > "$WORK/rs2.out" 2> "$WORK/rs2.err"
 assert_substr "$WORK/rs2.err" "--restart: bypassing prior APPROVED state — starting fresh at iter 2 (codex first)"
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: --restart treats an approval without a claude reply as a completed round"
+# The natural post-approval state has the same codex>claude count shape as
+# a pending half-step — claude never answers an approval. The persisted
+# verdict is what tells them apart: --restart here means a fresh round.
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-01"
+printf 'APPROVED\n' > "$AR_LIVE_STATE/iter-01/verdict"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-restart-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --restart > "$WORK/rs3.out" 2> "$WORK/rs3.err"
+assert_substr "$WORK/rs3.err" "--restart: bypassing prior APPROVED state — starting fresh at iter 2 (codex first)"
+if grep -Fq 'awaits a claude reply' "$WORK/rs3.err"; then
+  bad "--restart ran claude against a prior approval"
+else ok; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: --restart still resumes the half-step when the verdict is not APPROVED"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-02"
+printf 'CHANGES_REQUESTED\n' > "$AR_LIVE_STATE/iter-02/verdict"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-restart-argv" \
+  STUB_GL_CODEX_ITER=2 STUB_GL_CLAUDE_ITER=1 STUB_FAIL_MIDRUN=1 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --restart > "$WORK/rs4.out" 2> "$WORK/rs4.err"
+assert_substr "$WORK/rs4.err" "--restart: codex iter=2 awaits a claude reply — running the half-step first"
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: a relaunched --restart ends as approved when its own round was approved"
+# The relaunch replays --restart. An APPROVED verdict at or past the
+# invocation's baseline (BASE in worker.progress) was earned by the forced
+# round itself: the run must end approved, not force yet another round.
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-01"
+printf 'APPROVED\n' > "$AR_LIVE_STATE/iter-01/verdict"
+printf 'RUNS=0\nSTREAK=0\nBASE=1\n' > "$AR_LIVE_STATE/worker.progress"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-restart-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --restart > "$WORK/rs5.out" 2> "$WORK/rs5.err"
+assert_substr "$WORK/rs5.err" "--restart: the forced round already ran — codex APPROVED at iter 1; nothing to do"
+t "run.sh: the already-approved --restart relaunch reports approved"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" approved
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: the budget reconciles with summaries already landed --------
+# A claude summary can land right before its worker fails, leaving the
+# persisted RUNS behind the public thread. The relaunch compares its resume
+# point against the invocation's baseline iteration (BASE) and counts every
+# publicly completed round as spent budget.
+
+t "run.sh: a relaunch reconciles the budget with summaries already on the PR"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE"
+printf 'RUNS=0\nSTREAK=0\nBASE=1\n' > "$AR_LIVE_STATE/worker.progress"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 1 > "$WORK/wk2.out" 2> "$WORK/wk2.err"
+assert_substr "$WORK/wk2.err" "reconciling the budget"
+t "run.sh: the reconciled budget runs no extra agent turn"
+if grep -Fq '===== Iteration' "$WORK/wk2.err"; then
+  bad "the worker ran an iteration past the reconciled cap"
+else ok; fi
+t "run.sh: the reconciled run reports max_iterations_reached"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" max_iterations_reached
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------

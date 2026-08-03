@@ -1127,29 +1127,49 @@ repo_ident() {
   fi
 }
 
+# Validate a state dir's identity marker against this invocation's resolved
+# identity; die on a mismatch. $1 = the state dir. A missing/empty marker
+# passes — there is nothing to protect yet. The flat state path is not
+# injective (a literal "__" path component collides), so every entry point
+# that reads or writes a state dir — --stop, the front-end, the supervisor,
+# the worker — must check this BEFORE consulting the sentinel, pid records,
+# or lock, or one repository's stop/start acts on another's supervisor.
+check_state_marker() {
+  local dir="$1" marker="$1/.repo-slug" owner want
+  [[ -s "$marker" ]] || return 0
+  owner=$(<"$marker")
+  want=$(repo_ident)
+  # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
+  # the scheme joined the identity) is AMBIGUOUS: it could belong to the
+  # host's http or https endpoint, and nothing persisted proves which.
+  # Refuse it rather than adopt the current invocation's scheme — silently
+  # attaching one endpoint's sessions/context/history to the other would
+  # recreate the very identity confusion the scheme exists to prevent.
+  # The operator, who knows which endpoint the old runs used, migrates
+  # explicitly (one command, preserving sessions) or cleans the dir.
+  if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
+    die "state dir $dir carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
+  fi
+  [[ "$owner" == "$want" ]] \
+    || die "state dir $dir belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
+}
+
+# Validate an existing marker or stamp ours: the first process to touch a
+# state dir anchors its identity, so later collisions fail loudly instead
+# of sharing pid records, sentinels, and sessions.
+claim_state_marker() {
+  local dir="$1" marker="$1/.repo-slug"
+  if [[ -s "$marker" ]]; then
+    check_state_marker "$dir"
+  else
+    repo_ident > "$marker"
+  fi
+}
+
 ensure_state_dir() {
   STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
   mkdir -p "$STATE_DIR"
-  local marker="$STATE_DIR/.repo-slug" owner want
-  want=$(repo_ident)
-  if [[ -s "$marker" ]]; then
-    owner=$(<"$marker")
-    # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
-    # the scheme joined the identity) is AMBIGUOUS: it could belong to the
-    # host's http or https endpoint, and nothing persisted proves which.
-    # Refuse it rather than adopt the current invocation's scheme — silently
-    # attaching one endpoint's sessions/context/history to the other would
-    # recreate the very identity confusion the scheme exists to prevent.
-    # The operator, who knows which endpoint the old runs used, migrates
-    # explicitly (one command, preserving sessions) or cleans the dir.
-    if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
-      die "state dir $STATE_DIR carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
-    fi
-    [[ "$owner" == "$want" ]] \
-      || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
-  else
-    printf '%s\n' "$want" > "$marker"
-  fi
+  claim_state_marker "$STATE_DIR"
 }
 
 iter_dir() {
