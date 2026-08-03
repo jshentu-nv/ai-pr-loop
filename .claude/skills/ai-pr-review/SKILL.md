@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account.
-argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER]"
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -128,6 +128,19 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--codex-tier TIER` — service (speed) tier for the Codex reviewer, applied
   as `-c service_tier=TIER`. **Default `fast`** (1.5x speed, increased
   usage); `off` leaves the host's codex config untouched.
+- `--auto-resume N` — restart budget for the auto-resume supervisor.
+  **Default 10.** The supervisor runs in its own session and relaunches the
+  loop when a run dies without finishing — killed externally, or an agent
+  turn that errored — resuming at the PR's high-water mark each time. A run
+  that fails before it starts (bad flags, failed preflight) is not
+  relaunched. Lower it if the user wants fewer automatic retries.
+- `--no-auto-resume` — run the loop in the launched process with nothing
+  supervising it. Use when the user wants a single attempt and no restarts
+  ("just one run", "don't retry").
+- `--stop` — write the stop sentinel for this PR and signal its supervisor,
+  then exit. Use when the user says "stop the review", "cancel the bots" and
+  the background task is gone or unresponsive. Runs no preflight and clones
+  nothing, so it is safe to call at any time.
 
 ## Steps
 
@@ -232,6 +245,15 @@ Each iteration can take 2–15 minutes depending on repo size and whether
 the per-agent session is being resumed (cold codex run = slow; resumed =
 fast). Don't poll synchronously; rely on the monitor.
 
+A killed run resumes itself. `run.sh` starts a supervisor in its own
+session and tails its log, so the background task's output is unchanged.
+If the task is reaped (SIGTERM/SIGHUP), the supervisor keeps the review
+going and the loop restarts from the PR's high-water mark — the background
+task ends, but the review does not. Watch for `auto-resume:` lines to see
+restarts, and read the final state from the PR thread or
+`state/<ident>/pr-<N>/supervisor.log` when the task file stops growing. To
+end such a run, call `run.sh <pr> --repo <slug> --stop`.
+
 ### 5. Stream progress with a Monitor
 
 Arm a persistent Monitor that tails the bg output file and emits one
@@ -240,7 +262,7 @@ event per high-signal line:
 ```bash
 tail -F <BG_OUTPUT_FILE> 2>/dev/null \
   | grep -E --line-buffered \
-      "Iteration |codex:|claude:|VERDICT|ISSUES|CLAUDE_TURN|convergence|approved|finished|ERROR|failed|exit "
+      "Iteration |codex:|claude:|VERDICT|ISSUES|CLAUDE_TURN|convergence|approved|finished|ERROR|failed|exit |auto-resume"
 ```
 
 Set `persistent: true` and a `timeout_ms` covering the expected run (e.g.
@@ -272,6 +294,15 @@ orchestrator inspects the PR's existing AI comments and continues from
 the high-water mark. Per-PR session ids for both agents are persisted in
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`, so
 agents keep their internal memory across re-runs too.
+
+The auto-resume supervisor does that re-run for you (budget 10 by
+default): an externally killed run, or a turn that errored, comes back on
+its own. The supervisor stops for good on an end state
+(`approved`, `converged_no_major`, `review_posted`,
+`max_iterations_reached`), on a run that never got past
+config/preflight, when the restart budget runs out, and on a deliberate
+Ctrl-C or `--stop`. Granting more iterations after `max_iterations_reached`
+is a manual re-run.
 
 **Re-reviewing after approval.** If codex previously APPROVED and new
 commits then land on the PR, a plain re-run short-circuits ("codex

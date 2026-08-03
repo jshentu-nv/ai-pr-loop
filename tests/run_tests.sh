@@ -24,6 +24,17 @@
 #     inline notes, replies, banner-quoting prose, and misplaced markers
 #     are excluded; both turn scripts fail when their iteration summary
 #     never landed
+#   - auto-resume: the restart decision table and the backoff curve as
+#     helpers, plus real front-end/supervisor/worker runs — default budget,
+#     inline --no-auto-resume, --print-config/--preflight-only never
+#     supervising, argv forwarded verbatim (newline + quote, flag-shaped
+#     values), the stop sentinel, and budget exhaustion
+#   - auto-resume, live runs: a reaped front-end leaves the supervisor and
+#     its worker running, --stop and a signalled supervisor both reach the
+#     agent under the worker, a stale supervisor.pid is neither signalled
+#     nor obeyed, a second run on the same PR refuses to start, a worker
+#     that finishes reports a terminal status, and a SIGKILLed front-end
+#     leaves no tail behind
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -320,17 +331,30 @@ run_turn() {
   TURN_RC=$?
 }
 
-# run_run_sh [VAR=VALUE ...] [args ...] — run.sh with no GH_TOKEN, so any
-# github-forge invocation that survives flag validation dies in preflight
-# ("GH_TOKEN/GITHUB_TOKEN not set") before touching git or the network.
-# Leading VAR=VALUE words become env for the run (e.g. STUB_GLAB_NO_TOKEN=1).
-run_run_sh() {
+# run_run_sh_supervised [VAR=VALUE ...] [args ...] — run.sh with no GH_TOKEN,
+# so any github-forge invocation that survives flag validation dies in
+# preflight ("GH_TOKEN/GITHUB_TOKEN not set") before touching git or the
+# network. Leading VAR=VALUE words become env for the run (e.g.
+# STUB_GLAB_NO_TOKEN=1). Auto-resume stays at its default, so this drives the
+# front-end + supervisor + worker path; $SUP_PATH prepends stub dirs.
+run_run_sh_supervised() {
   local envs=()
   while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
   # ${arr[@]+...} keeps the empty-array expansion safe under `set -u` on
   # bash 3.2 (stock macOS).
-  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ${envs[@]+"${envs[@]}"} \
+  env -i PATH="${SUP_PATH:-$STUBS:/usr/bin:/bin}" HOME="$WORK" ${envs[@]+"${envs[@]}"} \
     bash "$ROOT/run.sh" "$@" > "$WORK/run.out" 2> "$WORK/run.err"
+  RUN_RC=$?
+}
+SUP_PATH=""
+
+# The same run with --no-auto-resume, so the loop runs in that process and
+# its own stderr carries the failure the assertions read.
+run_run_sh() {
+  local envs=()
+  while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ${envs[@]+"${envs[@]}"} \
+    bash "$ROOT/run.sh" "$@" --no-auto-resume > "$WORK/run.out" 2> "$WORK/run.err"
   RUN_RC=$?
 }
 assert_dies_with() {  # expected stderr substring
@@ -2700,6 +2724,437 @@ assert_prints 'codex: model=gpt-oss-120b effort=off tier=fast'
 t "run.sh: explicit effort wins through run.sh's resolution"
 run_run_sh --repo o/n --codex-model gpt-oss-120b --codex-effort high --print-config
 assert_prints 'codex: model=gpt-oss-120b effort=high tier=fast'
+
+# --- auto-resume: restart decision table -----------------------------------
+# The supervisor reads these files after every worker exit. Each row is
+# exercised on its own fixture dir; the run.sh tests below then drive the
+# same table through real front-end/supervisor/worker processes.
+
+AR="$WORK/ar-state"
+ar_reset() { rm -rf "$AR"; mkdir -p "$AR"; }
+
+t "auto-resume: the stop sentinel outranks a restartable status"
+ar_reset; : > "$AR/stop"; : > "$AR/worker.started"; printf 'codex_error\n' > "$AR/worker.status"
+assert_eq "$(auto_resume_decision "$AR")" "stop stopped by request"
+
+for _st in approved converged_no_major review_posted max_iterations_reached; do
+  t "auto-resume: $_st is terminal"
+  ar_reset; : > "$AR/worker.started"; printf '%s\n' "$_st" > "$AR/worker.status"
+  assert_eq "$(auto_resume_decision "$AR")" "stop worker finished: $_st"
+done
+
+for _st in codex_error claude_error; do
+  t "auto-resume: $_st restarts"
+  ar_reset; : > "$AR/worker.started"; printf '%s\n' "$_st" > "$AR/worker.status"
+  assert_eq "$(auto_resume_decision "$AR")" "restart agent turn failed ($_st)"
+done
+
+t "auto-resume: no status and no start stops (config/preflight error)"
+ar_reset
+assert_eq "$(auto_resume_decision "$AR")" "stop worker failed before it started (config/preflight error)"
+
+t "auto-resume: no status after a start restarts (killed externally)"
+ar_reset; : > "$AR/worker.started"
+assert_eq "$(auto_resume_decision "$AR")" "restart worker died without writing a status (killed externally)"
+
+t "auto-resume: an unrecognized status stops"
+ar_reset; : > "$AR/worker.started"; printf 'weird\n' > "$AR/worker.status"
+assert_eq "$(auto_resume_decision "$AR")" "stop unrecognized worker status: weird"
+
+t "auto-resume: the first restart waits the floor, then doubles to the cap"
+assert_eq "$(auto_resume_backoff 0)" 10
+assert_eq "$(auto_resume_backoff 1)" 20
+assert_eq "$(auto_resume_backoff 4)" 160
+assert_eq "$(auto_resume_backoff 5)" 300
+assert_eq "$(auto_resume_backoff 40)" 300
+
+# --- auto-resume: run.sh roles ---------------------------------------------
+# These start a real detached supervisor. Every case here kills the loop
+# early (missing token, missing context file, failing fetch), so no case
+# reaches an agent turn. $ROOT/state is gitignored; fixtures are removed as
+# each case finishes.
+
+AR_GH_STATE="$ROOT/state/o__n/pr-1"
+
+t "run.sh: auto-resume is on by default and reports its budget"
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n
+assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
+assert_substr "$AR_GH_STATE/supervisor.log" "budget 10 restart(s)"
+
+t "run.sh: a worker that fails before starting is not relaunched"
+assert_substr "$AR_GH_STATE/supervisor.log" "worker failed before it started"
+if grep -Fq 'auto-resume: restart' "$AR_GH_STATE/supervisor.log"; then
+  bad "the supervisor relaunched a config/preflight failure"
+else
+  ok
+fi
+
+t "run.sh: the front-end tails the supervisor log to its own stderr"
+assert_substr "$WORK/run.err" "worker failed before it started"
+
+t "run.sh: an unfinished run exits non-zero"
+if [[ "$RUN_RC" -ne 0 ]]; then ok; else bad "front-end exited 0"; fi
+
+t "run.sh: the supervisor removes its pid file on exit"
+if [[ -e "$AR_GH_STATE/supervisor.pid" ]]; then
+  bad "supervisor.pid survived the supervisor"
+else
+  ok
+fi
+
+t "run.sh: the supervisor hands the worker its argv verbatim (newline + quote)"
+# A --context-file path carrying a newline and a quote: the worker dies on it
+# and echoes the path, so the log proves the value crossed two process
+# boundaries intact.
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n --context-file "$(printf 'ab\n"q" c')"
+assert_substr "$AR_GH_STATE/supervisor.log" "not found or not a regular file: ab"
+if grep -Fxq -- '"q" c' "$AR_GH_STATE/supervisor.log"; then ok; else bad "the newline in the forwarded argument was lost"; fi
+
+t "run.sh: a flag-shaped option value is forwarded, not consumed"
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n --context-file --no-auto-resume
+assert_substr "$AR_GH_STATE/supervisor.log" "not found or not a regular file: --no-auto-resume"
+
+t "run.sh: --auto-resume rejects a non-numeric budget"
+run_run_sh_supervised 1 --repo o/n --auto-resume abc
+assert_dies_with "--auto-resume needs a non-negative count"
+
+t "run.sh: --auto-resume needs a value"
+run_run_sh_supervised 1 --repo o/n --auto-resume
+assert_dies_with "--auto-resume needs a restart budget"
+
+t "run.sh: --auto-resume 0 runs the loop in this process"
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n --auto-resume 0
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+if [[ -e "$ROOT/state/o__n" ]]; then bad "--auto-resume 0 still started a supervisor"; else ok; fi
+
+t "run.sh: --no-auto-resume runs the loop in this process"
+rm -rf "$ROOT/state/o__n"
+run_run_sh 1 --repo o/n
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+if [[ -e "$ROOT/state/o__n" ]]; then bad "--no-auto-resume still started a supervisor"; else ok; fi
+
+t "run.sh: --print-config never starts a supervisor"
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n --print-config
+assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast'
+if [[ -e "$ROOT/state/o__n" ]]; then bad "--print-config started a supervisor"; else ok; fi
+
+t "run.sh: --preflight-only never starts a supervisor"
+rm -rf "$ROOT/state/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
+run_run_sh_supervised STUB_MR_OPEN=1 9 --repo g/p --forge gitlab --preflight-only
+assert_prints 'identity: testuser'
+if [[ -e "$ROOT/state/gitlab.com__g__p" ]]; then bad "--preflight-only started a supervisor"; else ok; fi
+
+t "run.sh: --stop writes the sentinel and exits 0 without a preflight"
+rm -rf "$ROOT/state/o__n"
+run_run_sh_supervised 1 --repo o/n --stop
+if [[ "$RUN_RC" -eq 0 && -e "$AR_GH_STATE/stop" ]]; then ok; else bad "--stop rc=$RUN_RC, sentinel missing"; fi
+assert_substr "$WORK/run.err" "stop: wrote"
+
+t "run.sh: a fresh run clears a prior stop sentinel"
+run_run_sh_supervised 1 --repo o/n
+if [[ -e "$AR_GH_STATE/stop" ]]; then bad "the stale sentinel survived a new invocation"; else ok; fi
+rm -rf "$ROOT/state/o__n"
+
+t "run.sh: a worker killed after it started is relaunched until the budget ends"
+# The git stub fails the PR-head fetch, which happens after the worker
+# recorded worker.started — the row the supervisor exists for. Budget 1, so
+# one restart then a stop.
+AR_BIN="$WORK/ar-bin"
+mkdir -p "$AR_BIN"
+cat > "$AR_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+# Real git everywhere except the PR-head fetch, which fails.
+for a in "$@"; do [[ "$a" == "fetch" ]] && exit 1; done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$AR_BIN/git"
+AR_REPO="$WORK/ar-repo"
+git init -q "$AR_REPO"
+git -C "$AR_REPO" remote add origin https://gl.example/g/p.git
+rm -rf "$ROOT/state/gl.example__g__p"
+SUP_PATH="$AR_BIN:$STUBS:/usr/bin:/bin"
+run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 1
+SUP_PATH=""
+AR_GL_LOG="$ROOT/state/gl.example__g__p/pr-9/supervisor.log"
+assert_substr "$AR_GL_LOG" "restart 1/1 in 1s — worker died without writing a status"
+t "run.sh: the restart budget stops the loop"
+assert_substr "$AR_GL_LOG" "budget exhausted after 1 restart(s)"
+t "run.sh: a supervised run that never finished exits non-zero"
+if [[ "$RUN_RC" -ne 0 ]]; then ok; else bad "front-end exited 0"; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: a stale supervisor.pid -----------------------------------
+# A supervisor killed with SIGKILL leaves its pid file behind, and that pid
+# ends up owned by something else. The decoy leads its own session, so a
+# group kill aimed at it would take down a whole unrelated process group.
+
+t "run.sh: a stale supervisor.pid does not block a fresh run"
+rm -rf "$ROOT/state/o__n"
+mkdir -p "$AR_GH_STATE"
+setsid sleep 120 &
+AR_DECOY=$!
+printf '%s\n' "$AR_DECOY" > "$AR_GH_STATE/supervisor.pid"
+run_run_sh_supervised 1 --repo o/n
+assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
+
+t "run.sh: --stop leaves a supervisor.pid naming an unrelated process alone"
+printf '%s\n' "$AR_DECOY" > "$AR_GH_STATE/supervisor.pid"
+run_run_sh_supervised 1 --repo o/n --stop
+if [[ "$RUN_RC" -eq 0 ]] && kill -0 "$AR_DECOY" 2>/dev/null; then ok
+else bad "--stop signalled a process that is not this loop's supervisor"; fi
+
+t "run.sh: --stop reports no supervisor when the pid file is stale"
+assert_substr "$WORK/run.err" "stop: no live supervisor"
+kill "$AR_DECOY" 2>/dev/null
+wait "$AR_DECOY" 2>/dev/null
+rm -rf "$ROOT/state/o__n"
+
+# --- auto-resume: a live supervised run ------------------------------------
+# The git stub blocks in the PR-head fetch and records its own pid, standing
+# in for an agent turn in progress. That pid is how these cases tell whether a
+# stop reached below the worker's shell.
+
+AR_LIVE_BIN="$WORK/ar-live-bin"
+mkdir -p "$AR_LIVE_BIN"
+cat > "$AR_LIVE_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+# Real git everywhere except the PR-head fetch: that one records its pid and
+# blocks, the shape of a worker with an agent CLI under it.
+for a in "$@"; do
+  if [[ "$a" == "fetch" ]]; then
+    printf '%s\n' "$$" > "$STUB_FETCH_PID_FILE"
+    exec sleep 120
+  fi
+done
+exec /usr/bin/git "$@"
+EOF
+chmod +x "$AR_LIVE_BIN/git"
+AR_LIVE_REPO="$WORK/ar-live-repo"
+git init -q "$AR_LIVE_REPO"
+git -C "$AR_LIVE_REPO" remote add origin https://gl.example/g/p.git
+AR_LIVE_STATE="$ROOT/state/gl.example__g__p/pr-9"
+AR_LIVE_AGENT_FILE="$WORK/ar-live-agent.pid"
+LIVE_FRONT=''; LIVE_SUP=''; LIVE_WORKER=''; LIVE_AGENT=''
+
+live_wait() {  # path — up to 30s for it to appear
+  local i
+  for (( i = 0; i < 300; i++ )); do [[ -e "$1" ]] && return 0; sleep 0.1; done
+  return 1
+}
+live_gone() {  # pid — up to 15s for it to exit
+  local i
+  for (( i = 0; i < 150; i++ )); do kill -0 "$1" 2>/dev/null || return 0; sleep 0.1; done
+  return 1
+}
+# Start a supervised run in its own session and wait for the worker to reach
+# the blocking fetch. LIVE_FRONT leads that session, so a process-group signal
+# to it is what a terminal's Ctrl-C or a task runner's reap looks like.
+live_start() {  # [extra PATH dir]
+  local extra="${1:-}"
+  rm -rf "$ROOT/state/gl.example__g__p" "$AR_LIVE_AGENT_FILE"
+  setsid env -i PATH="${extra:+$extra:}$AR_LIVE_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+    STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+    STUB_FETCH_PID_FILE="$AR_LIVE_AGENT_FILE" \
+    bash "$ROOT/run.sh" https://gl.example/g/p/-/merge_requests/9 \
+      --dir "$AR_LIVE_REPO" \
+    > "$WORK/live.out" 2> "$WORK/live.err" &
+  LIVE_FRONT=$!
+  [[ "$(ps -o pgid= -p "$LIVE_FRONT" 2>/dev/null | tr -d ' ')" == "$LIVE_FRONT" ]] || return 1
+  live_wait "$AR_LIVE_AGENT_FILE" || return 1
+  LIVE_AGENT=$(head -1 "$AR_LIVE_AGENT_FILE")
+  LIVE_WORKER=$(ps -o ppid= -p "$LIVE_AGENT" 2>/dev/null | tr -d ' ')
+  LIVE_SUP=$(head -1 "$AR_LIVE_STATE/supervisor.pid" 2>/dev/null)
+  [[ -n "$LIVE_AGENT" && -n "$LIVE_WORKER" && -n "$LIVE_SUP" ]]
+}
+live_cleanup() {
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+    9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
+  kill "$LIVE_FRONT" 2>/dev/null
+  wait "$LIVE_FRONT" 2>/dev/null
+  kill "$LIVE_AGENT" 2>/dev/null
+  rm -rf "$ROOT/state/gl.example__g__p"
+}
+
+t "run.sh: the front-end names the live supervisor it started"
+if live_start; then
+  assert_substr "$WORK/live.err" "auto-resume: supervisor pid $LIVE_SUP,"
+else
+  bad "the supervised run never reached the blocking fetch"
+fi
+
+t "run.sh: a process-group TERM on the front-end leaves the supervisor running"
+kill -TERM -- "-$LIVE_FRONT" 2>/dev/null
+wait "$LIVE_FRONT" 2>/dev/null
+if kill -0 "$LIVE_SUP" 2>/dev/null && kill -0 "$LIVE_AGENT" 2>/dev/null; then ok
+else bad "the reaped front-end took the supervisor or the agent with it"; fi
+
+t "run.sh: the reaped front-end says where the run continues"
+assert_substr "$WORK/live.err" "front-end signalled; supervisor pid $LIVE_SUP keeps running"
+
+t "run.sh: a second run refuses to start while a supervisor is live"
+run_run_sh_supervised STUB_MR_OPEN=1 \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_LIVE_REPO"
+assert_dies_with "a supervisor for this PR is already running"
+
+t "run.sh: --stop ends the supervisor and the agent below the worker"
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+  9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
+if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
+else bad "the supervisor or the agent survived --stop"; fi
+live_cleanup
+
+t "run.sh: signalling the supervisor alone still ends the agent below the worker"
+if live_start; then
+  kill -TERM "$LIVE_SUP" 2>/dev/null
+  if live_gone "$LIVE_SUP" && live_gone "$LIVE_AGENT"; then ok
+  else bad "the agent outlived the supervisor's shutdown"; fi
+else
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+t "run.sh: the stop sentinel stops a live supervisor instead of relaunching"
+if live_start; then
+  : > "$AR_LIVE_STATE/stop"
+  kill -TERM "$LIVE_WORKER" 2>/dev/null
+  if live_gone "$LIVE_SUP"; then
+    assert_substr "$AR_LIVE_STATE/supervisor.log" "stopping — stopped by request"
+  else
+    bad "the supervisor ignored the stop sentinel"
+  fi
+  t "run.sh: a killed worker's agent does not outlive it"
+  if live_gone "$LIVE_AGENT"; then ok
+  else bad "the agent survived the worker the supervisor is done with"; fi
+else
+  bad "the supervised run never reached the blocking fetch"
+  t "run.sh: a killed worker's agent does not outlive it"
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+t "run.sh: a SIGKILLed front-end leaves no tail behind"
+if live_start; then
+  LIVE_TAIL=$(ps -o pid=,ppid=,args= 2>/dev/null \
+              | awk -v p="$LIVE_FRONT" '$2 == p && /tail/ { print $1; exit }')
+  kill -9 "$LIVE_FRONT" 2>/dev/null
+  wait "$LIVE_FRONT" 2>/dev/null
+  if [[ -z "$LIVE_TAIL" ]]; then bad "no tail found under the front-end"
+  elif live_gone "$LIVE_TAIL"; then ok
+  else bad "the tail outlived the front-end that started it"; fi
+else
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+t "run.sh: the front-end reads the supervisor pid when the log line wins the race"
+# The startup poll checks the pid file, then greps the log. A slow tail lets
+# the supervisor write both while that grep is in flight, so the poll returns
+# on the log line — and must still come back with the pid.
+AR_RACE_BIN="$WORK/ar-race-bin"
+mkdir -p "$AR_RACE_BIN"
+cat > "$AR_RACE_BIN/tail" <<'EOF'
+#!/usr/bin/env bash
+sleep 0.3
+exec /usr/bin/tail "$@"
+EOF
+chmod +x "$AR_RACE_BIN/tail"
+if live_start "$AR_RACE_BIN"; then
+  assert_substr "$WORK/live.err" "auto-resume: supervisor pid $LIVE_SUP,"
+else
+  bad "the supervised run never reached the blocking fetch"
+fi
+live_cleanup
+
+# --- auto-resume: a stop that lands before the supervisor is up ------------
+# Ctrl-C in the first moments of a run writes the sentinel while the
+# supervisor is still starting, so the supervisor reads it before each worker.
+
+t "run.sh: the front-end arms its Ctrl-C trap before it spawns the supervisor"
+AR_TRAP_LINE=$(grep -n '^  trap frontend_interrupt INT$' "$ROOT/run.sh" | head -1 | cut -d: -f1)
+AR_SPAWN_LINE=$(grep -n '^  spawn_detached bash ' "$ROOT/run.sh" | head -1 | cut -d: -f1)
+if [[ -n "$AR_TRAP_LINE" && -n "$AR_SPAWN_LINE" ]] && (( AR_TRAP_LINE < AR_SPAWN_LINE )); then ok
+else bad "a Ctrl-C between the spawn and the trap would orphan the supervisor (trap line ${AR_TRAP_LINE:-none}, spawn line ${AR_SPAWN_LINE:-none})"; fi
+
+t "run.sh: a supervisor that starts on a stop sentinel runs no worker"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE"
+: > "$AR_LIVE_STATE/stop"
+env -i PATH="$AR_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" STUB_MR_OPEN=1 \
+  bash "$ROOT/run.sh" --_supervise --auto-resume 1 \
+    https://gl.example/g/p/-/merge_requests/9 --dir "$AR_LIVE_REPO" \
+  > "$WORK/sup.out" 2> "$WORK/sup.err"
+if grep -Fq 'stopping — stopped by request' "$WORK/sup.err" \
+   && [[ ! -e "$AR_LIVE_STATE/worker.started" ]]; then ok
+else bad "the supervisor ran a worker although the run was already stopped"; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- auto-resume: a run that reaches a terminal status ----------------------
+# The only case here that gets past an agent turn: the git stub serves the PR
+# head from a local bare repo and the codex stub approves, so the worker
+# reports a terminal status the supervisor must not relaunch.
+
+AR_APP_BIN="$WORK/ar-approve-bin"
+mkdir -p "$AR_APP_BIN"
+cat > "$AR_APP_BIN/git" <<'EOF'
+#!/usr/bin/env bash
+# Real git, with the PR-head fetch served by a local bare repo (origin's URL
+# names the MR's project, which no test may reach).
+args=(); fetching=0
+for a in "$@"; do [[ "$a" == "fetch" ]] && fetching=1; done
+for a in "$@"; do
+  if (( fetching == 1 )) && [[ "$a" == "origin" ]]; then a="$STUB_GIT_REMOTE"; fi
+  args+=("$a")
+done
+exec /usr/bin/git "${args[@]}"
+EOF
+chmod +x "$AR_APP_BIN/git"
+AR_APP_REMOTE="$WORK/ar-approve-remote.git"
+AR_APP_SEED="$WORK/ar-approve-seed"
+AR_APP_REPO="$WORK/ar-approve-repo"
+git init -q --bare "$AR_APP_REMOTE"
+git init -q "$AR_APP_SEED"
+git -C "$AR_APP_SEED" symbolic-ref HEAD refs/heads/main
+printf 'seed\n' > "$AR_APP_SEED/f.txt"
+git -C "$AR_APP_SEED" add f.txt
+git -C "$AR_APP_SEED" -c user.email=t@example -c user.name=t commit -q -m seed
+git -C "$AR_APP_SEED" branch feat/x
+git -C "$AR_APP_SEED" push -q "$AR_APP_REMOTE" main feat/x
+git -C "$AR_APP_REMOTE" symbolic-ref HEAD refs/heads/main
+git clone -q "$AR_APP_REMOTE" "$AR_APP_REPO"
+git -C "$AR_APP_REPO" checkout -q feat/x
+git -C "$AR_APP_REPO" remote set-url origin https://gl.example/g/p.git
+
+t "run.sh: a worker that finishes records its status"
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$WORK/ar-approve-codex/sessions"
+SUP_PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin"
+# Budget 1 at a 1s backoff: an approved run must not relaunch at all, and a
+# fixture that breaks stops in seconds instead of backing off for minutes.
+run_run_sh_supervised STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" \
+  AUTO_RESUME_BACKOFF_FLOOR=1 AUTO_RESUME_BACKOFF_CAP=1 \
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_APP_REPO" --auto-resume 1
+SUP_PATH=""
+AR_APP_LOG="$AR_LIVE_STATE/supervisor.log"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" approved
+
+t "run.sh: a terminal status stops the supervisor without a relaunch"
+if grep -Fq 'stopping — worker finished: approved' "$AR_APP_LOG" \
+   && ! grep -Fq 'auto-resume: restart' "$AR_APP_LOG"; then ok
+else bad "the supervisor did not stop on a terminal status ($(tail -2 "$AR_APP_LOG" | tr '\n' ' '))"; fi
+
+t "run.sh: a supervised run that finished exits 0"
+if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "front-end exited rc=$RUN_RC"; fi
+
+t "run.sh: the front-end reports the finished run's status"
+assert_substr "$WORK/run.err" "supervisor exited; last worker status: approved"
+rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------
 # The agent prompts are one source per agent, shared by every forge. These

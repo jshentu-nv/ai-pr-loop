@@ -1017,6 +1017,63 @@ resolve_codex_effort() {
   esac
 }
 
+# --- Auto-resume ----------------------------------------------------------------
+#
+# The supervisor in run.sh decides what to do after each worker exit from the
+# status files in the per-PR state dir (see the protocol comment in run.sh).
+# Both helpers are pure so the decision table and the backoff curve are
+# testable on their own.
+
+AUTO_RESUME_BACKOFF_FLOOR="${AUTO_RESUME_BACKOFF_FLOOR:-10}"   # seconds before the first restart
+AUTO_RESUME_BACKOFF_CAP="${AUTO_RESUME_BACKOFF_CAP:-300}"      # ceiling for the doubling
+AUTO_RESUME_LONG_RUN="${AUTO_RESUME_LONG_RUN:-600}"            # a worker living longer than this is not a crash loop
+
+# What to do after a worker exit. $1 = the per-PR state dir. Prints
+# "<stop|restart> <reason>".
+#
+#   stop sentinel present         the operator asked for this
+#   terminal status               the loop reached an end state
+#   codex_error / claude_error    an agent turn failed; a fresh run picks up
+#                                 at the PR's high-water mark
+#   no status, worker started     killed externally mid-run
+#   no status, never started      bad flags or a failed preflight; relaunching
+#                                 would loop forever on the same error
+auto_resume_decision() {
+  local d="$1" status=''
+  if [[ -e "$d/stop" ]]; then
+    printf 'stop stopped by request\n'
+    return 0
+  fi
+  if [[ -f "$d/worker.status" ]]; then
+    status=$(head -1 "$d/worker.status" 2>/dev/null) || status=''
+  fi
+  case "$status" in
+    approved|converged_no_major|review_posted|max_iterations_reached)
+      printf 'stop worker finished: %s\n' "$status" ;;
+    codex_error|claude_error)
+      printf 'restart agent turn failed (%s)\n' "$status" ;;
+    '')
+      if [[ -e "$d/worker.started" ]]; then
+        printf 'restart worker died without writing a status (killed externally)\n'
+      else
+        printf 'stop worker failed before it started (config/preflight error)\n'
+      fi ;;
+    *)
+      printf 'stop unrecognized worker status: %s\n' "$status" ;;
+  esac
+}
+
+# Seconds to wait before restart number $1 (0-based) of a crash loop: the
+# floor, doubled per attempt, capped.
+auto_resume_backoff() {
+  local n="$1" w="$AUTO_RESUME_BACKOFF_FLOOR"
+  while (( n > 0 && w < AUTO_RESUME_BACKOFF_CAP )); do
+    w=$(( w * 2 )); n=$(( n - 1 ))
+  done
+  if (( w > AUTO_RESUME_BACKOFF_CAP )); then w="$AUTO_RESUME_BACKOFF_CAP"; fi
+  printf '%s\n' "$w"
+}
+
 # --- Repo identity / state dirs -------------------------------------------------
 
 # Canonical directory name for the repo's managed checkout and state: path

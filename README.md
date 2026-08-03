@@ -332,6 +332,10 @@ The loop exits when one of:
 - The iteration cap (`--max`) is hit → exit 1.
 - Either agent's turn errors → exit 1.
 
+An errored turn and a killed run are both restarted by the auto-resume
+supervisor (below) until it reaches one of the exit-0 states or spends its
+budget.
+
 ## Review-only mode
 
 Pass `--review-only` to run a single Codex review turn and stop, without
@@ -395,6 +399,57 @@ Per-PR session ids for both agents are stored under
 (GitLab: `state/<host>__<slug...>/...`), so resumed runs also restore the
 agents' internal memory.
 
+## Auto-resume
+
+A killed run restarts itself. `run.sh` starts a supervisor in its own
+session and then tails its log in the foreground, so what you see is the
+same as before. When the loop dies without finishing, the supervisor
+launches it again; each relaunch picks up at the PR's high-water mark
+above.
+
+On by default, budget 10 restarts.
+
+| After a run ends | Auto-resume |
+|---|---|
+| `approved`, `converged_no_major`, `review_posted`, `max_iterations_reached` | Stops — the loop reached an end state. |
+| `codex_error` / `claude_error` | Restarts; the failed turn runs again. |
+| Died with no final status (external `SIGTERM`/`SIGHUP`, OOM kill) | Restarts. |
+| Died before it started (bad flags, failed preflight, closed PR) | Stops — relaunching would loop on the same error. |
+| Stop sentinel present, or the budget is spent | Stops. |
+
+Backoff between restarts is 10s, doubling to a 300s cap, back to 10s
+after a run that lasted more than ten minutes.
+
+The supervisor is an ordinary process on the host, so a reboot ends the
+review along with it — there is no boot-time hook. Re-run the same
+command afterwards; it continues from the PR's high-water mark.
+
+**Stopping it.** Ctrl-C on the foreground command is a deliberate stop: it
+writes the stop sentinel and takes the supervisor and the running turn
+down with it. Nothing resumes. An external `SIGTERM`/`SIGHUP` — a task
+runner reaping the shell, a closed terminal — kills only the foreground
+command; the supervisor is in another session and keeps the review going.
+To stop such a run from elsewhere:
+
+```bash
+~/ai-pr-loop/run.sh 42 --repo owner/repo --stop
+# GitLab: add --forge gitlab --host <host>
+```
+
+`--stop` runs no preflight and clones nothing. The next ordinary run
+clears the sentinel.
+
+**Where it logs.** `state/<owner>__<name>/pr-<N>/supervisor.log` (GitLab:
+`state/<host>__<slug...>/...`), appended across invocations. Restart lines
+carry the word `auto-resume`. The same directory holds `supervisor.pid`
+while a supervisor is live, plus `worker.started` / `worker.status` — the
+files the restart decision reads.
+
+Pass `--no-auto-resume` to run the loop in the invoking process with
+nothing supervising it, or `--auto-resume N` to change the budget (`0`
+disables). `--print-config` and `--preflight-only` never start a
+supervisor.
+
 ## Direct CLI (advanced)
 
 The skill is just a wrapper around `run.sh`. You can drive it directly:
@@ -430,6 +485,12 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 # reviewer gpt-5.6-sol @ ultra on the fast tier):
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh --codex-effort high
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5 --codex-tier off
+
+# Auto-resume (on by default, budget 10): change the budget, turn it off,
+# or stop a supervisor that is running elsewhere:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --auto-resume 3
+~/ai-pr-loop/run.sh 42 --repo owner/repo --no-auto-resume
+~/ai-pr-loop/run.sh 42 --repo owner/repo --stop
 ```
 
 Iteration artifacts (prompts, full stdout/stderr, fetched thread, codex
@@ -444,7 +505,8 @@ after the fact.
 record their argv, and assertions check the recorded vectors (model /
 effort / tier mapping, `off` omission, the adaptive Codex effort default,
 explicit-level precedence, fresh-vs-resumed session flags) plus `run.sh`'s
-flag validation.
+flag validation. The auto-resume cases start real supervisors against the
+same stubs; every one of them dies before an agent turn.
 
 ```bash
 ~/ai-pr-loop/tests/run_tests.sh
