@@ -154,16 +154,17 @@
 #                 relaunch resumes from the PR's high-water mark. A run that
 #                 fails before it starts (bad flags, failed preflight) is not
 #                 relaunched. A relaunch keeps the invocation's remaining
-#                 --max/--converge budget and drops the context flags
-#                 (--context*, --clear-context), reusing the context
-#                 persisted at launch. The supervisor logs to
+#                 --max/--converge budget; once a worker lands the context
+#                 snapshot it drops the context flags (--context*,
+#                 --clear-context) and reuses the persisted context, and
+#                 before that it replays them. The supervisor logs to
 #                 state/<ident>/pr-<N>/supervisor.log; this command tails
 #                 that log, so foreground output is the same as an inline
 #                 run. --print-config and --preflight-only always run
-#                 inline. Requires setsid or perl for the detached
-#                 session AND flock or perl for the single-supervisor
-#                 lock; missing either, the loop runs inline, with a
-#                 warning.
+#                 inline. Requires setsid with -f support (util-linux) or
+#                 perl for the detached session AND flock or perl for the
+#                 single-supervisor lock; missing either, the loop runs
+#                 inline, with a warning.
 #   --no-auto-resume
 #                 Run the loop in this process. Nothing restarts it.
 #   --stop        Write the stop sentinel for this PR and signal its
@@ -756,7 +757,11 @@ fi
 
 if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 && PREFLIGHT_ONLY == 0 )); then
   if ! have_session_primitive; then
-    log "auto-resume: disabled — neither setsid nor perl found for a detached session; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    if command -v setsid >/dev/null 2>&1; then
+      log "auto-resume: disabled — this setsid does not support -f (fork/reparent) and perl is missing, so no detached session is possible; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    else
+      log "auto-resume: disabled — neither setsid nor perl found for a detached session; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    fi
     AUTO_RESUME=0
   elif ! have_lock_primitive; then
     log "auto-resume: disabled — no flock or perl to hold the single-supervisor lock; running the loop in this process (an external kill ends the review and nothing resumes it)"
@@ -1232,6 +1237,32 @@ LAST_CODEX=$(latest_ai_comment_iter codex)
 LAST_CLAUDE=$(latest_ai_comment_iter claude)
 LAST_CODEX="${LAST_CODEX:-0}"
 LAST_CLAUDE="${LAST_CLAUDE:-0}"
+
+# A codex run can crash after its summary POSTs but before the thread read
+# that gates canonical persistence succeeds — its stdout record survives as
+# provisional *.stdout files. The fetch above just confirmed which summaries
+# are public: adopt the provisional counts/verdict for the landed iteration
+# when the canonical files are missing, so convergence accounting and the
+# verdict-aware resume see what the PR already shows. Provisional files of
+# an iteration whose summary never landed are never adopted.
+adopt_landed_codex_artifacts() {
+  local it="$1" d
+  (( it > 0 )) || return 0
+  d="$STATE_DIR/$(printf 'iter-%02d' "$it")"
+  # Copy-then-rename: a kill mid-adoption must not leave a truncated
+  # canonical file that would block a later retry of the same adoption.
+  if [[ ! -f "$d/issue_counts" && -f "$d/issue_counts.stdout" ]]; then
+    cp "$d/issue_counts.stdout" "$d/issue_counts.tmp.$$"
+    mv -f "$d/issue_counts.tmp.$$" "$d/issue_counts"
+    log "resume: adopted stdout issue counts for landed codex iter $it"
+  fi
+  if [[ ! -f "$d/verdict" && -f "$d/verdict.stdout" ]]; then
+    cp "$d/verdict.stdout" "$d/verdict.tmp.$$"
+    mv -f "$d/verdict.tmp.$$" "$d/verdict"
+    log "resume: adopted stdout verdict for landed codex iter $it"
+  fi
+}
+adopt_landed_codex_artifacts "$LAST_CODEX"
 
 RESUME_CLAUDE_FIRST=0
 if (( RESTART == 1 )) && (( LAST_CODEX > 0 || LAST_CLAUDE > 0 )); then

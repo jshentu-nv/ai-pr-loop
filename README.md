@@ -418,8 +418,9 @@ refuses. `supervisor.pid` records the pid together with its start time,
 so a recycled pid is neither signalled by `--stop` nor blocks a new run;
 `worker.pid` records the live worker the same way, so `--stop` can still
 tear down a worker orphaned by a SIGKILLed supervisor. Auto-resume needs
-`setsid` or `perl` for the detached session and `flock` or `perl` for the
-lock; missing either, the loop runs inline, with a warning.
+`setsid` with `-f` support (util-linux) or `perl` for the detached,
+reparented session, and `flock` or `perl` for the lock; missing either,
+the loop runs inline, with a warning.
 
 | After a run ends | Auto-resume |
 |---|---|

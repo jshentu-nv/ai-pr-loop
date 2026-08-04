@@ -1154,13 +1154,43 @@ check_state_marker() {
     || die "state dir $dir belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
 }
 
+# mkdir-elected marker write, for filesystems without hard links and for
+# repairing a pre-existing empty marker. mkdir is atomic everywhere; the
+# winner PUBLISHES BY RENAME of a complete temp while holding the election
+# dir, so no observer ever sees a partial or zero-byte marker from this
+# path — a bare `repo_ident > marker` would expose an empty file between
+# the open and the write, which a concurrent claimant would treat as
+# unanchored. The winner writes only when no identity has landed; a loser
+# waits for the marker. A marker that never appears means a claimant died
+# inside the election — refuse with a cleanup hint rather than run
+# unanchored.
+claim_marker_election() {
+  local dir="$1" marker="$1/.repo-slug" etmp _w
+  if mkdir "$marker.lck" 2>/dev/null; then
+    if [[ ! -s "$marker" ]]; then
+      etmp="$marker.elect.$$"
+      repo_ident > "$etmp"
+      mv -f "$etmp" "$marker"
+    fi
+    rmdir "$marker.lck" 2>/dev/null || true
+  else
+    for (( _w = 0; _w < 50; _w++ )); do
+      [[ -s "$marker" ]] && break
+      sleep 0.1
+    done
+    [[ -s "$marker" ]] || die "state identity election for $dir did not complete (a claimant died mid-election?); remove $marker.lck and re-run after confirming no other run is live on this dir"
+  fi
+}
+
 # Validate an existing marker or stamp ours: the first process to touch a
 # state dir anchors its identity, so later collisions fail loudly instead
 # of sharing pid records, sentinels, and sessions. Election is atomic —
 # the marker is written aside and hard-linked into place, so it only ever
 # appears with its full content and ln(2) picks exactly one winner among
 # simultaneous first-touchers; every loser falls through and validates the
-# winner's identity like any later toucher.
+# winner's identity like any later toucher. Where ln cannot elect, and for
+# a pre-existing empty marker, claim_marker_election takes over with the
+# same publish-complete-or-not-at-all guarantee.
 claim_state_marker() {
   local dir="$1" marker="$1/.repo-slug" tmp
   tmp="$marker.claim.$$"
@@ -1172,33 +1202,10 @@ claim_state_marker() {
     fi
     rm -f "$tmp"
     if [[ ! -e "$marker" ]]; then
-      # ln failed with the marker still absent: this filesystem has no
-      # hard links. Elect through mkdir instead — atomic everywhere. The
-      # winner writes the marker only when no identity has landed (a
-      # previous winner may have completed and released before this
-      # election); a loser waits for the marker. Everyone then falls
-      # through to validation, so a late second-election winner checks
-      # the first winner's identity instead of overwriting it. A marker
-      # that never appears means a claimant died inside the election —
-      # refuse with a cleanup hint rather than run unanchored.
-      local _w
-      if mkdir "$marker.lck" 2>/dev/null; then
-        [[ -s "$marker" ]] || repo_ident > "$marker"
-        rmdir "$marker.lck" 2>/dev/null || true
-      else
-        for (( _w = 0; _w < 50; _w++ )); do
-          [[ -s "$marker" ]] && break
-          sleep 0.1
-        done
-        [[ -s "$marker" ]] || die "state identity election for $dir did not complete (a claimant died mid-election?); remove $marker.lck and re-run after confirming no other run is live on this dir"
-      fi
+      claim_marker_election "$dir"
     fi
   elif [[ ! -s "$marker" ]]; then
-    # An empty marker anchors nothing and would pass every check. Replace
-    # it whole — mv is atomic, so no reader ever sees a partial identity.
-    repo_ident > "$tmp"
-    mv -f "$tmp" "$marker"
-    return 0
+    claim_marker_election "$dir"
   fi
   check_state_marker "$dir"
 }

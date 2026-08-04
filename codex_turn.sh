@@ -161,6 +161,14 @@ esac
 # unattended operation; mutations to GitHub are expected.) `codex exec resume`
 # doesn't accept --cd or --color, so cd via subshell and use NO_COLOR=1 for
 # both fresh and resume paths.
+# A previous attempt at this iteration may have left provisional stdout
+# records. Clear them before the CLI runs: if this attempt is killed
+# after its summary POSTs but before its own parse lands, resume must
+# find nothing to adopt (and degrade conservatively) rather than adopt
+# the PREVIOUS attempt's stdout as this landed review's record — a stale
+# APPROVED would silently end the review.
+rm -f "$ID/issue_counts.stdout" "$ID/verdict.stdout"
+
 set +e
 ( cd "$REPO_DIR" && NO_COLOR=1 codex exec \
     "${CODEX_SUBCMD[@]}" \
@@ -192,48 +200,65 @@ log "codex: iter $ITER — exit $RC"
 # last, after every inline note). Trusting stdout alone is not enough: a run
 # can print its verdict even though the summary POST failed, or die after
 # posting only inline notes. Refetch the thread and require this iteration's
-# summary before recording any counts or verdict — failing without one means
-# the next invocation re-reviews at this same iteration, since the resume
-# high-water also only counts summaries. A summary that LANDED is a real,
-# public review even when the CLI then exited nonzero: persist its counts
-# and verdict before failing the turn, so a relaunch's resume accounts for
-# what the PR already shows (convergence included) instead of losing it.
+# summary before recording any CANONICAL counts or verdict — failing without
+# one means the next invocation re-reviews at this same iteration, since the
+# resume high-water also only counts summaries. A summary that LANDED is a
+# real, public review even when the CLI then exited nonzero: persist its
+# counts and verdict before failing the turn, so a relaunch's resume
+# accounts for what the PR already shows (convergence included).
+#
+# The stdout parse is ALWAYS persisted provisionally (*.stdout files) first:
+# this verification read can itself fail transiently right after a POST that
+# landed, and the durable stdout record must survive that. Resume adopts the
+# provisional files only once the public high-water confirms the summary
+# (adopt_landed_codex_artifacts in run.sh) — a run whose POST truly never
+# landed leaves provisional files that nothing ever adopts.
 SUMMARY_LANDED=0
 verify_ai_summary codex "$ITER" && SUMMARY_LANDED=1
 
-VERDICT=''
-if (( SUMMARY_LANDED == 1 )); then
-  # Parse issue counts (last occurrence wins). Missing line → counts
-  # unknown, orchestrator treats convergence as not-met.
-  ISSUES_LINE=$(grep -Eo '\[CODEX_ISSUES: BLOCKER=[0-9]+ MAJOR=[0-9]+ NIT=[0-9]+\]' \
-                  "$ID/codex.stdout" | tail -1 || true)
-  if [[ -n "$ISSUES_LINE" ]]; then
-    BLOCKER_N=$(grep -Eo 'BLOCKER=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-    MAJOR_N=$(grep -Eo 'MAJOR=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-    NIT_N=$(grep -Eo 'NIT=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
-    printf 'BLOCKER=%s\nMAJOR=%s\nNIT=%s\n' "$BLOCKER_N" "$MAJOR_N" "$NIT_N" \
-      > "$ID/issue_counts"
-    log "codex: issue counts BLOCKER=$BLOCKER_N MAJOR=$MAJOR_N NIT=$NIT_N"
-  else
-    log "codex: no [CODEX_ISSUES: ...] marker found — convergence check disabled for this iter"
-  fi
+# Parse issue counts (last occurrence wins). Missing line → counts unknown,
+# orchestrator treats convergence as not-met.
+ISSUES_LINE=$(grep -Eo '\[CODEX_ISSUES: BLOCKER=[0-9]+ MAJOR=[0-9]+ NIT=[0-9]+\]' \
+                "$ID/codex.stdout" | tail -1 || true)
+if [[ -n "$ISSUES_LINE" ]]; then
+  BLOCKER_N=$(grep -Eo 'BLOCKER=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+  MAJOR_N=$(grep -Eo 'MAJOR=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+  NIT_N=$(grep -Eo 'NIT=[0-9]+' <<<"$ISSUES_LINE" | grep -Eo '[0-9]+')
+  printf 'BLOCKER=%s\nMAJOR=%s\nNIT=%s\n' "$BLOCKER_N" "$MAJOR_N" "$NIT_N" \
+    > "$ID/issue_counts.stdout"
+  log "codex: issue counts BLOCKER=$BLOCKER_N MAJOR=$MAJOR_N NIT=$NIT_N"
+else
+  rm -f "$ID/issue_counts.stdout"
+  log "codex: no [CODEX_ISSUES: ...] marker found — convergence check disabled for this iter"
+fi
 
-  # Parse the verdict from stdout (last occurrence wins). No marker — e.g.
-  # stdout truncated by the failure that also produced a nonzero exit —
-  # records the conservative CHANGES_REQUESTED, so resume treats the landed
-  # review as a pending half-step rather than guessing an approval.
-  VERDICT=$(grep -Eo '\[CODEX_VERDICT: (APPROVED|CHANGES_REQUESTED)\]' \
-              "$ID/codex.stdout" | tail -1 || true)
-  if [[ "$VERDICT" == *APPROVED* ]]; then
-    echo "APPROVED" > "$ID/verdict"
-    log "codex: VERDICT = APPROVED"
-  elif [[ -n "$VERDICT" ]]; then
-    echo "CHANGES_REQUESTED" > "$ID/verdict"
-    log "codex: VERDICT = CHANGES_REQUESTED"
-  else
-    log "codex: no verdict marker found in stdout — treating as CHANGES_REQUESTED"
-    echo "CHANGES_REQUESTED" > "$ID/verdict"
+# Parse the verdict from stdout (last occurrence wins). No marker — e.g.
+# stdout truncated by the failure that also produced a nonzero exit —
+# records the conservative CHANGES_REQUESTED, so resume treats the landed
+# review as a pending half-step rather than guessing an approval.
+VERDICT=$(grep -Eo '\[CODEX_VERDICT: (APPROVED|CHANGES_REQUESTED)\]' \
+            "$ID/codex.stdout" | tail -1 || true)
+if [[ "$VERDICT" == *APPROVED* ]]; then
+  echo "APPROVED" > "$ID/verdict.stdout"
+  log "codex: VERDICT = APPROVED"
+elif [[ -n "$VERDICT" ]]; then
+  echo "CHANGES_REQUESTED" > "$ID/verdict.stdout"
+  log "codex: VERDICT = CHANGES_REQUESTED"
+else
+  log "codex: no verdict marker found in stdout — treating as CHANGES_REQUESTED"
+  echo "CHANGES_REQUESTED" > "$ID/verdict.stdout"
+fi
+
+if (( SUMMARY_LANDED == 1 )); then
+  # The summary is confirmed public: promote the provisional records.
+  # Copy-then-rename — a kill mid-copy must not leave a truncated
+  # canonical file that would block later adoption of the intact record.
+  if [[ -f "$ID/issue_counts.stdout" ]]; then
+    cp "$ID/issue_counts.stdout" "$ID/issue_counts.tmp.$$"
+    mv -f "$ID/issue_counts.tmp.$$" "$ID/issue_counts"
   fi
+  cp "$ID/verdict.stdout" "$ID/verdict.tmp.$$"
+  mv -f "$ID/verdict.tmp.$$" "$ID/verdict"
 fi
 
 if [[ $RC -ne 0 ]]; then

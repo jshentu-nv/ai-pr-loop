@@ -58,7 +58,12 @@
 #     front-end leaves no tail behind
 #   - codex_turn: a landed summary followed by a nonzero CLI exit persists
 #     its counts and verdict before the turn fails, and the relaunch
-#     converges from them
+#     converges from them; a verification read that fails right after the
+#     POST leaves a provisional stdout record that resume adopts once the
+#     public thread confirms the summary
+#   - portability branches, live: a perl-only PATH (no setsid) reparents
+#     the supervisor and survives the tree reap; a setsid without -f and
+#     no perl falls back inline with a warning naming the -f gap
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -180,8 +185,10 @@ printf '{"payload":{"id":"foreign-root-uuid","cwd":"/other-checkout","source":"e
   > "$CODEX_HOME/sessions/rollout-a-decoy.jsonl"
 printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
   > "$CODEX_HOME/sessions/rollout-stub.jsonl"
-echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
-echo "[CODEX_VERDICT: ${STUB_CODEX_VERDICT:-APPROVED}]"
+if [[ "${STUB_CODEX_SILENT:-0}" != "1" ]]; then
+  echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
+  echo "[CODEX_VERDICT: ${STUB_CODEX_VERDICT:-APPROVED}]"
+fi
 exit "${STUB_CODEX_EXIT:-0}"
 EOF
 
@@ -3218,6 +3225,32 @@ assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: the setsid-only run starts no supervisor"
 if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a lock primitive"; else ok; fi
 
+t "run.sh: a setsid without -f and no perl runs inline with a warning"
+# BusyBox setsid has no -f: a session without reparenting cannot escape a
+# tree reaper, so supervision must not start — and the warning must name
+# the real gap, not claim setsid is missing.
+AR_NF_BIN="$WORK/ar-nofork-bin"
+mkdir -p "$AR_NF_BIN"
+for _l in "$AR_NP_BIN"/*; do
+  ln -s "$(readlink "$_l")" "$AR_NF_BIN/$(basename "$_l")"
+done
+cat > "$AR_NF_BIN/setsid" <<'EOF'
+#!/bin/sh
+# BusyBox-shaped setsid: rejects -f.
+case "$1" in -f) echo "setsid: invalid option -- f" >&2; exit 1 ;; esac
+exec "$@"
+EOF
+chmod +x "$AR_NF_BIN/setsid"
+rm -rf "$ROOT/state/o__n"
+env -i PATH="$STUBS:$AR_NF_BIN" HOME="$WORK" \
+  bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
+RUN_RC=$?
+assert_dies_with "this setsid does not support -f"
+t "run.sh: the no-fork inline run proceeds to the normal flow"
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+t "run.sh: the no-fork run starts no supervisor"
+if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a reparenting primitive"; else ok; fi
+
 # --- auto-resume: state-path identity collisions -----------------------------
 # The flat state path is not injective: o__c/r and o/c__r share a
 # directory. Every entry point validates the .repo-slug marker before
@@ -3369,9 +3402,20 @@ live_start() {  # [extra PATH dir]
 live_cleanup() {
   env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
     9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
+  # Belt and braces with fixture-owned pids only: a --stop that raced a
+  # relaunch can miss its signal, and a leaked supervisor (default budget,
+  # 120s worker cycles) would stomp this shared state dir for the next
+  # twenty minutes of suite runs. The sentinel from --stop is on disk, so
+  # a direct TERM takes the shutdown path.
+  local _lp
+  _lp=$(head -1 "$AR_LIVE_STATE/supervisor.pid" 2>/dev/null)
+  [[ "$_lp" =~ ^[0-9]+$ ]] && kill -TERM "$_lp" 2>/dev/null
+  [[ -n "${LIVE_SUP:-}" ]] && kill -TERM "$LIVE_SUP" 2>/dev/null
+  [[ -n "${LIVE_WORKER:-}" ]] && kill -TERM "$LIVE_WORKER" 2>/dev/null
   kill "$LIVE_FRONT" 2>/dev/null
   wait "$LIVE_FRONT" 2>/dev/null
   kill "$LIVE_AGENT" 2>/dev/null
+  [[ -n "${LIVE_SUP:-}" ]] && live_gone "$LIVE_SUP"
   rm -rf "$ROOT/state/gl.example__g__p"
 }
 
@@ -3501,6 +3545,64 @@ else
 fi
 live_cleanup
 
+# The perl-only battery needs perl on the host (the same convention as the
+# Ctrl-C block): without it the curated PATH has no session primitive at
+# all and the run falls back inline, which is a different case entirely.
+if ! command -v perl >/dev/null 2>&1; then
+  printf 'SKIP: perl-only live cases need perl on the host\n' >&2
+else
+
+t "run.sh: perl-only hosts reparent the supervisor out of the front-end tree"
+# macOS shape: no setsid at all, perl does the fork+setsid+exec. The
+# whole run executes on a curated PATH without setsid; the reparenting
+# contract must hold exactly as on util-linux hosts.
+AR_PERLONLY_BIN="$WORK/ar-perlonly-bin"
+mkdir -p "$AR_PERLONLY_BIN"
+for _l in "$AR_NP_BIN"/*; do
+  ln -s "$(readlink "$_l")" "$AR_PERLONLY_BIN/$(basename "$_l")"
+done
+for _c in perl flock; do
+  _p=$(command -v "$_c" 2>/dev/null) && ln -s "$_p" "$AR_PERLONLY_BIN/$_c"
+done
+rm -rf "$ROOT/state/gl.example__g__p" "$AR_LIVE_AGENT_FILE"
+spawn_in_session env -i PATH="$AR_LIVE_BIN:$STUBS:$AR_PERLONLY_BIN" HOME="$WORK" \
+  STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
+  STUB_FETCH_PID_FILE="$AR_LIVE_AGENT_FILE" \
+  bash "$ROOT/run.sh" https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_LIVE_REPO" \
+  > "$WORK/po.out" 2> "$WORK/po.err"
+AR_PO_FRONT=$SESSION_PID
+if live_wait "$AR_LIVE_AGENT_FILE"; then
+  AR_PO_SUP=$(head -1 "$AR_LIVE_STATE/supervisor.pid" 2>/dev/null)
+  AR_PO_AGENT=$(head -1 "$AR_LIVE_AGENT_FILE")
+  AR_PO_TREE=$(tree_pids "$AR_PO_FRONT")
+  if [[ -n "$AR_PO_SUP" ]] && ! grep -qx "$AR_PO_SUP" <<<"$AR_PO_TREE"; then ok
+  else bad "the perl-only spawn left the supervisor in the front-end tree (sup=${AR_PO_SUP:-none})"; fi
+  t "run.sh: a tree reap on the perl-only front-end leaves the review running"
+  for _p in $AR_PO_TREE; do kill -TERM "$_p" 2>/dev/null; done
+  kill -TERM "$AR_PO_FRONT" 2>/dev/null
+  wait "$AR_PO_FRONT" 2>/dev/null
+  sleep 1
+  if kill -0 "$AR_PO_SUP" 2>/dev/null && kill -0 "$AR_PO_AGENT" 2>/dev/null; then ok
+  else bad "the tree reap took the perl-only supervisor or agent down"; fi
+else
+  bad "the perl-only supervised run never reached the blocking fetch ($(tail -2 "$WORK/po.err" 2>/dev/null | tr '\n' ' '))"
+  t "run.sh: a tree reap on the perl-only front-end leaves the review running"
+  bad "the perl-only supervised run never reached the blocking fetch"
+fi
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
+  9 --repo g/p --forge gitlab --host gl.example --stop >/dev/null 2>&1
+# Fixture-owned belt and braces: the sentinel from --stop is on disk, so a
+# direct TERM takes the shutdown path even if --stop's own signal missed.
+[[ "${AR_PO_SUP:-}" =~ ^[0-9]+$ ]] && kill -TERM "$AR_PO_SUP" 2>/dev/null
+[[ -n "${AR_PO_SUP:-}" ]] && live_gone "$AR_PO_SUP"
+kill "$AR_PO_FRONT" 2>/dev/null
+wait "$AR_PO_FRONT" 2>/dev/null
+[[ -n "${AR_PO_AGENT:-}" ]] && kill "$AR_PO_AGENT" 2>/dev/null
+rm -rf "$ROOT/state/gl.example__g__p"
+
+fi  # perl guard for the perl-only live cases
+
 t "run.sh: a sentinel-less group TERM during the backoff is survived"
 # The ignore-trap returns into an interrupted `sleep`, whose 143 must not
 # end the supervisor through set -e; the loop continues to the relaunch.
@@ -3618,8 +3720,15 @@ live_cleanup
 
 t "run.sh: a SIGKILLed front-end leaves no tail behind"
 if live_start; then
-  LIVE_TAIL=$(ps -o pid=,ppid=,args= 2>/dev/null \
-              | awk -v p="$LIVE_FRONT" '$2 == p && /tail/ { print $1; exit }')
+  # live_start returns when the worker's fetch blocks, which can precede
+  # the front-end spawning its tail — poll for the tail child first.
+  LIVE_TAIL=''
+  for (( _i = 0; _i < 100; _i++ )); do
+    LIVE_TAIL=$(ps -o pid=,ppid=,args= 2>/dev/null \
+                | awk -v p="$LIVE_FRONT" '$2 == p && /tail/ { print $1; exit }')
+    [[ -n "$LIVE_TAIL" ]] && break
+    sleep 0.1
+  done
   kill -9 "$LIVE_FRONT" 2>/dev/null
   wait "$LIVE_FRONT" 2>/dev/null
   if [[ -z "$LIVE_TAIL" ]]; then bad "no tail found under the front-end"
@@ -3956,6 +4065,110 @@ env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
     --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx2.out" 2> "$WORK/cx2.err"
 assert_substr "$WORK/cx2.err" "convergence: iter 2 BLOCKER=0 MAJOR=0 (streak 1 / 1)"
 assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" converged_no_major
+rm -rf "$ROOT/state/gl.example__g__p"
+
+# --- codex_turn: a POST that landed but whose verification read failed -------
+# The immediate thread read after a successful POST can fail transiently.
+# The stdout record persists as provisional (*.stdout); resume adopts it
+# only once the public thread confirms the summary landed. Pinning the
+# thread stub to iter 0 makes the first worker's verification miss —
+# exactly the outage shape — while the retry's stub shows the landed
+# summary.
+
+t "run.sh: a landed POST with a failed verification read keeps a provisional record"
+rm -rf "$ROOT/state/gl.example__g__p"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=0 STUB_GL_CLAUDE_ITER=0 \
+  STUB_CODEX_ISSUES='BLOCKER=0 MAJOR=0 NIT=1' \
+  STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_EXIT=17 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx3.out" 2> "$WORK/cx3.err"
+if [[ ! -f "$AR_LIVE_STATE/iter-01/issue_counts" \
+      && -f "$AR_LIVE_STATE/iter-01/issue_counts.stdout" ]]; then ok
+else bad "provisional/canonical count files in the wrong state after the outage"; fi
+t "run.sh: the provisional verdict is recorded without being canonical"
+if [[ ! -f "$AR_LIVE_STATE/iter-01/verdict" ]] \
+   && [[ "$(cat "$AR_LIVE_STATE/iter-01/verdict.stdout" 2>/dev/null)" == CHANGES_REQUESTED ]]; then ok
+else bad "provisional/canonical verdict files in the wrong state after the outage"; fi
+
+t "run.sh: a provisional record is never adopted while the thread shows nothing landed"
+# The rejecting direction of the adoption invariant: provisional files are
+# on disk (from the outage phase above), but the public thread still shows
+# no landed summary — resume must not adopt, and codex re-reviews instead.
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=0 STUB_GL_CLAUDE_ITER=0 \
+  STUB_CODEX_ISSUES='BLOCKER=0 MAJOR=0 NIT=1' \
+  STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_EXIT=17 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx3b.out" 2> "$WORK/cx3b.err"
+if grep -Fq 'resume: adopted' "$WORK/cx3b.err"; then
+  bad "resume adopted a provisional record with no landed summary"
+else ok; fi
+t "run.sh: the unlanded iteration keeps no canonical record"
+if [[ ! -e "$AR_LIVE_STATE/iter-01/verdict" && ! -e "$AR_LIVE_STATE/iter-01/issue_counts" ]]; then ok
+else bad "canonical files appeared for an iteration the thread never showed"; fi
+
+t "run.sh: resume adopts the provisional record once the thread shows the summary"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 --converge 1 > "$WORK/cx4.out" 2> "$WORK/cx4.err"
+assert_substr "$WORK/cx4.err" "resume: adopted stdout issue counts for landed codex iter 1"
+assert_substr "$WORK/cx4.err" "convergence: iter 1 BLOCKER=0 MAJOR=0 (streak 1 / 1)"
+t "run.sh: the adopted record converges the resumed half-step"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" converged_no_major
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "codex_turn: a fresh attempt clears the previous attempt's stdout record"
+# A stale provisional from a failed prior attempt must never be adoptable
+# as a later attempt's landed review: the turn clears the *.stdout files
+# before the CLI runs, so even an attempt killed mid-run leaves nothing
+# stale behind — here the CLI prints no markers at all, and the stale
+# APPROVED must be gone afterwards.
+rm -rf "$ROOT/state/gl.example__g__p"
+mkdir -p "$AR_LIVE_STATE/iter-01"
+printf 'APPROVED\n' > "$AR_LIVE_STATE/iter-01/verdict.stdout"
+printf 'BLOCKER=0\nMAJOR=0\nNIT=0\n' > "$AR_LIVE_STATE/iter-01/issue_counts.stdout"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=0 STUB_GL_CLAUDE_ITER=0 \
+  STUB_CODEX_SILENT=1 STUB_CODEX_EXIT=17 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 > "$WORK/cx5.out" 2> "$WORK/cx5.err"
+if [[ "$(cat "$AR_LIVE_STATE/iter-01/verdict.stdout" 2>/dev/null)" == CHANGES_REQUESTED \
+      && ! -e "$AR_LIVE_STATE/iter-01/issue_counts.stdout" ]]; then ok
+else bad "a stale stdout record survived a fresh attempt"; fi
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: an adopted APPROVED verdict ends the resumed review as approved"
+# The verdict half of adoption, at its highest stakes: codex approved and
+# posted, the CLI then died before the verification read — the relaunch
+# must honor the public approval instead of running claude against it.
+rm -rf "$ROOT/state/gl.example__g__p"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=0 STUB_GL_CLAUDE_ITER=0 \
+  STUB_CODEX_EXIT=17 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 > "$WORK/cx6.out" 2> "$WORK/cx6.err"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-approve-codex" ARGV_FILE="$WORK/ar-cx-argv" \
+  STUB_GL_CODEX_ITER=1 STUB_GL_CLAUDE_ITER=0 \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 2 > "$WORK/cx7.out" 2> "$WORK/cx7.err"
+assert_substr "$WORK/cx7.err" "resume: adopted stdout verdict for landed codex iter 1"
+assert_substr "$WORK/cx7.err" "codex already APPROVED at iter 1 — nothing to do"
+t "run.sh: the adopted approval reports approved"
+assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" approved
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- prompt rendering ------------------------------------------------------

@@ -256,9 +256,9 @@ read the final state from the PR thread or
 end such a run, call `run.sh <pr> --repo <slug> --stop`.
 
 **Check the launch output for `auto-resume: disabled`.** On a host without
-`setsid`/`perl` (no detached session) or without `flock`/`perl` (no
-single-supervisor lock), `run.sh` prints that warning and runs the loop
-inline in the background task itself. There is no supervisor: a reaped
+`setsid -f` (util-linux) or `perl` (no detached, reparented session), or
+without `flock`/`perl` (no single-supervisor lock), `run.sh` prints that
+warning and runs the loop inline in the background task itself. There is no supervisor: a reaped
 task ENDS the review, and nothing restarts it. Treat task death as review
 death in that case — re-run the same command to resume from the PR's
 high-water mark.
