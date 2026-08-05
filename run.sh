@@ -1356,26 +1356,169 @@ run_finalize() {
   esac
 }
 
+# --restart in local mode is a durable decision, not a per-invocation flag.
+# A restart consumes several markers and establishes a new base — a kill
+# partway would otherwise let a plain retry resurrect the superseded review
+# or exit "already completed" without the new review. So a pending-restart
+# marker is written FIRST, before anything is consumed, and every startup
+# treats its presence as a standing --restart until the new base is set
+# (cleared below). The iteration floor is published right after it.
+EFFECTIVE_RESTART=$RESTART
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_restart_pending_file)" ]]; then
+  EFFECTIVE_RESTART=1
+  (( RESTART == 1 )) \
+    || log "local: a prior --restart was interrupted — resuming it; clean $(local_state_dir) to abandon it"
+fi
+if (( LOCAL_MODE == 1 )) && (( EFFECTIVE_RESTART == 1 )); then
+  mkdir -p "$(local_state_dir)"    # a fresh target has no local/ yet
+  : > "$(local_restart_pending_file)"    # durable intent, before any consume
+  _fc=$(latest_local_iter codex); _fl=$(latest_local_iter claude)
+  write_state_atomic "$(local_iter_floor_file)" "$(( _fc > _fl ? _fc : _fl ))" \
+    || die "could not record the --restart iteration floor at $(local_iter_floor_file)"
+fi
+
+# Iterations at or below the floor belong to a review that a --restart
+# superseded; every consumer below — the held-finalize shortcut and resume
+# detection — reads them as absent. A floor file that exists but does not
+# hold a number is a torn write from a killed run: reading it as 0 would
+# silently resurrect the superseded review, so it fails closed.
+ITER_FLOOR=0
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_iter_floor_file)" ]]; then
+  ITER_FLOOR=$(<"$(local_iter_floor_file)")
+  [[ "$ITER_FLOOR" =~ ^[0-9]+$ ]] \
+    || die "the --restart iteration floor at $(local_iter_floor_file) is empty or malformed (a killed run left it torn). Re-run with --restart to record it again and review the current state from scratch, or write the last superseded iteration number into it by hand — deleting the file resurrects the superseded review"
+fi
+
+# A completed local review is terminal: its single commit was already
+# pushed, or landed as the local tip when there is no origin. A plain rerun
+# has nothing left to do — exiting here also keeps a human commit made
+# after completion from being mistaken for review state. --restart drops
+# the marker and reviews the target as it is now, from a new base.
+if (( LOCAL_MODE == 1 )) && [[ -s "$(local_completed_file)" ]]; then
+  COMPLETED_SHA=$(<"$(local_completed_file)")
+  # completed.sha is authoritative: in-progress markers found alongside it
+  # are leftovers of an interrupted terminal transition, and resuming from
+  # them would re-squash from the old base — rewriting the completed
+  # commit. Drop them whenever the marker is present.
+  rm -f "$(local_base_file)" "$(local_tip_file)" "$(local_origin_file)" \
+        "$(local_finalized_file)" "$(local_finalize_inprogress_file)" \
+        "$(local_pending_turn_file)"
+  if (( EFFECTIVE_RESTART == 0 )); then
+    log "local: this review already completed (commit $COMPLETED_SHA) — pass --restart to start a new review of the current state"
+    log "PR: $PR_URL"
+    exit 0
+  fi
+  log "--restart: prior local review completed at $COMPLETED_SHA — starting a new review from the current head"
+  rm -f "$(local_completed_file)"
+fi
+
+# A round that committed and wrote its response but was killed before its
+# commit was anchored: recover it from the checkout's raw HEAD BEFORE
+# local_setup_repo cleans the worktree back to the (stale) tip ref and
+# resume detection counts the round as complete.
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_pending_turn_file)" ]]; then
+  reconcile_pending_turn
+fi
+
 if (( LOCAL_MODE == 1 )); then
   local_setup_repo
 else
   sync_repo_to_pr_head
 fi
 
-# A squashed commit from an earlier invocation that never reached the remote
-# — its push was rejected, or --no-push held it — is finished work. Push it
-# (finalize reuses the composed message) rather than stacking more review
-# rounds on top of a review that already ended.
-if (( LOCAL_MODE == 1 )); then
-  FINALIZED_SHA_FILE="$STATE_DIR/local/finalized.sha"
-  if [[ -s "$FINALIZED_SHA_FILE" ]] \
-     && [[ "$(cat "$FINALIZED_SHA_FILE")" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]; then
-    log "local: this review already produced its squashed commit — finalizing it instead of reviewing again"
+# Is the held squash already the remote branch head — i.e. did the push
+# land and only the terminal bookkeeping get interrupted?
+#   0 landed   1 definitely not landed   2 could not tell
+# Only a SQUASH outcome can land: a metadata-only hold's SHA is the base,
+# which equals the remote head by construction and would otherwise read as
+# "landed" for a review that pushed nothing.
+finalized_landed() {  # <finalized-sha>
+  local out remote_head
+  [[ "$(local_finalized_kind)" == "squash" ]] || return 1
+  # local_setup_repo already fetched and vouched for this exact state.
+  [[ "${LOCAL_FINALIZE_LANDED:-0}" == "1" ]] && return 0
+  git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1 || return 1
+  # A failed ls-remote is "unknown" (rc 2); a successful one with no ref
+  # is a definite answer — the branch is simply not there. The `||` keeps
+  # the caller's errexit state intact either way.
+  out=$(git -C "$REPO_DIR" ls-remote origin "refs/heads/$HEAD_REF" 2>/dev/null) \
+    || return 2
+  remote_head=$(awk '{print $1; exit}' <<<"$out")
+  [[ -n "$remote_head" && "$remote_head" == "$1" ]]
+}
+
+# A finalized squash that already reached the remote is LANDED work: no
+# flavor of restart or supersession may consume it. Complete it first —
+# idempotent (the compose is reused, the re-push is a no-op) — and only
+# then let --restart begin its new review, from the landed head.
+LANDED_RC=1
+HELD_SUPERSEDED=0
+if (( LOCAL_MODE == 1 )) && [[ -n "$(local_finalized_sha)" ]] \
+   && [[ "$(local_finalized_sha)" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]; then
+  set +e; finalized_landed "$(local_finalized_sha)"; LANDED_RC=$?; set -e
+  # The held outcome is discarded either by --restart now, or by the
+  # supersession drop below when a prior --restart's floor covers every
+  # round it came from.
+  (( $(latest_local_iter codex) <= ITER_FLOOR )) && HELD_SUPERSEDED=1
+  # Never discard an outcome that MIGHT already be on the remote.
+  (( LANDED_RC == 2 )) && (( EFFECTIVE_RESTART == 1 || HELD_SUPERSEDED == 1 )) \
+    && die "could not read the remote head for '$HEAD_REF', so whether this review's squashed commit already landed is unknown — refusing to discard it. Re-run when the remote is reachable"
+  if (( LANDED_RC == 0 )); then
+    log "local: the squashed commit already reached the remote — completing the interrupted finalization"
     run_finalize
     (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || exit 1
-    log "PR: $PR_URL"
-    exit 0
+    if (( EFFECTIVE_RESTART == 0 && HELD_SUPERSEDED == 0 )); then
+      log "PR: $PR_URL"
+      exit 0
+    fi
+    # rc alone does not prove terminal completion (--no-push returns 0 with
+    # the outcome still held). The marker does, and until it exists nothing
+    # may consume the landed squash.
+    [[ -s "$(local_completed_file)" ]] \
+      || die "the landed finalization did not complete (its terminal marker was not written; --no-push holds it) — re-run without --no-push to finish it before starting a new review"
+    log "local: the landed review is complete — starting a new review from its head"
+    rm -f "$(local_completed_file)"
+    local_setup_repo
   fi
+fi
+
+# A finalize outcome from an earlier invocation that never landed — a
+# rejected push, a --no-push hold of the squash or of a metadata-only
+# finish — is finished work. Land it (finalize reuses the composed message
+# or held proposal) rather than stacking more review rounds on top of a
+# review that already ended. --restart instead CONSUMES the marker: the
+# fresh review stacks new rounds on the held state and later re-squashes
+# everything to the same base, so it stops being finished work.
+if (( LOCAL_MODE == 1 )); then
+  if (( EFFECTIVE_RESTART == 1 )); then
+    rm -f "$(local_finalized_file)" "$(local_finalize_inprogress_file)"
+  elif [[ -n "$(local_finalized_sha)" ]] \
+     && [[ "$(local_finalized_sha)" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]; then
+    if (( HELD_SUPERSEDED == 1 )); then
+      # Every completed round sits at or below the floor: the held outcome
+      # belongs to a review a --restart superseded, and the restart was
+      # interrupted before consuming it. Consume it now — landing it would
+      # silently drop the requested restart. Nothing landed: a squash on
+      # the remote was completed above, and an unreadable remote died
+      # there rather than reach this drop.
+      log "local: dropping a held outcome superseded by --restart"
+      rm -f "$(local_finalized_file)" "$(local_finalize_inprogress_file)"
+    else
+      log "local: this review already produced its finalize outcome — landing it instead of reviewing again"
+      run_finalize
+      (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || exit 1
+      log "PR: $PR_URL"
+      exit 0
+    fi
+  fi
+fi
+
+# The restart's superseding work is done — the floor is set, the old
+# terminal/held outcome is consumed, and local_setup_repo established the
+# base the new review builds on. Clear the durable intent so a later plain
+# rerun resumes the NEW review instead of re-driving the restart.
+if (( LOCAL_MODE == 1 )) && (( EFFECTIVE_RESTART == 1 )); then
+  rm -f "$(local_restart_pending_file)"
 fi
 
 # --- resume detection ---------------------------------------------------------
@@ -1396,6 +1539,8 @@ fi
 if (( LOCAL_MODE == 1 )); then
   LAST_CODEX=$(latest_local_iter codex)
   LAST_CLAUDE=$(latest_local_iter claude)
+  (( LAST_CODEX  > ITER_FLOOR )) || LAST_CODEX=$ITER_FLOOR
+  (( LAST_CLAUDE > ITER_FLOOR )) || LAST_CLAUDE=$ITER_FLOOR
 else
   LAST_CODEX=$(latest_ai_comment_iter codex)
   LAST_CLAUDE=$(latest_ai_comment_iter claude)
@@ -1608,6 +1753,17 @@ while (( RUNS < MAX_ITER )); do
   fi
 
   # Claude response.
+  # Two-phase receipt for the anchor window. `pending` before the turn
+  # marks a round whose outcome is not yet validated: a kill here re-runs
+  # it, never anchors it. Only after the turn returns rc 0 — which
+  # claude_turn.sh grants only with the marker AND its response artifact —
+  # is the receipt upgraded to `done` with the EXACT committed SHA, so
+  # recovery anchors that precise commit and nothing else.
+  _pretip=''
+  if (( LOCAL_MODE == 1 )); then
+    _pretip=$(git -C "$REPO_DIR" rev-parse HEAD)
+    write_state_atomic "$(local_pending_turn_file)" "pending $ITER $_pretip"
+  fi
   set +e
   bash "$LOOP_HOME/claude_turn.sh"
   CLAUDE_RC=$?
@@ -1615,14 +1771,33 @@ while (( RUNS < MAX_ITER )); do
 
   if [[ $CLAUDE_RC -ne 0 ]]; then
     log "claude turn failed on iter $ITER (rc=$CLAUDE_RC)"
+    # A failed turn is re-run in full next invocation, so any commits it
+    # left are abandoned work. PR scope drops them by syncing to the tip
+    # ref; the branch must be put back the same way, or the next resume
+    # reads them as the branch moving outside the loop and fails closed.
+    # (A turn that detached HEAD is left for that fail-closed check.)
+    if (( LOCAL_MODE == 1 )); then
+      rm -f "$(local_pending_turn_file)"    # the round is being re-run, not anchored
+      if [[ -s "$(local_tip_file)" ]]; then
+        if [[ "$LOCAL_SCOPE" != "branch" ]]; then
+          sync_repo_to_local_head
+        elif [[ "$(git -C "$REPO_DIR" symbolic-ref --quiet HEAD 2>/dev/null)" == "refs/heads/$HEAD_REF" ]]; then
+          force_clean_to_commit "$REPO_DIR" "$(<"$(local_tip_file)")" attach
+        fi
+      fi
+    fi
     FINAL_STATUS="claude_error"
     break
   fi
 
   if (( LOCAL_MODE == 1 )); then
-    # Whatever the turn committed is the run's work product and lives only
-    # here: give it a ref before anything else can move HEAD.
+    # The turn is validated: record the exact commit it produced, then
+    # anchor it. A kill between the two leaves a `done` receipt naming that
+    # commit, which recovery re-points the tip at. Drop the receipt last.
+    write_state_atomic "$(local_pending_turn_file)" \
+      "done $ITER $_pretip $(git -C "$REPO_DIR" rev-parse HEAD)"
     local_record_tip
+    rm -f "$(local_pending_turn_file)"
   fi
 
   # The round is complete once claude answered: persist the spent iteration

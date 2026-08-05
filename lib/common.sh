@@ -100,6 +100,23 @@ CLAUDE_GIT_EMAIL="claude-implementer+bot@users.noreply.github.com"
 log()  { printf '[ai-loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 
+# Every git command the ORCHESTRATOR runs against a checkout an agent turn
+# can write to. The turn may plant hooks there — pre-commit, pre-push,
+# post-checkout, reference-transaction (which fires on ref updates, so
+# reset/update-ref/fetch are ref-changing commands too) — and none of them
+# may execute with the loop's authority after the turn. core.fsmonitor is
+# likewise a config-planted program, and a "nothing changed" answer from
+# one would also fake the cleanliness probes.
+git_safe() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+
+# Publish a state file so a kill mid-write leaves either the old content
+# or the new one — never a truncated file a later run would misread. (A
+# plain '>' redirection truncates first and writes second.)
+write_state_atomic() {  # <path> <content>
+  printf '%s\n' "$2" > "$1.tmp" \
+    && mv -f "$1.tmp" "$1"
+}
+
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {
@@ -640,6 +657,10 @@ ensure_repo_clone() {
 # process. Reset at source time — an inherited environment value must never
 # be able to skip the first-sync safety checks.
 SYNC_DIR_TRUSTED=0
+# 1 once THIS process's own fetch saw the remote at the finalized squash
+# (local_setup_repo sets it). Reset at source time: an inherited
+# environment value must never stand in for that fetch.
+LOCAL_FINALIZE_LANDED=0
 
 # Force $1's worktree onto commit $2, dropping everything not in that commit.
 # $3 selects how HEAD gets there:
@@ -660,10 +681,10 @@ force_clean_to_commit() {
   # may run (a post-checkout hook could recreate artifacts right after
   # cleanup).
   if [[ "$mode" == "attach" ]]; then
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false reset --quiet --hard "$target" \
+    git_safe -C "$d" reset --quiet --hard "$target" \
       || die "could not reset $d to $target"
   else
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --force --detach "$target" \
+    git_safe -C "$d" checkout --quiet --force --detach "$target" \
       || die "could not check out $target in $d"
   fi
   git -C "$d" -c core.fsmonitor=false clean -qffd \
@@ -676,9 +697,10 @@ force_clean_to_commit() {
   # come from the just-checked-out .gitmodules (update=merge/rebase would
   # create commits instead of detaching). (Both are no-ops when there are no
   # submodules.)
-  git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule update --quiet --checkout --recursive --force \
+  git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
     || die "could not reset initialized submodules in $d"
-  git -C "$d" submodule --quiet foreach --recursive git -c core.fsmonitor=false clean -qffd \
+  git_safe -C "$d" submodule --quiet foreach --recursive \
+      git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
     || die "could not clean initialized submodules in $d"
   # Fail closed on anything the cleanup above did not cover.
   # --ignore-submodules=dirty is config-independent where it matters: it
@@ -694,7 +716,7 @@ force_clean_to_commit() {
   # `git add --renormalize . && git commit`.
   # core.fsmonitor=false: a formerly---dir clone keeps its caller config, and
   # a "nothing changed" fsmonitor answer must not fake this probe.
-  dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+  dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
     || die "git status failed in $d"
   [[ -z "$dirt" ]] \
     || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
@@ -712,7 +734,7 @@ verify_caller_clone_clean() {
   # -A` would stage it. core.fsmonitor=false: a caller's fsmonitor
   # hook/daemon claiming "nothing changed" would make status skip the real
   # worktree and report a tracked edit as clean.
-  dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
+  dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
     || die "git status failed in $d"
   [[ -z "$dirt" ]] \
     || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
@@ -721,8 +743,8 @@ verify_caller_clone_clean() {
   # submodule-local status.showUntrackedFiles=no (or a nested
   # submodule.<name>.ignore=all) could hide caller state that this
   # invocation's later trusted syncs would clean away.
-  dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-           git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+  dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
+           git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
     || die "git submodule status probe failed in $d"
   [[ -z "$dirt" ]] \
     || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
@@ -741,7 +763,7 @@ verify_caller_clone_clean() {
     || die "git ls-files probe failed in $d"
   [[ -z "$dirt" ]] \
     || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries that hide edits from status — clear them (git update-index --no-assume-unchanged/--no-skip-worktree) before running with --dir: $dirt"
-  dirt=$(git -C "$d" submodule --quiet foreach --recursive \
+  dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
            'git ls-files -v | { grep -E "^(S|[a-z]) " || true; }') \
     || die "git submodule ls-files probe failed in $d"
   [[ -z "$dirt" ]] \
@@ -755,10 +777,10 @@ sync_repo_to_pr_head() {
   # branch it points at. --no-deref delete removes the symref itself (rc 0
   # when absent), so the fetch below always creates fresh direct refs.
   for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
-    git -C "$d" update-ref --no-deref -d "$r" \
+    git_safe -C "$d" update-ref --no-deref -d "$r" \
       || die "could not clear stale ref $r in $d"
   done
-  git -C "$d" fetch --quiet origin \
+  git_safe -C "$d" fetch --quiet origin \
       "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
       "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
     || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
@@ -781,7 +803,7 @@ sync_repo_to_pr_head() {
     # probe above cannot see ignored files. core.hooksPath=/dev/null: a
     # caller-installed post-checkout hook must not run (it could create
     # artifacts a turn's `git add -A` would publish).
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$target" \
+    git_safe -C "$d" checkout --quiet --detach --no-overwrite-ignore "$target" \
       || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
     # Align each initialized submodule with the gitlink its (just-updated)
     # superproject records, exactly as the superproject was treated: a
@@ -796,7 +818,7 @@ sync_repo_to_pr_head() {
     # fetch.recurseSubmodules=false), try to fetch it best-effort first —
     # 'submodule update' used to do this; the checkout still fails closed
     # if the commit stays unavailable.
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule --quiet foreach --recursive \
+    git_safe -C "$d" submodule --quiet foreach --recursive \
         'git rev-parse --verify --quiet "$sha1^{commit}" >/dev/null 2>&1 \
            || git -c core.hooksPath=/dev/null fetch --quiet origin "$sha1" 2>/dev/null \
            || git -c core.hooksPath=/dev/null fetch --quiet origin 2>/dev/null \
@@ -807,12 +829,12 @@ sync_repo_to_pr_head() {
     # worktrees): nothing — hook output, submodule drift, filter effects —
     # may have appeared between the pre-check and here. Caller-preserving:
     # on failure we die without cleaning.
-    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d is not clean after checking out the PR head (a hook or filter may have produced state a turn could publish): $dirt"
-    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
+             git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git submodule status probe failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d has state inside initialized submodules after checking out the PR head: $dirt"
@@ -854,15 +876,217 @@ local_tip_ref() {
 # commit. Written once per run and read by finalize_turn.sh.
 local_base_file() { printf '%s/base.sha\n' "$(local_state_dir)"; }
 
-# Point the local tip ref at HEAD after a turn committed. Branch scope needs
-# nothing — committing already moved the branch.
+# Where the last committed round left HEAD. The tip ref keeps pr-scope
+# rounds reachable; this file is the EXPECTED tip for both scopes, checked
+# on every resume and sync so a branch or ref that moved outside the loop's
+# own turns is caught instead of silently adopted (rounds lost, or foreign
+# commits squashed as review work).
+local_tip_file() { printf '%s/tip.sha\n' "$(local_state_dir)"; }
+
+# The finalize outcome journal: one line "<kind> <sha>" written atomically,
+# so an interruption during publication never leaves a half-recorded
+# outcome (a kind without its SHA, or the reverse). kind is 'squash' (a
+# commit to push) or 'nocommit' (nothing lands; only a title/description
+# proposal) — a nocommit's SHA equals the base, so the SHA alone cannot
+# tell the two apart. Records a held --no-push outcome or a rejected push
+# awaiting retry, until it lands terminally.
+local_finalized_file() { printf '%s/finalized\n' "$(local_state_dir)"; }
+local_finalized_kind() { local f; f=$(local_finalized_file); [[ -s "$f" ]] && awk '{print $1}' "$f"; return 0; }
+local_finalized_sha()  { local f; f=$(local_finalized_file); [[ -s "$f" ]] && awk '{print $2}' "$f"; return 0; }
+# <sha> <kind> — one atomic write.
+local_write_finalized() { write_state_atomic "$(local_finalized_file)" "$2 $1"; }
+
+# Written before the squash commit moves HEAD, "<base> <approved-tree>": a
+# finalize interrupted before it journaled its squash is recognized by it.
+local_finalize_inprogress_file() { printf '%s/finalize-inprogress\n' "$(local_state_dir)"; }
+
+# The review's terminal marker: its single commit was pushed, or landed as
+# the local tip when there is no origin, or the rounds landed nothing. A
+# plain rerun of a completed review is a no-op; --restart clears this.
+local_completed_file() { printf '%s/completed.sha\n' "$(local_state_dir)"; }
+
+# Iterations at or below this floor belong to earlier, completed reviews
+# whose artifacts remain on disk as history; resume detection reads them as
+# absent. Written by run.sh when --restart follows a completed review.
+local_iter_floor_file() { printf '%s/iter-floor\n' "$(local_state_dir)"; }
+
+# Durable --restart intent. Written before the floor and every marker a
+# restart consumes, cleared only once the new review's base is established:
+# a restart interrupted anywhere in between is re-driven by the next run,
+# so no plain retry can resurrect the superseded review or exit as
+# "already completed" without the requested new review.
+local_restart_pending_file() { printf '%s/restart-pending\n' "$(local_state_dir)"; }
+
+# A receipt written before each implementer round and cleared once its
+# commit is anchored: "<iter> <pre-turn-tip>". Recovers the crash window
+# where the turn committed and wrote its response but the loop was killed
+# before anchoring the commit to the tip ref.
+local_pending_turn_file() { printf '%s/pending-turn\n' "$(local_state_dir)"; }
+
+# The origin destination the review is allowed to push to, recorded once
+# when the review starts and held for its whole life. A missing file mid-
+# review fails finalize closed (a turn could otherwise delete it to get a
+# poisoned re-pin); an operator who legitimately moved the remote writes
+# the new destination into the file by hand.
+local_origin_file() { printf '%s/origin.url\n' "$(local_state_dir)"; }
+
+# The effective fetch and push destinations of origin — every configured
+# url/pushurl, with url.*.insteadOf / url.*.pushInsteadOf rewrites applied
+# — or "(none)" when the remote does not exist. This covers the URL level
+# only: transport config a turn could plant (core.sshCommand,
+# credential.helper, http.proxy, remote.*.receivepack) is arbitrary code
+# execution with the operator's powers and cannot be policed here.
+origin_dest() {
+  if git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+    printf '%s\n%s\n' "$(git -C "$REPO_DIR" remote get-url --all origin)" \
+                      "$(git -C "$REPO_DIR" remote get-url --push --all origin)"
+  else
+    printf '(none)\n'
+  fi
+}
+
+# Record HEAD as the local tip: point the pr-scope ref at it (branch scope
+# needs no ref — the branch itself is the tip), and persist it as the
+# expected tip for later syncs and resumes. Runs at setup and after every
+# turn that may have committed.
 local_record_tip() {
   local ref head
-  [[ "$LOCAL_SCOPE" == "branch" ]] && return 0
-  ref=$(local_tip_ref)
   head=$(git -C "$REPO_DIR" rev-parse HEAD) || die "could not read HEAD in $REPO_DIR"
-  git -C "$REPO_DIR" update-ref "$ref" "$head" \
-    || die "could not update $ref in $REPO_DIR"
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    # The branch is the work product: recording a detached or off-branch
+    # HEAD would poison the expected tip with a commit the branch never
+    # carried. Keep the previous round's record and stop.
+    [[ "$(git -C "$REPO_DIR" symbolic-ref --quiet HEAD 2>/dev/null)" == "$(local_tip_ref)" ]] \
+      || die "HEAD in $REPO_DIR is not on the branch under review — refusing to record it as the local tip; put the branch back and re-run"
+  else
+    ref=$(local_tip_ref)
+    git_safe -C "$REPO_DIR" update-ref "$ref" "$head" \
+      || die "could not update $ref in $REPO_DIR"
+  fi
+  write_state_atomic "$(local_tip_file)" "$head"
+}
+
+# A finalize was interrupted mid-publication: its squash commit exists but
+# the tip is not yet anchored to it. Recover from EVERY partial state and
+# leave a consistent, journaled, anchored tip so finalize can complete it.
+# Returns 1 when there is nothing to repair; safe to call unconditionally,
+# since during active rounds neither the outcome journal nor the in-progress
+# marker exists.
+#
+# The squash is recognized two ways:
+#   - the outcome journal (kind squash + its SHA), written after the commit;
+#   - or, before that journal was written, the in-progress marker (base +
+#     approved tree): the tip ref or HEAD is then a commit collapsing that
+#     base onto that tree, which only the loop's own squash can be.
+local_adopt_finalized_squash() {
+  local fsha base cur ibase itree iround c ref_head head
+  base=''; [[ -s "$(local_base_file)" ]] && base=$(<"$(local_base_file)")
+  [[ -n "$base" ]] || return 1
+  ref_head=$(git -C "$REPO_DIR" rev-parse --verify --quiet "$(local_tip_ref)^{commit}" 2>/dev/null || true)
+  head=$(git -C "$REPO_DIR" rev-parse --verify --quiet HEAD 2>/dev/null || true)
+
+  fsha=$(local_finalized_sha)
+  if [[ "$(local_finalized_kind)" != "squash" || -z "$fsha" ]]; then
+    # No squash journal yet. Was one being published? The in-progress marker
+    # names the base and the approved tree; the squash is the ref/HEAD commit
+    # that collapses them.
+    [[ -s "$(local_finalize_inprogress_file)" ]] || return 1
+    read -r ibase itree < "$(local_finalize_inprogress_file)"
+    [[ "$ibase" == "$base" ]] || return 1
+    # The recorded round must NOT be mistaken for the squash: a single round
+    # has the same parent (base) and tree (approved) as its squash, so only a
+    # DIFFERENT commit is the real squash. tip.sha still names that round (the
+    # squash is journaled before local_record_tip advances tip.sha).
+    iround=''; [[ -s "$(local_tip_file)" ]] && iround=$(<"$(local_tip_file)")
+    fsha=''
+    for c in "$ref_head" "$head"; do
+      [[ -n "$c" ]] || continue
+      [[ -n "$iround" && "$c" == "$iround" ]] && continue
+      [[ "$(git -C "$REPO_DIR" rev-parse --verify --quiet "${c}^" 2>/dev/null)" == "$base" ]] || continue
+      [[ "$(git -C "$REPO_DIR" rev-parse --verify --quiet "${c}^{tree}" 2>/dev/null)" == "$itree" ]] || continue
+      fsha="$c"; break
+    done
+    [[ -n "$fsha" ]] || return 1
+    # Journal it now — from here it is an ordinary recorded squash.
+    local_write_finalized "$fsha" squash
+  fi
+
+  # Already anchored — nothing to repair.
+  [[ -s "$(local_tip_file)" && "$(<"$(local_tip_file)")" == "$fsha" ]] && return 1
+  # It must be a real commit that collapses base.. onto the base.
+  git -C "$REPO_DIR" rev-parse --verify --quiet "${fsha}^{commit}" >/dev/null 2>&1 || return 1
+  git -C "$REPO_DIR" merge-base --is-ancestor "$base" "$fsha" >/dev/null 2>&1 || return 1
+  # The tip ref must be exactly where the loop's own finalize left it — the
+  # squash (already advanced) or the recorded round (not yet) — never a
+  # human's commit, which would be a descendant to fail closed on.
+  cur="$ref_head"
+  if [[ "$cur" == "$fsha" ]]; then
+    : # ref already advanced (branch commit, or a killed adopt's update-ref); only tip.sha lags
+  elif [[ -s "$(local_tip_file)" && "$cur" == "$(<"$(local_tip_file)")" ]]; then
+    if [[ "$LOCAL_SCOPE" != "branch" ]]; then
+      git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$fsha" \
+        || die "could not anchor the interrupted finalize squash $fsha in $REPO_DIR"
+    else
+      # Branch scope: the commit itself moves the branch. A branch still at
+      # the round means the squash lives only on a detached HEAD; move the
+      # branch onto it (the loop's own squash), not a foreign commit.
+      git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$fsha" \
+        || die "could not anchor the interrupted finalize squash $fsha in $REPO_DIR"
+    fi
+  else
+    return 1
+  fi
+  write_state_atomic "$(local_tip_file)" "$fsha"
+  log "local: recovered an interrupted finalize — anchored the squash $fsha as the local tip"
+  return 0
+}
+
+# Recover a round killed in the window between its commit and the anchoring
+# of that commit to the tip ref. The `done` receipt names the EXACT commit
+# the validated turn produced; recovery re-points the tip ref at precisely
+# that commit — never at whatever HEAD happens to hold, so a human commit or
+# a turn claude_turn.sh rejected is never adopted. A `pending` receipt (turn
+# outcome never validated) invalidates the round so it re-runs. Runs on
+# every startup, including under --restart, so a validated fix is anchored
+# into the current state before the restart re-bases from it.
+reconcile_pending_turn() {
+  local pt state piter ptip post reftip
+  pt=$(cat "$(local_pending_turn_file)" 2>/dev/null) || pt=''
+  read -r state piter ptip post <<<"$pt"
+  if [[ "$state" == "done" && "$piter" =~ ^[0-9]+$ ]] \
+     && [[ "$ptip" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+     && [[ "$post" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+     && [[ -s "$(local_artifact_path claude "$piter")" ]] \
+     && git -C "$REPO_DIR" rev-parse --verify --quiet "${post}^{commit}" >/dev/null 2>&1; then
+    # The turn validated and produced exactly $post. Anchor it, but only
+    # when the tip ref is where the loop itself left it — already at $post
+    # (the branch-scope commit moved it, or a re-run already anchored) or
+    # still at the pre-turn tip (never advanced). A ref anywhere else is a
+    # human's; refuse rather than clobber it.
+    reftip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "$(local_tip_ref)^{commit}" 2>/dev/null || true)
+    if [[ "$reftip" == "$post" || "$reftip" == "$ptip" ]]; then
+      if [[ "$reftip" != "$post" ]]; then
+        git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$post" \
+          || die "could not anchor iter $piter's commit $post in $REPO_DIR"
+      fi
+      write_state_atomic "$(local_tip_file)" "$post"
+      log "local: recovered iter $piter — anchored its commit $post"
+    else
+      rm -f "$(local_pending_turn_file)"
+      die "iter $piter produced commit $post but $(local_tip_ref) now points at $reftip — refusing to move it. Reconcile $REPO_DIR by hand, or remove $(local_state_dir) to start over"
+    fi
+  elif [[ "$piter" =~ ^[0-9]+$ ]]; then
+    # `pending` (or malformed): the turn's outcome was never validated, and
+    # the receipt records no committed SHA to prove which commit — if any —
+    # the turn produced. Invalidate the round so it re-runs. A PR-scope
+    # commit is on a detached HEAD local_setup_repo cleans; a branch-scope
+    # commit left the branch ahead of the recorded tip, which — since it
+    # cannot be told from a human commit — is left to local_setup_repo's
+    # fail-closed "moved outside the loop" check rather than force-reset
+    # (which would clobber a human commit made in the crash window).
+    rm -f "$(local_artifact_path claude "$piter")"
+  fi
+  rm -f "$(local_pending_turn_file)"
 }
 
 # Position the checkout for the first turn of this invocation. Fresh run:
@@ -870,8 +1094,14 @@ local_record_tip() {
 # record it as the squash base. Resumed run: restore the local tip so earlier
 # rounds are not lost.
 local_setup_repo() {
-  local d="$REPO_DIR" ref tip base origin_head r
+  local d="$REPO_DIR" ref tip base origin_head r expected finalized
   mkdir -p "$(local_state_dir)"
+  # Pin the push destination for the review's whole life: finalize refuses
+  # to push anywhere else, whichever turn or invocation changed the
+  # configuration in between. Written only when the review STARTS — a
+  # missing pin mid-review is not re-adopted (a turn could delete the file
+  # and redirect the remote); finalize fails closed on it instead.
+  [[ -s "$(local_base_file)" ]] || origin_dest > "$(local_origin_file)"
   ref=$(local_tip_ref)
   # A caller-supplied clone is checked ONCE per invocation before this
   # process takes it over, exactly as sync_repo_to_pr_head does — every
@@ -884,50 +1114,96 @@ local_setup_repo() {
   if [[ "$LOCAL_SCOPE" == "branch" ]]; then
     tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
       || die "could not resolve the branch under review ($ref) in $d"
+    # Resumed run: only this loop's own turns may move the branch mid-review.
+    # Check it against the expected tip recorded after the last committed
+    # round — before any cleanup touches the worktree. A branch that was
+    # reset lost rounds; one that advanced would get foreign commits squashed
+    # as review work. Both fail closed.
+    if [[ -s "$(local_base_file)" ]]; then
+      # A finalize interrupted before it anchored its squash left the branch
+      # at that squash while tip.sha still names the round; adopt it before
+      # comparing, so the loop's own work is not read as foreign movement.
+      local_adopt_finalized_squash || true
+      expected=''
+      [[ -s "$(local_tip_file)" ]] && expected=$(<"$(local_tip_file)")
+      [[ -n "$expected" ]] \
+        || die "local rounds are recorded for branch $HEAD_REF (base $(<"$(local_base_file)")) but no expected tip is — the state at $(local_state_dir) is incomplete; remove it to review the branch as it is now"
+      [[ "$tip" == "$expected" ]] \
+        || die "branch $HEAD_REF is at $tip but the last committed round left it at $expected — the branch moved outside the loop. Put it back on $expected to continue this review, or remove $(local_state_dir) to review the branch as it is now"
+    fi
     # Pin the diff base for the whole review. Both prompts diff against
     # refs/ai-pr-loop/base; with no forge to fetch it from, it comes from
     # --base (resolved by run.sh). The --no-deref delete first: a pre-planted
     # symref at that path would otherwise redirect the update onto some other
     # ref (rc 0 when the ref does not exist).
-    git -C "$d" update-ref --no-deref -d refs/ai-pr-loop/base \
+    git_safe -C "$d" update-ref --no-deref -d refs/ai-pr-loop/base \
       || die "could not clear stale ref refs/ai-pr-loop/base in $d"
-    git -C "$d" update-ref refs/ai-pr-loop/base "$LOCAL_BASE_SHA" \
+    git_safe -C "$d" update-ref refs/ai-pr-loop/base "$LOCAL_BASE_SHA" \
       || die "could not point refs/ai-pr-loop/base at $LOCAL_BASE_SHA in $d"
     force_clean_to_commit "$d" "$tip" attach
     if [[ ! -s "$(local_base_file)" ]]; then
       printf '%s\n' "$tip" > "$(local_base_file)"
-      log "local: squash base recorded at $tip (branch \$HEAD_REF)"
+      local_record_tip
+      log "local: squash base recorded at $tip (branch $HEAD_REF)"
     fi
     return
   fi
   base=''
   [[ -s "$(local_base_file)" ]] && base=$(<"$(local_base_file)")
   if [[ -n "$base" ]]; then
+    # A finalize interrupted before it anchored its squash left the ref at
+    # the round while finalized.sha names the squash; advance the ref to it
+    # (the killed local_record_tip's job) before resolving the tip.
+    local_adopt_finalized_squash || true
     tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
       || die "local rounds are recorded for this PR (base $base) but their commits are not in $d — the checkout was recreated or pruned, and that work cannot be recovered; remove $(local_state_dir) to start a fresh local run"
+    # The tip ref must still name the last committed round: a ref that moved
+    # outside the loop's own turns would silently drop rounds or adopt
+    # commits no turn produced.
+    expected=''
+    [[ -s "$(local_tip_file)" ]] && expected=$(<"$(local_tip_file)")
+    [[ -n "$expected" ]] \
+      || die "local rounds are recorded for this PR (base $base) but no expected tip is — the state at $(local_state_dir) is incomplete; remove it to start a fresh local run"
+    [[ "$tip" == "$expected" ]] \
+      || die "the local tip ref $ref is at $tip but the last committed round left it at $expected — it moved outside the loop; repoint it at $expected to continue this review, or remove $(local_state_dir) to start a fresh local run"
     # Refresh the base ref for this invocation's diffs, and prove the PR head
     # has not moved under us: local rounds are stacked on $base, so a remote
     # that advanced past it makes the eventual single push a non-fast-forward
     # (and the loop never force-pushes). Better to say so now than after
     # another few hours of agent turns.
     for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
-      git -C "$d" update-ref --no-deref -d "$r" || die "could not clear stale ref $r in $d"
+      git_safe -C "$d" update-ref --no-deref -d "$r" || die "could not clear stale ref $r in $d"
     done
-    git -C "$d" fetch --quiet origin \
+    git_safe -C "$d" fetch --quiet origin \
         "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
         "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
       || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
     origin_head=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
       || die "could not resolve the PR head after fetch"
-    [[ "$origin_head" == "$base" ]] \
-      || die "the PR head moved to $origin_head since this local run started at $base — its rounds can no longer be pushed as a fast-forward. Reconcile $d manually (the local rounds are at $ref), or remove $(local_state_dir) and re-run to review the new head from scratch"
+    if [[ "$origin_head" != "$base" ]]; then
+      # One remote position is not external movement: the exact squash this
+      # run already validated and pushed, with the crash landing between
+      # the push and the terminal marker. Resume so the finalize shortcut
+      # can complete the interrupted run (its re-push is a no-op).
+      finalized=$(local_finalized_sha)
+      if [[ -n "$finalized" && "$origin_head" == "$finalized" && "$tip" == "$finalized" ]] \
+         && [[ "$(local_finalized_kind)" == "squash" ]]; then
+        # Proof for the caller: this fetch saw the remote at the finalized
+        # squash, so a later probe that cannot reach the remote must not
+        # downgrade the conclusion.
+        LOCAL_FINALIZE_LANDED=1
+        log "local: the squashed commit $finalized already reached the remote — completing the interrupted finalization"
+      else
+        die "the PR head moved to $origin_head since this local run started at $base — its rounds can no longer be pushed as a fast-forward. Reconcile $d manually (the local rounds are at $ref), or remove $(local_state_dir) and re-run to review the new head from scratch"
+      fi
+    fi
     force_clean_to_commit "$d" "$tip" detach
     log "local: resuming local rounds at $tip (squash base $base)"
   else
     sync_repo_to_pr_head
     tip=$(git -C "$d" rev-parse HEAD) || die "could not read HEAD in $d"
     printf '%s\n' "$tip" > "$(local_base_file)"
-    git -C "$d" update-ref "$ref" "$tip" || die "could not create $ref in $d"
+    local_record_tip
     log "local: squash base recorded at $tip (PR head)"
   fi
 }
@@ -945,8 +1221,19 @@ sync_repo_to_local_head() {
     [[ "$(git -C "$d" symbolic-ref --quiet HEAD 2>/dev/null)" == "$ref" ]] \
       || die "HEAD in $d is not on $ref any more (a turn detached or switched it) — a local branch review commits onto that branch; put it back before re-running"
   fi
+  # A finalize interrupted before it anchored its squash left the tip at
+  # that squash while tip.sha still names the round; adopt it as the loop's
+  # own work before the check below would read it as foreign movement.
+  local_adopt_finalized_squash || true
   tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
     || die "local tip ref $ref is missing in $d — this run's local rounds are unreachable"
+  # The expected tip is recorded right after every committed round; a tip
+  # that moved off it means something other than an implementer turn
+  # committed, and syncing to it would adopt content no round produced.
+  # Checked only when recorded — this function is also driven standalone.
+  if [[ -s "$(local_tip_file)" ]] && [[ "$tip" != "$(<"$(local_tip_file)")" ]]; then
+    die "local tip $ref is at $tip but the last committed round left it at $(<"$(local_tip_file)") — it moved outside the loop's own turns; refusing to sync to it"
+  fi
   force_clean_to_commit "$d" "$tip" "$mode"
   [[ "$(git -C "$d" rev-parse HEAD)" == "$tip" ]] \
     || die "post-sync HEAD in $d is not the local tip $tip"
@@ -1871,7 +2158,10 @@ claude_run_prompt() {
 # an error rather than a silent mis-render: a dropped block would quietly
 # strip an agent's posting recipe, and a typo ({{#gitlba}}) has no other
 # symptom.
-PROMPT_BLOCK_TAGS='github gitlab forge local pr branch'
+# squash / nocommit select the finalize prompt's job: compose the squashed
+# commit's message, or — when the rounds land no net change on a PR/MR —
+# only assess the title/description.
+PROMPT_BLOCK_TAGS='github gitlab forge local pr branch squash nocommit'
 
 render_forge_blocks() {
   local template="$1" want="$2"

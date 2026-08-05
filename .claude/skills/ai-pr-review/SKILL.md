@@ -91,7 +91,11 @@ Optional flags worth surfacing if the user mentions a constraint:
     `state/<repo-ident>/<target>/iter-NN/`.
   - Rounds are committed locally and pushed only once, on agreement
     (`approved` / `converged_no_major`). The commit's message carries the
-    review's findings, fixes, and decisions.
+    review's findings, fixes, and decisions. A review that changes nothing
+    (all findings answered by pushback, or edits that cancel out) lands no
+    commit; the exchange files are its only record — say so when reporting.
+  - A completed review is terminal: re-running exits without doing
+    anything. `--restart` reviews the target as it now stands.
   - The push is fast-forward only. If the branch moved on the remote, the
     run fails with the squashed commit left in the checkout — report that
     to the user; never force-push on their behalf.

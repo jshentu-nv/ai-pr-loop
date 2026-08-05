@@ -377,6 +377,17 @@ section: findings the final code addresses, decisions taken (including
 suggestions evaluated and rejected, and why), and anything deliberately
 deferred.
 
+A review that ends in agreement without changing the tree — every finding
+answered by pushback, or rounds whose edits cancel out — lands no commit
+and pushes nothing. The exchange itself (findings, responses, decisions)
+stays in the state dir below, which is the review's only record in that
+case. On a PR/MR, the title and description are still checked and
+refreshed if the review agreed they were stale — that update is then the
+run's only external write. An update replaces the whole field, so it is
+delivered only when the PR/MR text is unchanged since the proposal was
+composed — a human edit made in between wins, and the run reassesses; a
+failed delivery keeps the run retryable.
+
 What the message must never contain is churn from inside the review — a
 defect introduced by one round and fixed by a later one isn't in the final
 diff, so it isn't in the message either. No iteration numbers, no round
@@ -390,7 +401,9 @@ state/<repo-ident>/<target>/
   iter-01/claude-response.md   # fixes, pushback, verification
   iter-02/...
   local/base.sha               # the commit the run started from
+  local/tip.sha                # where the last committed round left HEAD
   local/commit-message.txt     # the composed message for the squash
+  local/completed.sha          # terminal marker: the review's final commit
 ```
 
 Each file is that turn's completion contract, exactly as the summary
@@ -402,13 +415,13 @@ findings cite `path:line` in the review file.
 
 | Invocation | Scope | Forge use |
 |---|---|---|
-| `--local` with a PR/MR number or URL | `pr` | Read-only for metadata and human comments; one write at the end (the push, plus the title/description if the change made them stale). |
-| `--local --base REF`, no positional | `branch` | None at all — no token, no CLI. Reviews the branch `--dir` has checked out (default: the current directory) against `REF`. |
+| `--local` with a PR/MR number or URL | `pr` | Read-only API/CLI use for metadata and human comments. At the end, at most two writes: the `git push` of the squashed commit, plus one title/description update when the review left them stale. |
+| `--local --base REF`, no positional | `branch` | No forge API, CLI, or token. Reviews the branch `--dir` has checked out (default: the current directory) against `REF`. The end-of-review push still happens: a plain fast-forward `git push` to `origin`, unless `--no-push` is given or the checkout has no `origin`. |
 
 In `branch` scope the loop commits onto that branch and pushes it at the
-end if the checkout has an `origin`; without one, the squashed commit just
-stays local. `--base` takes any committish git resolves — `main`,
-`origin/main`, a tag, a SHA.
+end if the checkout has an `origin`; without one, the squashed commit on
+the branch is the review's result and the run is complete. `--base` takes
+any committish git resolves — `main`, `origin/main`, a tag, a SHA.
 
 ### Pushing
 
@@ -421,12 +434,18 @@ stays local. `--base` takes any committish git resolves — `main`,
   checkout for you to reconcile — the loop never force-pushes.
 - `--no-push` stops after creating the squashed commit. Re-running without
   the flag pushes it without composing the message again.
+- Once the commit is pushed — or landed locally with no `origin` to push
+  to — the review is complete and terminal: re-running the same command
+  exits without doing anything. Pass `--restart` to review the target as
+  it now stands, from a new base; commits made after completion (yours or
+  the bot's) are part of that new base and are never rewritten.
 
 ### Interruptions
 
 The rounds live only in the checkout, so the loop keeps them on a ref of
 its own (`refs/ai-pr-loop/local/pr-<N>`; in `branch` scope, the branch
-itself) and restores them on the next invocation. Two things fail closed
+itself), records the expected tip in `local/tip.sha` after every committed
+round, and restores them on the next invocation. Three things fail closed
 rather than guess:
 
 - The recorded rounds are missing from the checkout (it was recreated or
@@ -435,6 +454,10 @@ rather than guess:
 - The PR/MR head moved past the commit the rounds are stacked on — the
   squash could never be pushed as a fast-forward, so the run stops before
   spending more agent turns.
+- The branch (or the loop's tip ref) no longer matches the recorded tip —
+  it was reset or advanced outside the loop mid-review, so resuming would
+  lose rounds or adopt commits no turn produced. The run stops and says
+  how to reconcile.
 
 An errored turn and a killed run are both restarted by the auto-resume
 supervisor (below) until it reaches one of the exit-0 states or spends its
