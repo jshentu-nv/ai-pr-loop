@@ -13,9 +13,20 @@ HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 ID=$(iter_dir "$ITER")
 mkdir -p "$ID"
 
-# Snapshot prior AI thread for the model.
+# Where the review goes.
+#   forge mode — comments on the PR/MR; the prior AI thread is snapshotted
+#                here for the model to read.
+#   local mode — a file. It is this turn's completion contract, so a
+#                leftover from a crashed earlier attempt is removed first:
+#                only a review written by THIS run may count as done.
 THREAD_FILE="$ID/thread.ndjson"
-fetch_ai_thread > "$THREAD_FILE" || true
+REVIEW_FILE=$(local_artifact_path codex "$ITER")
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  rm -f "$REVIEW_FILE"
+  : > "$THREAD_FILE"
+else
+  fetch_ai_thread > "$THREAD_FILE" || true
+fi
 
 PREV_ITER=$(( ITER - 1 ))
 [[ $PREV_ITER -lt 0 ]] && PREV_ITER=0
@@ -25,7 +36,12 @@ PREV_ITER=$(( ITER - 1 ))
 # humans pushing commits, and the prompt section about Claude's pushback is
 # inapplicable.
 if [[ "${REVIEW_ONLY:-0}" == "1" ]]; then
-  MODE_NOTE="**Mode: review-only.** There is no Claude implementer in this loop -- humans address findings by pushing commits directly. The \"Response to Claude pushback\" section in step 7 is therefore inapplicable; rename it to \"Response to changes since iter ${PREV_ITER}\" and use it to note which prior findings the new commits resolved, accepted, or left open. If there is no prior iteration on this PR (ITER=1), omit that section entirely."
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    PUSHBACK_SECTION='Carried over'
+  else
+    PUSHBACK_SECTION="Response to Claude's pushback"
+  fi
+  MODE_NOTE="**Mode: review-only.** There is no Claude implementer in this loop -- humans address findings by pushing commits directly. The \"${PUSHBACK_SECTION}\" section in step 7 is therefore inapplicable; rename it to \"Response to changes since iter ${PREV_ITER}\" and use it to note which prior findings the new commits resolved, accepted, or left open. If there is no prior iteration on this PR (ITER=1), omit that section entirely."
 else
   MODE_NOTE=''
 fi
@@ -52,7 +68,7 @@ fi
 PROMPT_TEMPLATE="$HERE/prompts/codex.md"
 PROMPT_FILE="$ID/codex.prompt.md"
 forge_vocab
-render_forge_blocks "$PROMPT_TEMPLATE" "${FORGE:-github}" \
+render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
 | sed \
   -e "s|{{FORGE_NAME}}|${FORGE_NAME}|g" \
   -e "s|{{PR_NOUN_LONG}}|${PR_NOUN_LONG}|g" \
@@ -75,6 +91,8 @@ render_forge_blocks "$PROMPT_TEMPLATE" "${FORGE:-github}" \
   -e "s|{{PREV_ITER}}|${PREV_ITER}|g" \
   -e "s|{{MAX_ITER}}|${MAX_ITER}|g" \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
+  -e "s|{{REVIEW_FILE}}|${REVIEW_FILE}|g" \
+  -e "s|{{HISTORY_DIR}}|${STATE_DIR}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
@@ -196,25 +214,32 @@ fi
 
 log "codex: iter $ITER — exit $RC"
 
-# The summary comment is the turn's completion contract (the prompt posts it
-# last, after every inline note). Trusting stdout alone is not enough: a run
-# can print its verdict even though the summary POST failed, or die after
-# posting only inline notes. Refetch the thread and require this iteration's
-# summary before recording any CANONICAL counts or verdict — failing without
+# The turn's completion contract — the summary comment in forge mode, the
+# written review file in local mode. The prompt produces it LAST, after every
+# inline note / finding, so its absence means the turn did not finish.
+# Trusting stdout alone is not enough: a run can print its verdict even though
+# the summary POST failed or the review was never written. Require the
+# artifact before recording any CANONICAL counts or verdict — failing without
 # one means the next invocation re-reviews at this same iteration, since the
-# resume high-water also only counts summaries. A summary that LANDED is a
+# resume high-water counts the same artifact. A summary that LANDED is a
 # real, public review even when the CLI then exited nonzero: persist its
 # counts and verdict before failing the turn, so a relaunch's resume
 # accounts for what the PR already shows (convergence included).
 #
 # The stdout parse is ALWAYS persisted provisionally (*.stdout files) first:
-# this verification read can itself fail transiently right after a POST that
-# landed, and the durable stdout record must survive that. Resume adopts the
-# provisional files only once the public high-water confirms the summary
-# (adopt_landed_codex_artifacts in run.sh) — a run whose POST truly never
-# landed leaves provisional files that nothing ever adopts.
+# in forge mode this verification read can itself fail transiently right after
+# a POST that landed, and the durable stdout record must survive that. Resume
+# adopts the provisional files only once the public high-water confirms the
+# summary (adopt_landed_codex_artifacts in run.sh) — a run whose POST truly
+# never landed leaves provisional files that nothing ever adopts. Local mode
+# has no public surface to confirm against: the file on disk IS the record, so
+# the probe below is the only check and adoption never applies.
 SUMMARY_LANDED=0
-verify_ai_summary codex "$ITER" && SUMMARY_LANDED=1
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  local_artifact_written codex "$ITER" && SUMMARY_LANDED=1
+else
+  verify_ai_summary codex "$ITER" && SUMMARY_LANDED=1
+fi
 
 # Parse issue counts (last occurrence wins). Missing line → counts unknown,
 # orchestrator treats convergence as not-met.
@@ -265,13 +290,21 @@ if [[ $RC -ne 0 ]]; then
   log "codex stderr (tail):"
   tail -20 "$ID/codex.stderr" >&2 || true
   if (( SUMMARY_LANDED == 1 )); then
-    log "codex: the iter $ITER summary landed before the CLI failure — counts and verdict persisted for resume"
+    if [[ "$LOCAL_MODE" == "1" ]]; then
+      log "codex: the iter $ITER review landed before the CLI failure — counts and verdict persisted for resume"
+    else
+      log "codex: the iter $ITER summary landed before the CLI failure — counts and verdict persisted for resume"
+    fi
   fi
   exit 1
 fi
 
 if (( SUMMARY_LANDED == 0 )); then
-  log "codex: iter $ITER summary comment not found on the PR — failing the turn (stdout verdict ignored)"
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    log "codex: iter $ITER review file $REVIEW_FILE is missing or empty — failing the turn (stdout verdict ignored)"
+  else
+    log "codex: iter $ITER summary comment not found on the PR — failing the turn (stdout verdict ignored)"
+  fi
   exit 1
 fi
 

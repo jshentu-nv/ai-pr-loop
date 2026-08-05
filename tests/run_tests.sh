@@ -64,6 +64,13 @@
 #   - portability branches, live: a perl-only PATH (no setsid) reparents
 #     the supervisor and survives the tree reap; a setsid without -f and
 #     no perl falls back inline with a warning naming the -f gap
+#   - local review mode: flag validation and --print-config reporting, the
+#     state key for a PR-less branch review, resume high-water from the
+#     per-round files, both turn scripts' file contracts (written artifact
+#     completes the turn; a stale one does not), the forge staying
+#     read-only on a PR/MR target, and — against real git — checkout
+#     positioning across invocations, squash-into-one-commit, the
+#     fast-forward-only push, and the single post-push PR/MR text write
 #   - gitlab plumbing: preflight token resolution via the glab stub (incl.
 #     OAuth-session rejection), fetch_ai_thread mapping of /discussions
 #     (surfaces, discussion_id, reply chaining, system/non-marker filtering),
@@ -168,6 +175,31 @@ if [[ "${STUB_RUNTIME_AUTO_ABORT:-0}" == "1" ]]; then
   echo "Error: repeated permission blocks, so auto mode cannot determine the safety of this action" >&2
   exit 1
 fi
+# The finalize turn of a local review: compose the squashed commit's message
+# (its own prompt, its own marker). STUB_NO_FINALIZE_MSG=1 prints the marker
+# without writing the file — the shape a crashed compose leaves behind.
+for a in "$@"; do
+  case "$a" in
+    *"Finalize the local review"*)
+      if [[ "${STUB_NO_FINALIZE_MSG:-0}" != "1" ]]; then
+        mkdir -p "$STATE_DIR/local"
+        printf '%s\n' "${STUB_FINALIZE_MSG:-Squashed subject line}" \
+          > "$STATE_DIR/local/commit-message.txt"
+      fi
+      [[ "${STUB_FINALIZE_TITLE:-}" == "" ]] \
+        || printf '%s\n' "$STUB_FINALIZE_TITLE" > "$STATE_DIR/local/pr-title.txt"
+      [[ "${STUB_FINALIZE_DESC:-}" == "" ]] \
+        || printf '%s\n' "$STUB_FINALIZE_DESC" > "$STATE_DIR/local/pr-description.md"
+      echo "[CLAUDE_FINALIZE: COMPLETE]"
+      exit 0
+      ;;
+  esac
+done
+# Local review mode: the turn's contract is a written response file, not a
+# comment. STUB_NO_LOCAL_ARTIFACT=1 prints the marker without writing it.
+if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" ]]; then
+  printf 'stub response\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/claude-response.md"
+fi
 echo "[CLAUDE_TURN: COMPLETE]"
 EOF
 
@@ -185,6 +217,11 @@ printf '{"payload":{"id":"foreign-root-uuid","cwd":"/other-checkout","source":"e
   > "$CODEX_HOME/sessions/rollout-a-decoy.jsonl"
 printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
   > "$CODEX_HOME/sessions/rollout-stub.jsonl"
+# Local review mode: the turn's contract is a written review file.
+# STUB_NO_LOCAL_ARTIFACT=1 prints a verdict without writing it.
+if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" ]]; then
+  printf 'stub review\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/codex-review.md"
+fi
 if [[ "${STUB_CODEX_SILENT:-0}" != "1" ]]; then
   echo "[CODEX_ISSUES: ${STUB_CODEX_ISSUES:-BLOCKER=0 MAJOR=0 NIT=0}]"
   echo "[CODEX_VERDICT: ${STUB_CODEX_VERDICT:-APPROVED}]"
@@ -231,6 +268,10 @@ case "$*" in
     fi
     RAW="[$(IFS=,; echo "${els[*]}")]"
     ;;
+  *"pr edit"*)
+    : > "${ARGV_FILE}.ghedit"
+    for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.ghedit"; done
+    exit 0 ;;
   *) RAW='[]' ;;
 esac
 if [[ -n "$JQ_PROG" ]]; then jq -c "$JQ_PROG" <<<"$RAW"; else printf '%s\n' "$RAW"; fi
@@ -1012,7 +1053,7 @@ t "claude: dies instead of answering a stale review when this iter's codex summa
 new_case claude-stale-review
 run_turn claude STUB_NO_CODEX_SUMMARY=1
 assert_eq "$TURN_RC" 1
-if grep -q "codex summary for iter 1 not found" "$CASE_DIR/turn.log"; then
+if grep -q "codex review for iter 1 not found" "$CASE_DIR/turn.log"; then
   ok
 else
   bad "missing die message (log: $(tail -2 "$CASE_DIR/turn.log" 2>/dev/null | tr '\n' ' '))"
@@ -4205,10 +4246,29 @@ printf 'a\n{{/github}}\n' > "$WORK/bad.md"
 if render_forge_blocks "$WORK/bad.md" github >/dev/null 2>&1; then
   bad "unmatched close exited 0"; else ok; fi
 
-t "render_forge_blocks: nested blocks are an error"
-printf '{{#github}}\n{{#gitlab}}\nx\n{{/gitlab}}\n{{/github}}\n' > "$WORK/bad.md"
-if render_forge_blocks "$WORK/bad.md" github >/dev/null 2>&1; then
-  bad "nested block exited 0"; else ok; fi
+t "render_forge_blocks: crossed close markers are an error"
+printf '{{#pr}}\n{{#github}}\nx\n{{/pr}}\n{{/github}}\n' > "$WORK/bad.md"
+if render_forge_blocks "$WORK/bad.md" "pr github" >/dev/null 2>&1; then
+  bad "crossed close markers exited 0"; else ok; fi
+
+t "render_forge_blocks: a tag outside the vocabulary is an error, not a silent drop"
+printf '{{#gitlba}}\nx\n{{/gitlba}}\n' > "$WORK/bad.md"
+if render_forge_blocks "$WORK/bad.md" "gitlab pr" >/dev/null 2>&1; then
+  bad "typo'd tag exited 0"; else ok; fi
+
+t "render_forge_blocks: nested blocks keep the inner text only when both tags are active"
+_frag=$(printf 'a\n{{#pr}}\npr\n{{#gitlab}}\nglab\n{{/gitlab}}\n{{#github}}\ngh\n{{/github}}\n{{/pr}}\n{{#branch}}\nbr\n{{/branch}}\nz\n')
+_r=$(printf '%s\n' "$_frag" | render_fixture "local pr gitlab")
+assert_eq "$_r" "$(printf 'a\npr\nglab\nz')"
+
+t "render_forge_blocks: an inactive outer block drops its active inner block"
+_r=$(printf '%s\n' "$_frag" | render_fixture "local branch")
+assert_eq "$_r" "$(printf 'a\nbr\nz')"
+
+t "prompt_tags: forge/local and pr/branch axes"
+assert_eq "$(LOCAL_MODE=0 LOCAL_SCOPE=pr FORGE=gitlab prompt_tags)" 'forge pr gitlab'
+assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github prompt_tags)" 'local pr github'
+assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local prompt_tags)" 'local branch'
 
 t "forge_vocab: github nouns"
 FORGE=github REPO_SLUG=o/n PR_NUMBER=7 FORGE_HOST=github.com forge_vocab
@@ -4221,38 +4281,542 @@ assert_eq "$PR_NOUN|$SUMMARY_NOUN|$TOKEN_NOUN" 'MR|MR note|GitLab token'
 t "forge_vocab: gitlab reference carries the host"
 assert_eq "$PR_REF" '`g/s/p!7` on `gl.example.com`'
 
+# Every combination the loop can run: exchange mode (forge | local) x scope
+# (pr | branch) x forge. A block that leaks — or silently vanishes — would
+# ship an agent the wrong contract, which no other test would catch.
 for _agent in claude codex; do
   [[ "$_agent" == claude ]] && _tag=ai-loop:claude-implementer || _tag=ai-loop:codex-reviewer
-  for _forge in github gitlab; do
-    _out=$(render_forge_blocks "$ROOT/prompts/$_agent.md" "$_forge") || _out=''
+  [[ "$_agent" == claude ]] && _artifact=claude-response.md || _artifact=codex-review.md
+  for _tags in "forge pr github" "forge pr gitlab" \
+               "local pr github" "local pr gitlab" "local branch"; do
+    _out=$(render_forge_blocks "$ROOT/prompts/$_agent.md" "$_tags") || _out=''
 
-    t "prompts/$_agent.md [$_forge]: renders and leaves no block markers"
+    t "prompts/$_agent.md [$_tags]: renders and leaves no block markers"
     if [[ -n "$_out" ]] && ! grep -qE '\{\{[#/]' <<<"$_out"; then ok
     else bad "empty render or leftover {{#…}} markers"; fi
 
-    t "prompts/$_agent.md [$_forge]: orchestrator's comment marker survives"
-    assert_render_has "$_out" "$_tag"
-
-    t "prompts/$_agent.md [$_forge]: runtime-validation mandate survives"
+    t "prompts/$_agent.md [$_tags]: runtime-validation mandate survives"
     assert_render_has "$_out" 'A missing toolchain is not an excuse'
 
-    if [[ "$_forge" == github ]]; then
-      t "prompts/$_agent.md [github]: no GitLab mechanics leak"
-      assert_render_lacks "$_out" 'PRIVATE-TOKEN'
-      t "prompts/$_agent.md [github]: uses the gh CLI"
-      assert_render_has "$_out" 'gh '
-    else
-      t "prompts/$_agent.md [gitlab]: no GitHub mechanics leak"
-      assert_render_lacks "$_out" 'gh api'
-      t "prompts/$_agent.md [gitlab]: uses curl with the token header"
-      assert_render_has "$_out" 'PRIVATE-TOKEN'
-    fi
+    case "$_tags" in
+      forge*)
+        t "prompts/$_agent.md [$_tags]: orchestrator's comment marker survives"
+        assert_render_has "$_out" "$_tag"
+        ;;
+      *)
+        t "prompts/$_agent.md [$_tags]: names the file that is the turn's contract"
+        assert_render_has "$_out" "$_artifact"
+        t "prompts/$_agent.md [$_tags]: no comment-posting recipe survives"
+        assert_render_lacks "$_out" 'gh pr comment'
+        assert_render_lacks "$_out" 'gh api --method POST'
+        assert_render_lacks "$_out" '/notes"'
+        assert_render_lacks "$_out" 'in_reply_to'
+        ;;
+    esac
+
+    case "$_tags" in
+      forge*github)
+        t "prompts/$_agent.md [$_tags]: no GitLab mechanics leak"
+        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
+        t "prompts/$_agent.md [$_tags]: uses the gh CLI"
+        assert_render_has "$_out" 'gh pr'
+        ;;
+      forge*gitlab)
+        t "prompts/$_agent.md [$_tags]: no GitHub mechanics leak"
+        assert_render_lacks "$_out" 'gh api'
+        t "prompts/$_agent.md [$_tags]: uses curl with the token header"
+        assert_render_has "$_out" 'PRIVATE-TOKEN'
+        ;;
+      local*github)
+        t "prompts/$_agent.md [$_tags]: no GitLab mechanics leak"
+        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
+        ;;
+      local*gitlab)
+        t "prompts/$_agent.md [$_tags]: no GitHub mechanics leak"
+        assert_render_lacks "$_out" 'gh api'
+        assert_render_lacks "$_out" 'gh pr'
+        ;;
+      *branch)
+        t "prompts/$_agent.md [$_tags]: no forge mechanics at all"
+        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
+        assert_render_lacks "$_out" 'gh pr'
+        assert_render_lacks "$_out" 'gh api'
+        assert_render_lacks "$_out" 'glab '
+        ;;
+    esac
   done
+done
+
+t "prompts/codex.md [local pr github]: keeps read-only PR access"
+_out=$(render_forge_blocks "$ROOT/prompts/codex.md" "local pr github")
+assert_render_has "$_out" 'gh pr view'
+assert_render_has "$_out" 'Never write to it'
+
+t "prompts/codex.md [local pr gitlab]: keeps read-only MR access"
+_out=$(render_forge_blocks "$ROOT/prompts/codex.md" "local pr gitlab")
+assert_render_has "$_out" 'PRIVATE-TOKEN'
+assert_render_has "$_out" 'Never write to it'
+
+t "prompts/claude.md [local pr *]: the implementer defers the title/description"
+for _f in github gitlab; do
+  _out=$(render_forge_blocks "$ROOT/prompts/claude.md" "local pr $_f")
+  assert_render_has "$_out" 'Description drift'
+done
+
+# The finalize prompt exists only for local mode.
+for _tags in "local pr github" "local pr gitlab" "local branch"; do
+  _out=$(render_forge_blocks "$ROOT/prompts/finalize.md" "$_tags") || _out=''
+
+  t "prompts/finalize.md [$_tags]: renders and leaves no block markers"
+  if [[ -n "$_out" ]] && ! grep -qE '\{\{[#/]' <<<"$_out"; then ok
+  else bad "empty render or leftover {{#…}} markers"; fi
+
+  t "prompts/finalize.md [$_tags]: bans review churn from the message"
+  assert_render_has "$_out" 'No churn from inside the review'
+
+  t "prompts/finalize.md [$_tags]: demands the completion marker"
+  assert_render_has "$_out" '[CLAUDE_FINALIZE: COMPLETE]'
+
+  case "$_tags" in
+    *branch)
+      t "prompts/finalize.md [$_tags]: no title/description step without a PR/MR"
+      assert_render_lacks "$_out" 'title and description true'
+      ;;
+    *)
+      t "prompts/finalize.md [$_tags]: keeps the title/description step"
+      assert_render_has "$_out" 'title and description true'
+      ;;
+  esac
 done
 
 t "prompts: the forked per-forge copies are gone"
 if [[ -e "$ROOT/prompts/claude.gitlab.md" || -e "$ROOT/prompts/codex.gitlab.md" ]]; then
   bad "a *.gitlab.md prompt fork still exists"; else ok; fi
+
+# --- local review mode: flags ----------------------------------------------
+
+t "run.sh: --base is rejected without --local"
+run_run_sh --repo o/n --base main 42
+assert_dies_with "--base only applies to --local"
+
+t "run.sh: --no-push is rejected without --local"
+run_run_sh --repo o/n --no-push 42
+assert_dies_with "--no-push only applies to --local"
+
+t "run.sh: --base is rejected alongside a PR/MR"
+run_run_sh --repo o/n --local --base main 42
+assert_dies_with "--base is for a local review with no PR/MR"
+
+t "run.sh: a PR-less local review requires --base"
+run_run_sh --local
+assert_dies_with "--base REF is required"
+
+t "run.sh: a PR-less local review rejects --repo"
+run_run_sh --local --base main --repo o/n
+assert_dies_with "--repo is not used"
+
+t "run.sh: a PR-less local review rejects --host"
+run_run_sh --local --base main --host gl.example.com
+assert_dies_with "--host is not used"
+
+t "run.sh: a PR-less local review rejects --forge"
+run_run_sh --local --base main --forge gitlab
+assert_dies_with "--forge is not used"
+
+t "run.sh: forge mode is reported by --print-config"
+run_run_sh --repo o/n --print-config 42
+assert_prints 'mode: forge scope=pr base=- push=yes'
+
+t "run.sh: local mode on a PR is reported by --print-config"
+run_run_sh --repo o/n --local --print-config 42
+assert_prints 'mode: local scope=pr base=- push=yes'
+
+t "run.sh: --no-push is reported by --print-config"
+run_run_sh --repo o/n --local --no-push --print-config 42
+assert_prints 'mode: local scope=pr base=- push=no'
+
+t "run.sh: a PR-less local review is reported by --print-config"
+run_run_sh --local --base origin/main --dir "$WORK" --print-config
+assert_prints 'mode: local scope=branch base=origin/main push=yes'
+
+t "run.sh: a PR-less local review needs an existing directory"
+run_run_sh --local --base main --dir "$WORK/no-such-dir"
+assert_dies_with "no such directory"
+
+t "run.sh: a PR-less local review needs a git work tree"
+mkdir -p "$WORK/plain-dir"
+run_run_sh --local --base main --dir "$WORK/plain-dir"
+assert_dies_with "not a git work tree"
+
+# --- local review mode: state identity -------------------------------------
+
+t "state: a PR-less local review is keyed by checkout path + branch"
+_ident=$(REPO_DIR_CANON=/x/y/repo HEAD_REF=feature/z LOCAL_SCOPE=branch \
+         "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; printf '%s/%s\n' \
+           \"\$(repo_ident_name)\" \"\$(state_leaf_name)\"")
+case "$_ident" in
+  local__repo-*/branch-feature_z-*) ok ;;
+  *) bad "unexpected state key '$_ident'" ;;
+esac
+
+t "state: two branches of one checkout get distinct state"
+_a=$(REPO_DIR_CANON=/x/y/repo HEAD_REF=a LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; state_leaf_name")
+_b=$(REPO_DIR_CANON=/x/y/repo HEAD_REF=b LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; state_leaf_name")
+if [[ "$_a" != "$_b" ]]; then ok; else bad "branches 'a' and 'b' share state leaf '$_a'"; fi
+
+t "state: same-named branches in different checkouts get distinct state"
+_a=$(REPO_DIR_CANON=/x/one HEAD_REF=f LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; repo_ident_name")
+_b=$(REPO_DIR_CANON=/x/two HEAD_REF=f LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; repo_ident_name")
+if [[ "$_a" != "$_b" ]]; then ok; else bad "two checkouts share the identity '$_a'"; fi
+
+t "state: a forge target's state key is unchanged by the local-mode plumbing"
+_ident=$(FORGE=github REPO_SLUG=o/n PR_NUMBER=7 "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; printf '%s/%s\n' \
+           \"\$(repo_ident_name)\" \"\$(state_leaf_name)\"")
+assert_eq "$_ident" 'o__n/pr-7'
+
+# --- local review mode: resume high-water ----------------------------------
+
+_lh="$WORK/local-hw"; mkdir -p "$_lh/iter-01" "$_lh/iter-02" "$_lh/iter-03"
+printf 'r\n' > "$_lh/iter-01/codex-review.md"
+printf 'a\n' > "$_lh/iter-01/claude-response.md"
+printf 'r\n' > "$_lh/iter-02/codex-review.md"
+printf 'a\n' > "$_lh/iter-02/claude-response.md"
+printf 'r\n' > "$_lh/iter-03/codex-review.md"
+: >       "$_lh/iter-03/claude-response.md"          # crashed turn: empty file
+
+t "latest_local_iter: counts the reviewer's completed rounds"
+assert_eq "$(STATE_DIR="$_lh" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; latest_local_iter codex")" 3
+
+t "latest_local_iter: an empty artifact does not count as a completed round"
+assert_eq "$(STATE_DIR="$_lh" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; latest_local_iter claude")" 2
+
+t "latest_local_iter: a state dir with no rounds reports 0"
+mkdir -p "$WORK/local-hw-empty"
+assert_eq "$(STATE_DIR="$WORK/local-hw-empty" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; latest_local_iter codex")" 0
+
+# --- local review mode: turn contracts -------------------------------------
+# The turn scripts must never touch the forge in local mode, and each turn's
+# written artifact — not its stdout marker — is what completes it.
+
+local_turn() {  # <claude|codex> [VAR=VALUE ...]
+  local who="$1"; shift
+  mkdir -p "$CASE_DIR/state/iter-01"
+  run_turn "$who" LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local \
+    REPO_SLUG= REPO_OWNER= REPO_NAME= PR_NUMBER= GH_USER= "$@"
+}
+
+t "codex_turn [local]: writes the review file and completes"
+new_case codex-local
+local_turn codex
+assert_rc0
+assert_substr "$CASE_DIR/state/iter-01/codex-review.md" 'stub review'
+
+t "codex_turn [local]: renders the local prompt, not a posting recipe"
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'codex-review.md'
+assert_no_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'gh pr comment'
+
+t "codex_turn [local]: fails the turn when no review file was written"
+new_case codex-local-noartifact
+local_turn codex STUB_NO_LOCAL_ARTIFACT=1
+assert_eq "$TURN_RC" 1
+
+t "codex_turn [local]: a stale review file cannot complete a crashed turn"
+new_case codex-local-stale
+mkdir -p "$CASE_DIR/state/iter-01"
+printf 'left over from a crashed attempt\n' > "$CASE_DIR/state/iter-01/codex-review.md"
+local_turn codex STUB_NO_LOCAL_ARTIFACT=1
+assert_eq "$TURN_RC" 1
+
+t "claude_turn [local]: answers the review file and writes its response"
+new_case claude-local
+mkdir -p "$CASE_DIR/state/iter-01"
+printf 'stub review\n' > "$CASE_DIR/state/iter-01/codex-review.md"
+local_turn claude
+assert_rc0
+assert_substr "$CASE_DIR/state/iter-01/claude-response.md" 'stub response'
+assert_pair "$ARGV" --add-dir "$CASE_DIR/state"
+
+t "claude_turn [local]: fails the turn when no response file was written"
+new_case claude-local-noartifact
+mkdir -p "$CASE_DIR/state/iter-01"
+printf 'stub review\n' > "$CASE_DIR/state/iter-01/codex-review.md"
+local_turn claude STUB_NO_LOCAL_ARTIFACT=1
+assert_eq "$TURN_RC" 1
+
+t "claude_turn [local]: dies when the reviewer wrote no review"
+new_case claude-local-noreview
+local_turn claude
+assert_eq "$TURN_RC" 1
+assert_substr "$CASE_DIR/turn.log" 'codex review for iter 1 not found'
+
+# --- local review mode: squash + push (real git) ---------------------------
+
+local_fixture() {  # -> $LF_REMOTE $LF_CLONE $LF_STATE $LF_BASE, branch feature/x
+  local n="loc$RANDOM$RANDOM"
+  LF_REMOTE="$WORK/$n-remote.git"; git init -q --bare -b main "$LF_REMOTE"
+  LF_CLONE="$WORK/$n-clone"; git init -q -b main "$LF_CLONE"
+  git -C "$LF_CLONE" config user.email t@t; git -C "$LF_CLONE" config user.name t
+  git -C "$LF_CLONE" remote add origin "$LF_REMOTE"
+  echo base > "$LF_CLONE/f"; git -C "$LF_CLONE" add f; git -C "$LF_CLONE" commit -qm base
+  git -C "$LF_CLONE" push -q origin HEAD:refs/heads/main
+  git -C "$LF_CLONE" checkout -qb feature/x
+  echo head >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "human work"
+  git -C "$LF_CLONE" push -q origin HEAD:refs/heads/feature/x
+  LF_BASE=$(git -C "$LF_CLONE" rev-parse HEAD)
+  LF_STATE="$WORK/$n-state"; mkdir -p "$LF_STATE/local"
+  printf '%s\n' "$LF_BASE" > "$LF_STATE/local/base.sha"
+}
+local_round() {  # <n> — one implementer round, committed locally
+  printf 'round %s\n' "$1" >> "$LF_CLONE/f"
+  git -C "$LF_CLONE" commit -qam "round $1"
+}
+finalize_run() {  # [VAR=VALUE ...]
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/fin-argv" \
+    CODEX_HOME="$WORK/codex-home" \
+    LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local MANAGED_CLONE=0 \
+    REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
+    BASE_REF=main HEAD_REF=feature/x ITER=3 MAX_ITER=6 \
+    REPO_SLUG= REPO_OWNER= REPO_NAME= PR_NUMBER= GH_USER= \
+    HAS_CONTEXT=0 CLAUDE_MODEL=off CLAUDE_EFFORT=off CLAUDE_PERMS=off \
+    "$@" \
+    "$BASH_BIN" "$ROOT/finalize_turn.sh" > "$WORK/fin.log" 2>&1
+  FIN_RC=$?
+}
+remote_head() { git -C "$LF_REMOTE" rev-parse refs/heads/feature/x; }
+local_head()  { git -C "$LF_CLONE" rev-parse HEAD; }
+
+t "finalize: three local rounds become one pushed commit"
+local_fixture; local_round 1; local_round 2; local_round 3
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
+assert_eq "$(remote_head)" "$(local_head)"
+
+t "finalize: the pushed commit carries the composed message"
+assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s)" 'Squashed subject line'
+
+t "finalize: the pushed commit is authored by the implementer bot"
+assert_eq "$(git -C "$LF_CLONE" log -1 --format=%an)" 'claude-implementer (ai-bot)'
+
+t "finalize: the human's own commits are left untouched"
+assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s "$LF_BASE")" 'human work'
+
+t "finalize: the squashed tree is exactly what the rounds produced"
+assert_eq "$(cat "$LF_CLONE/f" | tr '\n' ' ')" 'base head round 1 round 2 round 3 '
+
+t "finalize: a fresh run after the push has nothing left to do"
+finalize_run
+assert_eq "$FIN_RC" 3
+
+t "finalize: --no-push squashes but leaves the remote alone"
+local_fixture; local_round 1; local_round 2
+finalize_run NO_PUSH=1
+assert_eq "$FIN_RC" 0
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: re-running a held squash pushes it without composing again"
+finalize_run STUB_NO_FINALIZE_MSG=1     # a re-compose would leave no message
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s)" 'Squashed subject line'
+
+t "finalize: rounds with no net change push nothing"
+local_fixture
+printf 'x\n' >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "round 1"
+git -C "$LF_CLONE" revert --no-edit HEAD >/dev/null
+finalize_run
+assert_eq "$FIN_RC" 3
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: a branch that moved on the remote is never force-pushed"
+local_fixture; local_round 1
+git -C "$LF_CLONE" push -q origin "$LF_BASE:refs/heads/side"   # keep the object
+_moved=$(git -C "$LF_CLONE" commit-tree "$LF_BASE^{tree}" -p "$LF_BASE" -m "someone else" \
+           -c user.name=o -c user.email=o@o 2>/dev/null \
+         || GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@o GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@o \
+            git -C "$LF_CLONE" commit-tree "$LF_BASE^{tree}" -p "$LF_BASE" -m "someone else")
+git -C "$LF_CLONE" push -q origin "$_moved:refs/heads/feature/x"
+finalize_run
+assert_eq "$FIN_RC" 1
+assert_eq "$(remote_head)" "$_moved"
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
+
+t "finalize: a compose that wrote no message leaves the rounds intact"
+local_fixture; local_round 1; local_round 2
+finalize_run STUB_NO_FINALIZE_MSG=1
+assert_eq "$FIN_RC" 1
+assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 2
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: refuses to rewrite history it did not create"
+local_fixture; local_round 1
+git -C "$LF_CLONE" reset -q --hard "$LF_BASE~1"   # branch moved off the recorded base
+finalize_run
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'no longer descends from the squash base'
+
+# --- local review mode: positioning a PR/MR run ----------------------------
+# The rounds of a PR-scope run sit on a detached HEAD in a checkout shared
+# with other PRs of the repo, so they are kept on a private ref and restored
+# on the next invocation. Driven directly: run.sh's clone guard rejects the
+# local-path origin a fixture must use.
+
+setup_run() {  # <fn> [VAR=VAL ...] — run one lib function against the fixture
+  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    LOCAL_MODE=1 LOCAL_SCOPE=pr MANAGED_CLONE=1 PR_NUMBER=42 \
+    REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
+    "${@:2}" \
+    "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; $1" > "$WORK/setup.log" 2>&1
+}
+
+t "local_setup_repo [branch]: pins the diff base from --base"
+local_fixture; rm -f "$LF_STATE/local/base.sha"
+_want=$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch MANAGED_CLONE=0 \
+     REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
+     LOCAL_BASE_SHA="$_want" \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_setup_repo" >/dev/null 2>&1; then
+  assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/base)" "$_want"
+  assert_eq "$(cat "$LF_STATE/local/base.sha")" "$LF_BASE"
+else
+  bad "local_setup_repo failed in branch scope"
+fi
+
+t "local_setup_repo [PR/MR]: starts at the PR head and records it as the base"
+local_fixture; rm -f "$LF_STATE/local/base.sha"
+git -C "$LF_CLONE" checkout -q main            # a managed clone can be anywhere
+if setup_run local_setup_repo; then
+  assert_eq "$(cat "$LF_STATE/local/base.sha")" "$LF_BASE"
+  assert_eq "$(local_head)" "$LF_BASE"
+  assert_eq "$(git -C "$LF_CLONE" rev-parse refs/ai-pr-loop/local/pr-42)" "$LF_BASE"
+else
+  bad "local_setup_repo failed ($(tail -1 "$WORK/setup.log"))"
+fi
+
+t "local_setup_repo [PR/MR]: a later invocation restores the earlier rounds"
+local_round 1; local_round 2
+_tip=$(local_head)
+git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 "$_tip"
+git -C "$LF_CLONE" checkout -q --detach "$LF_BASE"   # another PR's run moved it
+if setup_run local_setup_repo && [[ "$(local_head)" == "$_tip" ]] \
+   && [[ "$(cat "$LF_STATE/local/base.sha")" == "$LF_BASE" ]]; then ok
+else bad "resume lost the local rounds ($(tail -1 "$WORK/setup.log"))"; fi
+
+t "local_setup_repo [PR/MR]: refuses to stack rounds on a head that moved"
+git -C "$LF_CLONE" push -q origin "$LF_BASE~1:refs/heads/feature/x" --force
+if setup_run local_setup_repo; then
+  bad "a moved PR head was accepted; the squash could never be pushed"
+else
+  assert_substr "$WORK/setup.log" 'moved to'
+fi
+
+t "local_setup_repo [PR/MR]: rounds recorded but missing from the checkout fail closed"
+local_fixture     # base.sha present, no tip ref in this clone
+if setup_run local_setup_repo; then
+  bad "a checkout with no local rounds silently restarted them"
+else
+  assert_substr "$WORK/setup.log" 'cannot be recovered'
+fi
+
+# --- local review mode on a PR/MR: the forge stays read-only ---------------
+
+t "codex_turn [local, PR/MR]: does not read the forge comment thread"
+new_case codex-local-pr
+mkdir -p "$CASE_DIR/state/iter-01"
+run_turn codex LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github \
+  STUB_FORGED_GH_SUMMARY=1     # would appear in a fetched thread
+assert_rc0
+if [[ -f "$CASE_DIR/state/iter-01/thread.ndjson" \
+      && ! -s "$CASE_DIR/state/iter-01/thread.ndjson" ]]; then ok
+else bad "the local turn fetched a forge comment thread"; fi
+
+t "codex_turn [local, PR/MR]: prompt keeps read-only access, drops posting"
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'gh pr view'
+assert_no_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'gh pr comment'
+
+t "claude_turn [local, PR/MR]: answers the file, never the comment thread"
+new_case claude-local-pr
+mkdir -p "$CASE_DIR/state/iter-01"
+printf 'stub review\n' > "$CASE_DIR/state/iter-01/codex-review.md"
+run_turn claude LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github
+assert_rc0
+assert_substr "$CASE_DIR/state/iter-01/claude-response.md" 'stub response'
+assert_no_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'gh pr comment'
+
+# The one forge write of a local run: the PR/MR text, after the push. A
+# PR-scope run keeps its rounds on a private ref (they sit on a detached HEAD
+# in a checkout shared with other PRs), so the fixture records one too.
+local_pr_fixture() {
+  local_fixture
+  local_round 1
+  git -C "$LF_CLONE" update-ref refs/ai-pr-loop/local/pr-42 HEAD
+}
+finalize_run_pr() {  # [VAR=VALUE ...]
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/fin-argv" \
+    CODEX_HOME="$WORK/codex-home" \
+    LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github MANAGED_CLONE=0 \
+    REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
+    BASE_REF=main HEAD_REF=feature/x ITER=3 MAX_ITER=6 \
+    REPO_SLUG=o/n REPO_OWNER=o REPO_NAME=n PR_NUMBER=42 GH_USER=testuser \
+    HAS_CONTEXT=0 CLAUDE_MODEL=off CLAUDE_EFFORT=off CLAUDE_PERMS=off \
+    "$@" \
+    "$BASH_BIN" "$ROOT/finalize_turn.sh" > "$WORK/fin.log" 2>&1
+  FIN_RC=$?
+}
+
+t "finalize [PR/MR]: refreshes the title and description after the push"
+local_pr_fixture
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr STUB_FINALIZE_TITLE='New title' STUB_FINALIZE_DESC='New body'
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+assert_pair "$WORK/fin-argv.ghedit" --title 'New title'
+assert_line "$WORK/fin-argv.ghedit" --body-file
+
+t "finalize [PR/MR]: leaves the title and description alone when unchanged"
+local_pr_fixture
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr
+assert_eq "$FIN_RC" 0
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then bad "edited the PR text with nothing proposed"; else ok; fi
+
+t "finalize [PR/MR]: --no-push writes nothing to the forge"
+local_pr_fixture
+rm -f "$WORK/fin-argv.ghedit"
+finalize_run_pr NO_PUSH=1 STUB_FINALIZE_TITLE='New title'
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$LF_BASE"
+if [[ -e "$WORK/fin-argv.ghedit" ]]; then bad "edited the PR text before the push landed"; else ok; fi
+
+# --- local review mode: keeping the rounds alive ---------------------------
+
+t "sync_repo_to_local_head: keeps local rounds and drops turn leftovers"
+local_fixture; local_round 1; local_round 2
+_tip=$(local_head)
+printf 'build output\n' > "$LF_CLONE/artifact.o"
+printf 'stray edit\n' >> "$LF_CLONE/f"
+env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+  MANAGED_CLONE=0 \
+  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1
+if [[ "$(local_head)" == "$_tip" ]] \
+   && [[ ! -e "$LF_CLONE/artifact.o" ]] \
+   && [[ -z "$(git -C "$LF_CLONE" status --porcelain)" ]]; then ok
+else bad "local sync lost rounds or left the worktree dirty"; fi
+
+t "sync_repo_to_local_head: a branch review stays on its branch"
+assert_eq "$(git -C "$LF_CLONE" symbolic-ref --short HEAD)" 'feature/x'
+
+t "sync_repo_to_local_head: a detached HEAD in a branch review fails closed"
+git -C "$LF_CLONE" checkout -q --detach HEAD
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
+     MANAGED_CLONE=0 \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
+  bad "a detached HEAD was silently accepted"; else ok; fi
+git -C "$LF_CLONE" checkout -q feature/x
 
 # --- summary ---------------------------------------------------------------
 

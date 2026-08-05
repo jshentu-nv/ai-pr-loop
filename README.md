@@ -4,6 +4,11 @@ Two-agent autonomous PR review loop, designed to be driven by an AI agent.
 Codex reviews; Claude responds (fix code or push back); they iterate until
 Codex approves or the loop converges on NIT-only findings.
 
+By default the review happens **on the PR** — comments, replies, and one
+commit per round. With `--local` it happens **entirely on disk** and lands
+as a **single commit** carrying the review's findings and decisions; see
+[Local review mode](#local-review-mode).
+
 Works on **GitHub pull requests** and **GitLab merge requests** (gitlab.com
 or self-hosted) — see [GitLab support](#gitlab-support).
 
@@ -99,6 +104,11 @@ account), and will ask you to confirm the first time it's about to post.
 Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
 Codex `exec resume`), so internal memory persists across iterations on top
 of the publicly auditable PR thread.
+
+Under `--local` the same two agents do the same work, but the review is
+written to files instead of comments, the implementer commits without
+pushing, and a final turn composes one commit message for the whole review
+— see [Local review mode](#local-review-mode).
 
 ## GitLab support
 
@@ -331,6 +341,100 @@ The loop exits when one of:
   `review_posted` for CHANGES_REQUESTED, `approved` for APPROVED) → exit 0.
 - The iteration cap (`--max`) is hit → exit 1.
 - Either agent's turn errors → exit 1.
+- In `--local` mode, the squash or the push fails (status `finalize_error`)
+  → exit 1. The local rounds are left in the checkout.
+
+## Local review mode
+
+`--local` keeps the whole review off the forge. The two agents exchange it
+through files under the state dir, the implementer commits **without
+pushing**, and when they agree every round is squashed into **one commit**
+that carries the review's findings, fixes, and decisions in its message.
+That single commit is the only thing pushed.
+
+Use it when the review's back-and-forth would clutter the PR/MR: no bot
+comments, no chain of "address review" commits — just the change, plus a
+message a future reader can act on.
+
+```bash
+# On a PR/MR: read its metadata, review locally, push one commit.
+~/ai-pr-loop/run.sh 42 --repo owner/repo --local
+
+# With no PR/MR at all: review the branch this checkout has out, against main.
+cd ~/src/myproject
+~/ai-pr-loop/run.sh --local --base main
+
+# Create the squashed commit but hold it back for inspection.
+~/ai-pr-loop/run.sh 42 --repo owner/repo --local --no-push
+```
+
+### What lands
+
+One commit, authored by `claude-implementer (ai-bot)`, on top of the
+commits that were already on the branch — the human's own commits are never
+rewritten. Its message states what the change does, then a `Review notes:`
+section: findings the final code addresses, decisions taken (including
+suggestions evaluated and rejected, and why), and anything deliberately
+deferred.
+
+What the message must never contain is churn from inside the review — a
+defect introduced by one round and fixed by a later one isn't in the final
+diff, so it isn't in the message either. No iteration numbers, no round
+counts, no "addressed review comments".
+
+### Where the review lives
+
+```
+state/<repo-ident>/<target>/
+  iter-01/codex-review.md      # the reviewer's findings, citing path:line
+  iter-01/claude-response.md   # fixes, pushback, verification
+  iter-02/...
+  local/base.sha               # the commit the run started from
+  local/commit-message.txt     # the composed message for the squash
+```
+
+Each file is that turn's completion contract, exactly as the summary
+comment is in forge mode: a turn whose file is missing or empty fails and
+is re-run at the same iteration. There is no inline-comment surface —
+findings cite `path:line` in the review file.
+
+### Two scopes
+
+| Invocation | Scope | Forge use |
+|---|---|---|
+| `--local` with a PR/MR number or URL | `pr` | Read-only for metadata and human comments; one write at the end (the push, plus the title/description if the change made them stale). |
+| `--local --base REF`, no positional | `branch` | None at all — no token, no CLI. Reviews the branch `--dir` has checked out (default: the current directory) against `REF`. |
+
+In `branch` scope the loop commits onto that branch and pushes it at the
+end if the checkout has an `origin`; without one, the squashed commit just
+stays local. `--base` takes any committish git resolves — `main`,
+`origin/main`, a tag, a SHA.
+
+### Pushing
+
+- The push happens only when the review ends in agreement (`APPROVED`, or
+  the `--converge` streak). Hitting the iteration cap or erroring pushes
+  nothing: the rounds stay in the checkout and the next invocation
+  continues them.
+- It is always a fast-forward. If the branch moved on the remote while the
+  review ran, the push is refused and the squashed commit is left in the
+  checkout for you to reconcile — the loop never force-pushes.
+- `--no-push` stops after creating the squashed commit. Re-running without
+  the flag pushes it without composing the message again.
+
+### Interruptions
+
+The rounds live only in the checkout, so the loop keeps them on a ref of
+its own (`refs/ai-pr-loop/local/pr-<N>`; in `branch` scope, the branch
+itself) and restores them on the next invocation. Two things fail closed
+rather than guess:
+
+- The recorded rounds are missing from the checkout (it was recreated or
+  pruned) — that work is unrecoverable, so the run stops and tells you to
+  clear `local/` to start over.
+- The PR/MR head moved past the commit the rounds are stacked on — the
+  squash could never be pushed as a fast-forward, so the run stops before
+  spending more agent turns.
 
 An errored turn and a killed run are both restarted by the auto-resume
 supervisor (below) until it reaches one of the exit-0 states or spends its
@@ -393,6 +497,10 @@ completion contract (posted last, after every inline comment, and
 re-verified by the orchestrator after each turn), so a turn that died
 after inline-only posts — or whose summary POST failed — is re-run at the
 same iteration instead of being skipped past.
+
+In `--local` mode the same table applies, read from the review files under
+the state dir instead of the PR's comments: a round counts once its
+`codex-review.md` / `claude-response.md` exists and is non-empty.
 
 Per-PR session ids for both agents are stored under
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`
@@ -507,6 +615,13 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 # Just post a review, don't auto-fix anything:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --review-only
 
+# Keep the review off the forge; land one squashed commit when they agree:
+~/ai-pr-loop/run.sh 42 --repo owner/repo --local
+~/ai-pr-loop/run.sh 42 --repo owner/repo --local --no-push   # hold it locally
+
+# No PR/MR at all — review this checkout's branch against main:
+~/ai-pr-loop/run.sh --local --base main --dir ~/src/some-checkout
+
 # Attach reference material (web links / notes / a local file) for both agents:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo \
   --context-url https://example.com/design-doc \
@@ -540,7 +655,9 @@ explicit-level precedence, fresh-vs-resumed session flags) plus `run.sh`'s
 flag validation. The auto-resume cases start real supervisors against the
 same stubs; most die before an agent turn, and the terminal-status cases
 drive the Codex stub through an approved run to prove the supervisor stops
-on an end state.
+on an end state. Local review mode is covered against real git: the
+per-round file contracts, resume high-water, squash-into-one-commit, the
+fast-forward-only push, and the single post-push title/description write.
 
 ```bash
 ~/ai-pr-loop/tests/run_tests.sh
@@ -554,7 +671,8 @@ on an end state.
   belong to a different account. Don't run on PRs/MRs you don't intend the
   bots to act on under those identities.
 - Claude never force-pushes, amends, or rebases — only adds new commits
-  to the PR head ref.
+  to the PR head ref. Under `--local` it does not push at all; the
+  orchestrator squashes the rounds and pushes that one commit.
 - Managed checkouts live at `~/ai-pr-loop/checkouts/<owner>__<name>/`
   (one clone per repo, shared across PRs). For concurrent loops on the
   same repo, pass `--dir` to point each loop at its own clone.
