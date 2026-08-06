@@ -1017,6 +1017,82 @@ resolve_codex_effort() {
   esac
 }
 
+# --- Auto-resume ----------------------------------------------------------------
+#
+# The supervisor in run.sh decides what to do after each worker exit from the
+# status files in the per-PR state dir (see the protocol comment in run.sh).
+# Both helpers are pure so the decision table and the backoff curve are
+# testable on their own.
+
+AUTO_RESUME_BACKOFF_FLOOR="${AUTO_RESUME_BACKOFF_FLOOR:-10}"   # seconds before the first restart
+AUTO_RESUME_BACKOFF_CAP="${AUTO_RESUME_BACKOFF_CAP:-300}"      # ceiling for the doubling
+AUTO_RESUME_LONG_RUN="${AUTO_RESUME_LONG_RUN:-600}"            # a worker living longer than this is not a crash loop
+
+# What to do after a worker exit. $1 = the per-PR state dir. Prints
+# "<stop|restart> <reason>".
+#
+#   stop sentinel present         the operator asked for this
+#   terminal status               the loop reached an end state
+#   codex_error / claude_error    an agent turn failed; a fresh run picks up
+#                                 at the PR's high-water mark
+#   no status, worker started     killed externally mid-run
+#   no status, never started      bad flags or a failed preflight; relaunching
+#                                 would loop forever on the same error
+auto_resume_decision() {
+  local d="$1" status=''
+  if [[ -e "$d/stop" ]]; then
+    printf 'stop stopped by request\n'
+    return 0
+  fi
+  if [[ -f "$d/worker.status" ]]; then
+    status=$(head -1 "$d/worker.status" 2>/dev/null) || status=''
+  fi
+  case "$status" in
+    approved|converged_no_major|review_posted|max_iterations_reached)
+      printf 'stop worker finished: %s\n' "$status" ;;
+    codex_error|claude_error)
+      printf 'restart agent turn failed (%s)\n' "$status" ;;
+    '')
+      if [[ -e "$d/worker.started" ]]; then
+        printf 'restart worker died without writing a status (killed externally)\n'
+      else
+        printf 'stop worker failed before it started (config/preflight error)\n'
+      fi ;;
+    *)
+      printf 'stop unrecognized worker status: %s\n' "$status" ;;
+  esac
+}
+
+# Drop the context flags a relaunch must not replay from a worker argv,
+# into STRIPPED_ARGV: --clear-context, and the --context* inputs with
+# their values — a retry reuses the context.md the first worker persisted,
+# and the original paths may be temporary. Values may be flag-shaped or
+# hold newlines; positionals and every other flag (including --restart,
+# whose resume branch is half-step-aware and safe to replay) pass through
+# untouched.
+strip_context_worker_flags() {
+  STRIPPED_ARGV=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --clear-context) shift ;;
+      --context|--context-url|--context-file)
+        if (( $# >= 2 )); then shift 2; else shift; fi ;;
+      *) STRIPPED_ARGV+=("$1"); shift ;;
+    esac
+  done
+}
+
+# Seconds to wait before restart number $1 (0-based) of a crash loop: the
+# floor, doubled per attempt, capped.
+auto_resume_backoff() {
+  local n="$1" w="$AUTO_RESUME_BACKOFF_FLOOR"
+  while (( n > 0 && w < AUTO_RESUME_BACKOFF_CAP )); do
+    w=$(( w * 2 )); n=$(( n - 1 ))
+  done
+  if (( w > AUTO_RESUME_BACKOFF_CAP )); then w="$AUTO_RESUME_BACKOFF_CAP"; fi
+  printf '%s\n' "$w"
+}
+
 # --- Repo identity / state dirs -------------------------------------------------
 
 # Canonical directory name for the repo's managed checkout and state: path
@@ -1051,29 +1127,93 @@ repo_ident() {
   fi
 }
 
+# Validate a state dir's identity marker against this invocation's resolved
+# identity; die on a mismatch. $1 = the state dir. A missing/empty marker
+# passes — there is nothing to protect yet. The flat state path is not
+# injective (a literal "__" path component collides), so every entry point
+# that reads or writes a state dir — --stop, the front-end, the supervisor,
+# the worker — must check this BEFORE consulting the sentinel, pid records,
+# or lock, or one repository's stop/start acts on another's supervisor.
+check_state_marker() {
+  local dir="$1" marker="$1/.repo-slug" owner want
+  [[ -s "$marker" ]] || return 0
+  owner=$(<"$marker")
+  want=$(repo_ident)
+  # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
+  # the scheme joined the identity) is AMBIGUOUS: it could belong to the
+  # host's http or https endpoint, and nothing persisted proves which.
+  # Refuse it rather than adopt the current invocation's scheme — silently
+  # attaching one endpoint's sessions/context/history to the other would
+  # recreate the very identity confusion the scheme exists to prevent.
+  # The operator, who knows which endpoint the old runs used, migrates
+  # explicitly (one command, preserving sessions) or cleans the dir.
+  if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
+    die "state dir $dir carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
+  fi
+  [[ "$owner" == "$want" ]] \
+    || die "state dir $dir belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
+}
+
+# mkdir-elected marker write, for filesystems without hard links and for
+# repairing a pre-existing empty marker. mkdir is atomic everywhere; the
+# winner PUBLISHES BY RENAME of a complete temp while holding the election
+# dir, so no observer ever sees a partial or zero-byte marker from this
+# path — a bare `repo_ident > marker` would expose an empty file between
+# the open and the write, which a concurrent claimant would treat as
+# unanchored. The winner writes only when no identity has landed; a loser
+# waits for the marker. A marker that never appears means a claimant died
+# inside the election — refuse with a cleanup hint rather than run
+# unanchored.
+claim_marker_election() {
+  local dir="$1" marker="$1/.repo-slug" etmp _w
+  if mkdir "$marker.lck" 2>/dev/null; then
+    if [[ ! -s "$marker" ]]; then
+      etmp="$marker.elect.$$"
+      repo_ident > "$etmp"
+      mv -f "$etmp" "$marker"
+    fi
+    rmdir "$marker.lck" 2>/dev/null || true
+  else
+    for (( _w = 0; _w < 50; _w++ )); do
+      [[ -s "$marker" ]] && break
+      sleep 0.1
+    done
+    [[ -s "$marker" ]] || die "state identity election for $dir did not complete (a claimant died mid-election?); remove $marker.lck and re-run after confirming no other run is live on this dir"
+  fi
+}
+
+# Validate an existing marker or stamp ours: the first process to touch a
+# state dir anchors its identity, so later collisions fail loudly instead
+# of sharing pid records, sentinels, and sessions. Election is atomic —
+# the marker is written aside and hard-linked into place, so it only ever
+# appears with its full content and ln(2) picks exactly one winner among
+# simultaneous first-touchers; every loser falls through and validates the
+# winner's identity like any later toucher. Where ln cannot elect, and for
+# a pre-existing empty marker, claim_marker_election takes over with the
+# same publish-complete-or-not-at-all guarantee.
+claim_state_marker() {
+  local dir="$1" marker="$1/.repo-slug" tmp
+  tmp="$marker.claim.$$"
+  if [[ ! -e "$marker" ]]; then
+    repo_ident > "$tmp"
+    if ln "$tmp" "$marker" 2>/dev/null; then
+      rm -f "$tmp"
+      return 0
+    fi
+    rm -f "$tmp"
+    if [[ ! -e "$marker" ]]; then
+      claim_marker_election "$dir"
+    fi
+  elif [[ ! -s "$marker" ]]; then
+    claim_marker_election "$dir"
+  fi
+  check_state_marker "$dir"
+}
+
 ensure_state_dir() {
   STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
   mkdir -p "$STATE_DIR"
-  local marker="$STATE_DIR/.repo-slug" owner want
-  want=$(repo_ident)
-  if [[ -s "$marker" ]]; then
-    owner=$(<"$marker")
-    # A scheme-less gitlab marker ('gitlab <host> <slug>', written before
-    # the scheme joined the identity) is AMBIGUOUS: it could belong to the
-    # host's http or https endpoint, and nothing persisted proves which.
-    # Refuse it rather than adopt the current invocation's scheme — silently
-    # attaching one endpoint's sessions/context/history to the other would
-    # recreate the very identity confusion the scheme exists to prevent.
-    # The operator, who knows which endpoint the old runs used, migrates
-    # explicitly (one command, preserving sessions) or cleans the dir.
-    if [[ "$owner" == "gitlab ${FORGE_HOST:-} $REPO_SLUG" && "$owner" != "$want" ]]; then
-      die "state dir $STATE_DIR carries a pre-scheme identity marker ('$owner') whose original scheme cannot be inferred. If that state belongs to ${FORGE_SCHEME:-https}://${FORGE_HOST:-}, migrate it explicitly with:  echo '$want' > \"$marker\"  — otherwise clean the state dir"
-    fi
-    [[ "$owner" == "$want" ]] \
-      || die "state dir $STATE_DIR belongs to '$owner', not '$want' (identity collision — use distinct project paths or clean the state dir)"
-  else
-    printf '%s\n' "$want" > "$marker"
-  fi
+  claim_state_marker "$STATE_DIR"
 }
 
 iter_dir() {

@@ -12,6 +12,10 @@
 # didn't respond (prior run died or hit max between turns), claude runs first
 # at that iteration.
 #
+# Auto-resume: a supervisor in its own session restarts the loop when a run
+# dies without finishing, so an external kill does not end the review. On by
+# default; see --auto-resume / --no-auto-resume / --stop.
+#
 # Usage:
 #   run.sh <pr-number-or-url> [--repo OWNER/NAME] [--dir REPO_DIR]
 #                      [--forge github|gitlab] [--host HOST]
@@ -22,6 +26,7 @@
 #                      [--claude-perms MODE]
 #                      [--codex-model MODEL] [--codex-effort LEVEL]
 #                      [--codex-tier TIER] [--print-config]
+#                      [--auto-resume N] [--no-auto-resume] [--stop]
 #
 # The positional argument is either a PR/MR number (with --repo) or a full
 # PR/MR URL, from which the forge, host, repo, and number are all derived:
@@ -52,7 +57,10 @@
 #   --converge    3 consecutive BLOCKER=0 MAJOR=0 codex iters; pass 0 to disable.
 #   --restart     Force a new review round even if codex previously APPROVED.
 #                 Use after new commits land past a prior approval. Starts at
-#                 max(last_codex,last_claude)+1, codex first.
+#                 max(last_codex,last_claude)+1, codex first. A pending
+#                 half-step (codex posted, claude did not reply) is resumed
+#                 first rather than skipped, so an auto-resume relaunch can
+#                 replay the flag safely.
 #   --review-only Run a single codex review turn and exit; do not run the
 #                 claude implementer. Useful when you want feedback without
 #                 auto-fixups. Implies --max 1, disables --converge. Both
@@ -66,8 +74,11 @@
 #                 Free-text note to attach for both agents. Repeatable.
 #   --context-file FILE
 #                 Local file whose contents are injected verbatim as context
-#                 for both agents. Read at launch (not referenced later), so
-#                 the path need not survive to later re-runs. Repeatable.
+#                 for both agents. Read at launch and snapshotted to the
+#                 PR's context.md; once that snapshot lands, the path is
+#                 never read again (auto-resume relaunches replay the flag
+#                 — and re-read the file — only until the snapshot
+#                 succeeds). Repeatable.
 #   --clear-context
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
@@ -134,10 +145,41 @@
 #                 (Pushes are separate: they use the checkout's own git
 #                 credential — SSH key or helper — which may belong to a
 #                 different account.)
+#   --auto-resume N
+#                 Restart budget for the auto-resume supervisor. Default 10;
+#                 0 disables it (same as --no-auto-resume). The supervisor
+#                 runs in its own session and relaunches the loop when a run
+#                 dies without a final status — killed by an external
+#                 SIGTERM/SIGHUP — or when an agent turn errors. Each
+#                 relaunch resumes from the PR's high-water mark. A run that
+#                 fails before it starts (bad flags, failed preflight) is not
+#                 relaunched. A relaunch keeps the invocation's remaining
+#                 --max/--converge budget; once a worker lands the context
+#                 snapshot it drops the context flags (--context*,
+#                 --clear-context) and reuses the persisted context, and
+#                 before that it replays them. The supervisor logs to
+#                 state/<ident>/pr-<N>/supervisor.log; this command tails
+#                 that log, so foreground output is the same as an inline
+#                 run. --print-config and --preflight-only always run
+#                 inline. Requires setsid with -f support (util-linux) or
+#                 perl for the detached session AND flock or perl for the
+#                 single-supervisor lock; missing either, the loop runs
+#                 inline, with a warning.
+#   --no-auto-resume
+#                 Run the loop in this process. Nothing restarts it.
+#   --stop        Write the stop sentinel for this PR and signal its
+#                 supervisor — or, when a SIGKILL took the supervisor and
+#                 left its worker tree orphaned, the worker's process
+#                 group — then exit. Runs no preflight and clones nothing.
+#                 Ctrl-C on the foreground command does the same.
 #
 # Context flags persist per-PR: re-running without them reuses the prior
 # context.md, so you only pass them once. Pass any --context* flag to replace
-# the stored context, or --clear-context to drop it.
+# the stored context, or --clear-context to drop it. An auto-resume relaunch
+# replays the --context* flags (re-reading their inputs) only until a worker
+# lands the invocation's snapshot; after that it reuses the persisted
+# context.md and never reads the paths again, so a temporary file stays
+# valid for the rest of the supervised run.
 #
 # Credentials — one per forge:
 #   GitHub: GH_TOKEN/GITHUB_TOKEN (the gh CLI must be logged in). Works on
@@ -162,6 +204,7 @@ LOOP_HOME="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 MAX_ITER_DEFAULT=6
 CONVERGE_DEFAULT=3
 HARD_CEILING=50           # safety bound when --max 0 (uncapped)
+AUTO_RESUME_DEFAULT=10    # restart budget for the auto-resume supervisor
 
 REPO_SLUG=""
 REPO_DIR=""
@@ -186,8 +229,17 @@ CLAUDE_PERMS="auto"
 CODEX_MODEL="gpt-5.6-sol"
 CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, off (host/model default) otherwise
 CODEX_TIER="fast"
+AUTO_RESUME="$AUTO_RESUME_DEFAULT"
+STOP_ONLY=0
+ROLE=frontend             # frontend | supervise | worker (the last two are internal)
+WORKER_ARGV=()            # this argv minus the flags parsed in the loop's own cases below
 
 while [[ $# -gt 0 ]]; do
+  # Snapshot the vector so the supervisor can hand the worker this
+  # invocation's argv verbatim — array in, array out, so a --context note
+  # holding newlines and quotes survives. ARGV_MINE marks the flags this
+  # script consumes for itself; everything else is copied through.
+  ARGV_HEAD=("$@"); ARGV_N=$#; ARGV_MINE=0
   case "$1" in
     --repo)          REPO_SLUG="$2"; shift 2 ;;
     --dir)           REPO_DIR="$2"; MANAGED_CLONE=0; shift 2 ;;
@@ -209,6 +261,15 @@ while [[ $# -gt 0 ]]; do
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
+    --auto-resume)   [[ $# -ge 2 ]] || die "--auto-resume needs a restart budget"
+                     AUTO_RESUME="$2"; ARGV_MINE=1; shift 2 ;;
+    --no-auto-resume) AUTO_RESUME=0; ARGV_MINE=1; shift ;;
+    --stop)          STOP_ONLY=1; ARGV_MINE=1; shift ;;
+    --_supervise|--_worker)
+      # Internal roles, set by the front-end and the supervisor.
+      [[ "$ROLE" == "frontend" ]] || die "pass at most one of --_supervise / --_worker"
+      case "$1" in --_worker) ROLE=worker ;; *) ROLE=supervise ;; esac
+      ARGV_MINE=1; shift ;;
     -h|--help)
       awk 'NR < 2 { next } /^set -euo pipefail/ { exit } { print }' "$0"; exit 0 ;;
     *)
@@ -220,7 +281,14 @@ while [[ $# -gt 0 ]]; do
       fi
       shift ;;
   esac
+  if (( ARGV_MINE == 0 )); then
+    for (( ARGV_I = 0; ARGV_I < ARGV_N - $#; ARGV_I++ )); do
+      WORKER_ARGV+=("${ARGV_HEAD[$ARGV_I]}")
+    done
+  fi
 done
+
+[[ "$AUTO_RESUME" =~ ^[0-9]+$ ]] || die "--auto-resume needs a non-negative count (got: $AUTO_RESUME)"
 
 # --- forge resolution -----------------------------------------------------------
 #
@@ -428,6 +496,566 @@ fi
 [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
 
+# --- auto-resume: front-end, supervisor, worker -------------------------------
+#
+# Three roles share this script.
+#
+#   front-end  (default)      Parses args, then either runs the loop in this
+#                             process (--no-auto-resume, --print-config,
+#                             --preflight-only) or starts the supervisor and
+#                             tails its log in the foreground.
+#   supervisor (--_supervise) Launches the worker, waits for it, and decides
+#                             from the status files whether to stop or
+#                             relaunch. Lives in its own session, so a
+#                             process-group kill aimed at the front-end — or
+#                             at the shell that launched it — does not reach
+#                             it. That is what lets a killed run come back.
+#   worker     (--_worker)    The loop itself. Reports through the status
+#                             files below.
+#
+# Status protocol, all under the per-PR state dir:
+#   supervisor.lock  flock'd by the supervisor for its lifetime (and by the
+#                    worker tree, which inherits the fd); one supervisor per
+#                    PR, enforced by the kernel rather than a check window
+#   supervisor.pid   the supervisor's pid + its start-time token; removed
+#                    when it exits. Signalling target only — the token pins
+#                    the incarnation, so a recycled pid is never signalled
+#                    and a stale file blocks nothing
+#   supervisor.log   what the front-end tails; appended, never truncated
+#   worker.pid       the live worker's pid + start token, written by the
+#                    supervisor at each launch — lets --stop reach a worker
+#                    orphaned by a SIGKILLed supervisor
+#   worker.started   touched once the run is known to be well-formed
+#   worker.status    the worker's FINAL_STATUS on a normal exit
+#   worker.progress  iterations + convergence streak this invocation has
+#                    used, across relaunches, plus the invocation's starting
+#                    iteration (the budget baseline); cleared per invocation
+#   context.applied  touched once a worker applies this invocation's context
+#                    intent; until then relaunches replay the --context*
+#                    flags instead of dropping them; cleared per invocation
+#   stop             stop sentinel; the supervisor stops and does not relaunch
+#
+# Every entry point that touches this dir validates the .repo-slug identity
+# marker first (check_state_marker): the flat path is not injective, and a
+# colliding repo's --stop or start must fail loudly, not act on another
+# repository's supervisor.
+#
+# The state path is the one ensure_state_dir computes; the front-end and the
+# supervisor need it before the run is authenticated, so they derive it from
+# the resolved forge identity alone.
+PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
+
+# TERM the supervisor and everything it started. A detached supervisor leads
+# its own process group, so the signal reaches its worker and the agents too;
+# without setsid it shares the caller's group, where a group kill would hit
+# unrelated processes, so signal the pid alone and let its own trap forward.
+signal_supervisor() {
+  local pid="$1" pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=''
+  if [[ "$pgid" == "$pid" ]]; then
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+}
+
+# Start-time token for pid $1, whitespace-squeezed; empty when unknown.
+# Written next to the pid in supervisor.pid and compared on every read: two
+# processes can share a recycled pid, but not a pid AND a start time.
+# TZ/LC_ALL are pinned because ps renders lstart in the caller's timezone
+# and locale — a --stop run from another environment must still match the
+# token the supervisor wrote.
+proc_start_token() {
+  local t
+  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || t=''
+  # shellcheck disable=SC2086
+  set -- $t
+  printf '%s\n' "$*"
+}
+
+# True when pid $1 is a live process of this loop whose argv carries $3 and
+# whose start-time token matches $2. A process killed with SIGKILL leaves
+# its pid record behind and the operating system hands that pid to
+# something else — even to another loop's process — so the command line AND
+# the start-time token must both match before the pid is signalled or
+# blocks a run.
+recorded_pid_is_live() {
+  local pid="${1:-}" token="${2:-}" argmark="$3"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  ps -o args= -p "$pid" 2>/dev/null | grep -q -- "$argmark" || return 1
+  [[ "$(proc_start_token "$pid")" == "$token" ]]
+}
+
+supervisor_is_live() { recorded_pid_is_live "${1:-}" "${2:-}" '--_supervise'; }
+worker_is_live()     { recorded_pid_is_live "${1:-}" "${2:-}" '--_worker'; }
+
+# Read a pid record file ($1: pid line, token line) into REC_PID / REC_TOKEN.
+read_pid_record() {
+  REC_PID=''; REC_TOKEN=''
+  [[ -s "$1" ]] || return 0
+  REC_PID=$(head -1 "$1")
+  REC_TOKEN=$(sed -n '2p' "$1")
+}
+
+# True when a session primitive exists that spawn_detached can actually
+# use: setsid must support -f (fork/reparent — a plain setsid leaves the
+# supervisor inside the caller's descendant tree, where a tree reaper
+# finds it), or perl does the fork+setsid itself. Without one there is no
+# detached session and the loop runs inline instead.
+have_session_primitive() {
+  { command -v setsid >/dev/null 2>&1 && setsid -f true 2>/dev/null; } \
+    || command -v perl >/dev/null 2>&1
+}
+
+# True when a tool exists to hold the single-supervisor flock. Supervision
+# without it would run unlocked — simultaneous starts could all win — so
+# the front-end requires this alongside the session primitive (a
+# setsid-without-flock host has a session but no lock).
+have_lock_primitive() {
+  command -v flock >/dev/null 2>&1 || command -v perl >/dev/null 2>&1
+}
+
+# Run a command in its own session, REPARENTED out of this process's
+# descendant tree: a task reaper that walks and TERMs the caller's tree
+# must not find the supervisor, and a new session alone does not move a
+# process off its parent. setsid -f forks so the intermediate exits and
+# init adopts the child; the perl arm does the same fork+setsid+exec.
+# The front-end checks have_session_primitive before spawning, so the
+# last arm is a backstop.
+spawn_detached() {
+  if command -v setsid >/dev/null 2>&1 && setsid -f true 2>/dev/null; then
+    setsid -f "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'exit 0 if fork; use POSIX qw(setsid); setsid();
+             exec @ARGV or exit 127' -- "$@"
+  else
+    die "spawn_detached: neither setsid nor perl is available"
+  fi
+}
+
+# Take a non-blocking exclusive flock on fd $1. flock(1) is util-linux;
+# perl covers hosts without it (macOS). The lock rides the open file
+# description, so it survives the perl helper's exit and is inherited by
+# every child sharing the fd. Fails closed with neither tool — an unlocked
+# supervisor would let simultaneous starts all win, so the front-end gates
+# supervision on have_lock_primitive and never reaches that arm.
+acquire_lock_fd() {
+  if command -v flock >/dev/null 2>&1; then
+    flock -n "$1"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e 'use Fcntl qw(:flock); open(my $fh, ">&=", $ARGV[0]) or exit 2;
+             exit(flock($fh, LOCK_EX|LOCK_NB) ? 0 : 1)' "$1"
+  else
+    return 1
+  fi
+}
+
+# Record this run's outcome for the supervisor. Only a worker reports; an
+# inline run has no supervisor reading it.
+write_worker_status() {
+  [[ "$ROLE" == "worker" ]] || return 0
+  printf '%s\n' "$1" > "$STATE_DIR/worker.status"
+}
+
+# Record the loop counters a relaunch must not reset: --max and --converge
+# are per-invocation, and a relaunched worker continues the same invocation.
+# BASE is the iteration the invocation's FIRST worker started at — the
+# budget baseline. A relaunch compares its own starting iteration against
+# it: iterations whose summaries landed on the PR are spent even when the
+# worker died before persisting RUNS (a posted claude summary followed by a
+# nonzero exit leaves RUNS behind the public thread).
+persist_worker_progress() {
+  [[ "$ROLE" == "worker" ]] || return 0
+  printf 'RUNS=%s\nSTREAK=%s\nSTREAK_AT=%s\nBASE=%s\n' \
+    "$RUNS" "$CONVERGE_STREAK" "$STREAK_AT" "$RUNS_BASE_ITER" \
+    > "$STATE_DIR/worker.progress"
+}
+
+# Convergence accounting for iter $1 from its persisted issue_counts.
+# Returns 0 when the streak has reached CONVERGE_N — the caller exits the
+# loop as converged. Runs after a fresh codex turn AND when a relaunch
+# resumes past a codex review that landed before a crash: qualifying
+# reviews count either way. STREAK_AT records the last iteration accounted,
+# so a relaunch replaying the same landed review cannot count it twice.
+update_converge_streak() {
+  local it="$1" counts_file ib im
+  (( CONVERGE_N > 0 )) || return 1
+  (( it > STREAK_AT )) || return 1
+  counts_file="$STATE_DIR/$(printf 'iter-%02d' "$it")/issue_counts"
+  if [[ ! -f "$counts_file" ]]; then
+    log "convergence: no issue_counts file for iter $it — streak unchanged"
+    return 1
+  fi
+  ib=$(awk -F= '/^BLOCKER=/{print $2}' "$counts_file")
+  im=$(awk -F= '/^MAJOR=/{print $2}'   "$counts_file")
+  STREAK_AT="$it"
+  if [[ "$ib" == "0" && "$im" == "0" ]]; then
+    CONVERGE_STREAK=$((CONVERGE_STREAK + 1))
+    persist_worker_progress
+    log "convergence: iter $it BLOCKER=0 MAJOR=0 (streak $CONVERGE_STREAK / $CONVERGE_N)"
+    if (( CONVERGE_STREAK >= CONVERGE_N )); then
+      log "convergence: $CONVERGE_N consecutive NIT-only iterations — exiting"
+      return 0
+    fi
+  else
+    if (( CONVERGE_STREAK > 0 )); then
+      log "convergence: streak reset (BLOCKER=$ib MAJOR=$im at iter $it)"
+    fi
+    CONVERGE_STREAK=0
+    persist_worker_progress
+  fi
+  return 1
+}
+
+# --stop: write the sentinel and signal the supervisor — or, when a SIGKILL
+# took the supervisor and left its worker tree orphaned, the worker's
+# process group. No preflight, no clone — a stop must work even when the
+# forge is unreachable. The identity check comes first: on a colliding flat
+# path this dir may belong to another repository, and its supervisor must
+# not be stopped.
+if (( STOP_ONLY == 1 )); then
+  mkdir -p "$PR_STATE_DIR"
+  claim_state_marker "$PR_STATE_DIR"
+  : > "$PR_STATE_DIR/stop"
+  log "stop: wrote $PR_STATE_DIR/stop — the supervisor will not relaunch this PR"
+  read_pid_record "$PR_STATE_DIR/supervisor.pid"
+  if supervisor_is_live "$REC_PID" "$REC_TOKEN"; then
+    signal_supervisor "$REC_PID"
+    log "stop: signalled supervisor pid $REC_PID"
+  else
+    # No supervisor to forward the signal. A worker it left behind (the
+    # supervisor was SIGKILLed) never reads the sentinel, so signal its
+    # process group directly — verified by pid + start token first, and
+    # never our own group.
+    read_pid_record "$PR_STATE_DIR/worker.pid"
+    if worker_is_live "$REC_PID" "$REC_TOKEN"; then
+      W_PGID=$(ps -o pgid= -p "$REC_PID" 2>/dev/null | tr -d ' ') || W_PGID=''
+      MY_PGID=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || MY_PGID=''
+      if [[ -n "$W_PGID" && "$W_PGID" != "$MY_PGID" ]]; then
+        kill -TERM -- "-$W_PGID" 2>/dev/null || true
+        log "stop: no live supervisor — signalled the orphaned worker group $W_PGID (worker pid $REC_PID)"
+      else
+        kill -TERM "$REC_PID" 2>/dev/null || true
+        log "stop: no live supervisor — signalled the orphaned worker pid $REC_PID"
+      fi
+    else
+      log "stop: no live supervisor for this PR"
+    fi
+  fi
+  exit 0
+fi
+
+if [[ "$ROLE" == "worker" ]]; then
+  # Clear the status files this run will write: a previous run's values must
+  # never be read as this one's outcome. Identity first — on a colliding
+  # flat path these could be another repository's files.
+  mkdir -p "$PR_STATE_DIR"
+  claim_state_marker "$PR_STATE_DIR"
+  rm -f "$PR_STATE_DIR/worker.status" "$PR_STATE_DIR/worker.started"
+fi
+
+if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 && PREFLIGHT_ONLY == 0 )); then
+  if ! have_session_primitive; then
+    if command -v setsid >/dev/null 2>&1; then
+      log "auto-resume: disabled — this setsid does not support -f (fork/reparent) and perl is missing, so no detached session is possible; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    else
+      log "auto-resume: disabled — neither setsid nor perl found for a detached session; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    fi
+    AUTO_RESUME=0
+  elif ! have_lock_primitive; then
+    log "auto-resume: disabled — no flock or perl to hold the single-supervisor lock; running the loop in this process (an external kill ends the review and nothing resumes it)"
+    AUTO_RESUME=0
+  fi
+fi
+
+if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 0 )); then
+  SUP_LOG="$PR_STATE_DIR/supervisor.log"
+  SUP_PID_FILE="$PR_STATE_DIR/supervisor.pid"
+  mkdir -p "$PR_STATE_DIR"
+  claim_state_marker "$PR_STATE_DIR"
+  # Two supervisors on one PR would double-post. This check is the friendly
+  # fast-fail; the authority is the supervisor's own lock, which closes the
+  # window between this read and the spawn below.
+  read_pid_record "$SUP_PID_FILE"
+  if supervisor_is_live "$REC_PID" "$REC_TOKEN"; then
+    die "a supervisor for this PR is already running (pid $REC_PID); stop it with --stop, or pass --no-auto-resume to run in this process"
+  fi
+  # A stop from an earlier run must not block this one. The pid file stays
+  # put: a stale record blocks nothing (the token unmasks it), the new
+  # supervisor overwrites it, and removing it here could erase the fresh
+  # record of a supervisor another invocation just started.
+  rm -f "$PR_STATE_DIR/stop"
+  : >> "$SUP_LOG"
+  # Tail from the end of what is already there, so a fresh invocation shows
+  # its own output and not the whole history.
+  SUP_LOG_OFFSET=$(wc -c < "$SUP_LOG" | tr -d ' ')
+
+  STOP_HINT="$0 $PR_NUMBER --repo $REPO_SLUG"
+  [[ "$FORGE" == "github" ]] || STOP_HINT="$STOP_HINT --forge $FORGE --host ${FORGE_SCHEME}://${FORGE_HOST}"
+  STOP_HINT="$STOP_HINT --stop"
+  SUP_PID=''
+  TAIL_PID=''
+
+  # Ctrl-C is a deliberate stop: leave the sentinel behind so the supervisor
+  # cannot relaunch, and take the whole session down.
+  frontend_interrupt() {
+    : > "$PR_STATE_DIR/stop"
+    if [[ -z "$SUP_PID" ]]; then
+      read_pid_record "$SUP_PID_FILE"
+      supervisor_is_live "$REC_PID" "$REC_TOKEN" && SUP_PID="$REC_PID"
+    fi
+    log "auto-resume: Ctrl-C — stopping supervisor pid ${SUP_PID:-unknown}; this run will not resume"
+    if [[ -n "$SUP_PID" ]]; then
+      signal_supervisor "$SUP_PID"
+      local i
+      for (( i = 0; i < 20; i++ )); do
+        kill -0 "$SUP_PID" 2>/dev/null || break
+        sleep 0.5
+      done
+    fi
+    if [[ -n "$TAIL_PID" ]]; then kill "$TAIL_PID" 2>/dev/null || true; fi
+    exit 130
+  }
+  # An external SIGTERM/SIGHUP ends this front-end only. The supervisor is in
+  # another session and keeps the loop going — the failure this feature is
+  # for.
+  frontend_detach() {
+    if [[ -z "$SUP_PID" ]]; then
+      read_pid_record "$SUP_PID_FILE"
+      supervisor_is_live "$REC_PID" "$REC_TOKEN" && SUP_PID="$REC_PID"
+    fi
+    log "auto-resume: front-end signalled; supervisor pid ${SUP_PID:-unknown} keeps running ($STOP_HINT to end it)"
+    if [[ -n "$TAIL_PID" ]]; then kill "$TAIL_PID" 2>/dev/null || true; fi
+    exit 143
+  }
+  # Armed before the supervisor is spawned: Ctrl-C in the first moments of a
+  # run must stop it too. The sentinel is the handle until the pid file
+  # exists — the supervisor reads it before each worker.
+  trap frontend_interrupt INT
+  trap frontend_detach TERM HUP
+
+  spawn_detached bash "$0" --_supervise --auto-resume "$AUTO_RESUME" \
+      ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} >> "$SUP_LOG" 2>&1 </dev/null &
+
+  # The supervisor writes its pid before its first log line and removes the
+  # file when it exits, so a missing pid file means either "not up yet" or
+  # "already finished". The log line settles which. A record that fails the
+  # incarnation check is a leftover from an earlier run — keep waiting for
+  # ours to overwrite it. A spawned supervisor that loses the lock race
+  # logs "another supervisor" and exits; attach to the winner if its record
+  # lands within the window, refuse otherwise.
+  SUP_RAN=0
+  SUP_CONFLICT=0
+  for (( SUP_WAIT = 0; SUP_WAIT < 100; SUP_WAIT++ )); do
+    if [[ -s "$SUP_PID_FILE" ]]; then
+      read_pid_record "$SUP_PID_FILE"
+      if supervisor_is_live "$REC_PID" "$REC_TOKEN"; then
+        SUP_PID="$REC_PID"; SUP_RAN=1; break
+      fi
+    fi
+    SUP_LOG_TAIL=$(tail -c "+$((SUP_LOG_OFFSET + 1))" "$SUP_LOG" 2>/dev/null) || SUP_LOG_TAIL=''
+    if grep -q 'auto-resume: supervisor started' <<<"$SUP_LOG_TAIL"; then
+      # The pid lands before that line, so read the file again: a live
+      # supervisor has written it by now, and an empty file means the
+      # supervisor already exited.
+      [[ -s "$SUP_PID_FILE" ]] && SUP_PID=$(head -1 "$SUP_PID_FILE")
+      SUP_RAN=1; break
+    fi
+    if grep -q 'auto-resume: another supervisor for this PR' <<<"$SUP_LOG_TAIL"; then
+      SUP_CONFLICT=1
+    fi
+    sleep 0.1
+  done
+  if (( SUP_RAN == 0 && SUP_CONFLICT == 1 )); then
+    die "this PR's supervisor.lock is still held — a supervisor is running (stop it with --stop), or a just-ended run's children are still winding down (retry shortly); --no-auto-resume runs the loop in this process"
+  fi
+  (( SUP_RAN == 1 )) || die "the auto-resume supervisor did not start — see $SUP_LOG"
+
+  if [[ -n "$SUP_PID" ]]; then
+    log "auto-resume: supervisor pid $SUP_PID, budget $AUTO_RESUME restart(s), log $SUP_LOG"
+    log "auto-resume: stop it with Ctrl-C here, or: $STOP_HINT"
+  fi
+
+  # --pid ends the tail when this front-end dies, including a SIGKILL that
+  # runs no trap. BSD tail has no such flag; there the traps above stop it.
+  TAIL_ARGS=(-c "+$((SUP_LOG_OFFSET + 1))" -f)
+  if tail --pid=$$ -c +1 /dev/null >/dev/null 2>&1; then
+    TAIL_ARGS=("--pid=$$" "${TAIL_ARGS[@]}")
+  fi
+  tail "${TAIL_ARGS[@]}" "$SUP_LOG" >&2 &
+  TAIL_PID=$!
+
+  if [[ -n "$SUP_PID" ]]; then
+    while kill -0 "$SUP_PID" 2>/dev/null; do sleep 1; done
+  fi
+  # Give the tail a moment to drain the supervisor's last lines.
+  sleep 1
+  kill "$TAIL_PID" 2>/dev/null || true
+  wait "$TAIL_PID" 2>/dev/null || true
+
+  FRONT_STATUS=''
+  [[ -f "$PR_STATE_DIR/worker.status" ]] && FRONT_STATUS=$(head -1 "$PR_STATE_DIR/worker.status")
+  log "auto-resume: supervisor exited; last worker status: ${FRONT_STATUS:-none}"
+  case "$FRONT_STATUS" in
+    approved|converged_no_major|review_posted) exit 0 ;;
+    *)                                          exit 1 ;;
+  esac
+fi
+
+if [[ "$ROLE" == "supervise" ]]; then
+  mkdir -p "$PR_STATE_DIR"
+  claim_state_marker "$PR_STATE_DIR"
+  # One supervisor per PR, enforced by the kernel: the lock is taken before
+  # anything else, held for this process's lifetime, and inherited by the
+  # worker tree below (the fd rides into every child), so simultaneous
+  # starts race the flock — exactly one wins — and a SIGKILLed supervisor's
+  # surviving worker still holds it until that whole tree is gone. The
+  # front-end reads the log lines below and reports the refusal. No lock
+  # tool means no exclusion guarantee: refuse to supervise rather than run
+  # unlocked (the front-end gates on this too; a direct --_supervise
+  # invocation gets the same answer).
+  if ! have_lock_primitive; then
+    log "auto-resume: no flock or perl to hold the single-supervisor lock — refusing to supervise"
+    exit 75
+  fi
+  exec 9>>"$PR_STATE_DIR/supervisor.lock"
+  if ! acquire_lock_fd 9; then
+    log "auto-resume: another supervisor for this PR is already running (supervisor.lock is held) — exiting"
+    exit 75
+  fi
+  printf '%s\n%s\n' "$$" "$(proc_start_token "$$")" > "$PR_STATE_DIR/supervisor.pid"
+  WORKER_PID=''
+  # TERM the worker and everything below it. The turn scripts and the agent
+  # CLIs they launch run in this process group, so signal the group with this
+  # process deaf to it — signalling the worker's shell alone leaves an agent
+  # editing, pushing, and commenting on its own. Without a session of our own
+  # the group is the caller's and must not be signalled, so the worker takes
+  # the signal alone there.
+  kill_worker_tree() {
+    local pgid
+    pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || pgid=''
+    if [[ "$pgid" == "$$" ]]; then
+      trap '' TERM
+      kill -TERM -- "-$$" 2>/dev/null || true
+      trap supervisor_signalled TERM
+    elif [[ -n "$WORKER_PID" ]]; then
+      kill -TERM "$WORKER_PID" 2>/dev/null || true
+    fi
+  }
+  # Only the stop sentinel means the review should end: --stop and Ctrl-C
+  # both write it before signalling. A TERM/HUP without it is exactly the
+  # external noise this feature exists to survive — stay up, let the
+  # interrupted wait resume, and relaunch the worker if the signal took it
+  # down too.
+  supervisor_signalled() {
+    if [[ -e "$PR_STATE_DIR/stop" ]]; then
+      log "auto-resume: supervisor signalled — stop requested; shutting down (worker pid ${WORKER_PID:-none})"
+      kill_worker_tree
+      rm -f "$PR_STATE_DIR/supervisor.pid" "$PR_STATE_DIR/worker.pid"
+      exit 143
+    fi
+    log "auto-resume: supervisor signalled without a stop request — ignoring; the review continues (--stop or Ctrl-C ends it)"
+  }
+  trap supervisor_signalled TERM HUP
+
+  log "auto-resume: supervisor started (pid $$, budget $AUTO_RESUME restart(s))"
+  # Once a worker has applied this invocation's context intent (the
+  # context.applied stamp: snapshot rendered, cleared, or reuse confirmed),
+  # relaunches drop the context flags — the --context* inputs may name
+  # temporary paths, and their content is persisted in context.md. Until
+  # then relaunches replay the flags: a replacement that failed mid-render
+  # must be retried (and fail loudly on a dead source), never quietly
+  # papered over with the previous invocation's stored context. --restart
+  # stays either way: its resume branch is half-step-aware, so replaying
+  # it is safe.
+  strip_context_worker_flags ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"}
+  RETRY_ARGV=(${STRIPPED_ARGV[@]+"${STRIPPED_ARGV[@]}"})
+  if (( ${#RETRY_ARGV[@]} != ${#WORKER_ARGV[@]} )); then
+    log "auto-resume: relaunches reuse the stored context once a worker lands this invocation's snapshot (context flags dropped); until then they replay the context flags"
+  fi
+  # The iteration budget, convergence streak, and context stamp span
+  # relaunches; only a new invocation grants a fresh count.
+  rm -f "$PR_STATE_DIR/worker.progress" "$PR_STATE_DIR/context.applied"
+  ATTEMPT=0
+  QUICK=0          # consecutive short-lived workers; drives the backoff
+  while :; do
+    # A stop that arrived before this worker starts counts: the front-end
+    # writes the sentinel on Ctrl-C, which can land while this supervisor is
+    # still coming up.
+    if [[ -e "$PR_STATE_DIR/stop" ]]; then
+      log "auto-resume: stopping — stopped by request"
+      break
+    fi
+    rm -f "$PR_STATE_DIR/worker.status" "$PR_STATE_DIR/worker.started"
+    WORKER_AT=$(date +%s)
+    if (( ATTEMPT == 0 )) || [[ ! -e "$PR_STATE_DIR/context.applied" ]]; then
+      bash "$0" --_worker ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} &
+    else
+      bash "$0" --_worker ${RETRY_ARGV[@]+"${RETRY_ARGV[@]}"} &
+    fi
+    WORKER_PID=$!
+    # Recorded with its start token so --stop can still reach the worker
+    # tree after a SIGKILL takes this supervisor down (the worker never
+    # reads the stop sentinel itself).
+    printf '%s\n%s\n' "$WORKER_PID" "$(proc_start_token "$WORKER_PID")" \
+      > "$PR_STATE_DIR/worker.pid"
+    WORKER_RC=0
+    # A trapped signal interrupts wait with 128+sig while the worker may
+    # still be running (the ignored sentinel-less TERM above); only a
+    # reaped worker ends this loop. When the worker vanished during the
+    # interruption itself, the 128+sig may be trap noise rather than the
+    # worker's status — ask the job table once more and keep the stored
+    # status (127 = already collected: the first value was real).
+    while :; do
+      if wait "$WORKER_PID"; then WORKER_RC=0; else WORKER_RC=$?; fi
+      if kill -0 "$WORKER_PID" 2>/dev/null; then continue; fi
+      if (( WORKER_RC > 128 )); then
+        if wait "$WORKER_PID" 2>/dev/null; then WORKER_RC=0
+        else WORKER_RC2=$?; (( WORKER_RC2 == 127 )) || WORKER_RC="$WORKER_RC2"; fi
+      fi
+      break
+    done
+    # The worker's shell is gone; anything it started goes with it, or a
+    # relaunch would put a second agent on the same checkout and PR.
+    kill_worker_tree
+    WORKER_PID=''
+    rm -f "$PR_STATE_DIR/worker.pid"
+    RAN_SECS=$(( $(date +%s) - WORKER_AT ))
+
+    DECISION=$(auto_resume_decision "$PR_STATE_DIR")
+    ACTION="${DECISION%% *}"
+    REASON="${DECISION#* }"
+    if [[ "$ACTION" == "stop" ]]; then
+      log "auto-resume: stopping — $REASON (worker exit $WORKER_RC after ${RAN_SECS}s)"
+      break
+    fi
+    if (( ATTEMPT >= AUTO_RESUME )); then
+      log "auto-resume: stopping — budget exhausted after $ATTEMPT restart(s); last: $REASON"
+      break
+    fi
+    ATTEMPT=$(( ATTEMPT + 1 ))
+    # A worker that ran a long time before dying is not a crash loop, so its
+    # restart waits the floor again.
+    if (( RAN_SECS > AUTO_RESUME_LONG_RUN )); then QUICK=0; fi
+    BACKOFF=$(auto_resume_backoff "$QUICK")
+    QUICK=$(( QUICK + 1 ))
+    log "auto-resume: restart $ATTEMPT/$AUTO_RESUME in ${BACKOFF}s — $REASON (worker exit $WORKER_RC after ${RAN_SECS}s)"
+    # Guarded: a group-wide sentinel-less TERM kills this sleep with 143
+    # after the trap above returns, and an unguarded nonzero here would
+    # end the supervisor through set -e — the very signal being ignored.
+    sleep "$BACKOFF" || true
+  done
+
+  rm -f "$PR_STATE_DIR/supervisor.pid" "$PR_STATE_DIR/worker.pid"
+  SUP_STATUS=''
+  [[ -f "$PR_STATE_DIR/worker.status" ]] && SUP_STATUS=$(head -1 "$PR_STATE_DIR/worker.status")
+  case "$SUP_STATUS" in
+    approved|converged_no_major|review_posted) exit 0 ;;
+    *)                                          exit 1 ;;
+  esac
+fi
+
 # Validate any --context-file paths up front so we fail fast (contents are read
 # at render time below, not stored by reference).
 for _cf in "${CONTEXT_FILES[@]}"; do
@@ -497,6 +1125,14 @@ export STATE_DIR
 RUN_LOG="$STATE_DIR/run.log"
 : > "$RUN_LOG"
 
+# The run is well-formed: flags, forge resolution, preflight, and the open
+# check all passed. A worker that dies past this point was killed or crashed,
+# and the supervisor relaunches it; one that dies before it is a config or
+# preflight error, which relaunching cannot fix.
+if [[ "$ROLE" == "worker" ]]; then
+  touch "$STATE_DIR/worker.started"
+fi
+
 # --- additional context (web links / notes / files) ---------------------------
 #
 # Optional reference material the human attaches for BOTH agents. Rendered once
@@ -542,7 +1178,11 @@ CTX_HDR
       cat -- "$_cf"
       printf '\n\n---\n'
     done
-  } > "$CONTEXT_FILE"
+  } > "$CONTEXT_FILE.tmp"
+  # Land the snapshot whole or not at all: a source read failing mid-render
+  # exits this run (set -e) with only the .tmp written, so a relaunch never
+  # reuses a truncated context.md as the trusted material.
+  mv -f "$CONTEXT_FILE.tmp" "$CONTEXT_FILE"
   HAS_CONTEXT=1
   log "context: wrote ${#CONTEXT_URLS[@]} link(s), ${#CONTEXT_NOTES[@]} note(s), ${#CONTEXT_FILES[@]} file(s) -> $CONTEXT_FILE"
 elif (( CLEAR_CONTEXT == 1 )); then
@@ -553,6 +1193,12 @@ elif [[ -s "$CONTEXT_FILE" ]]; then
   log "context: reusing stored context at $CONTEXT_FILE (no --context* flags this run; --clear-context to drop)"
 fi
 export CONTEXT_FILE HAS_CONTEXT
+# The invocation's context intent is applied — rendered, cleared, or reuse
+# confirmed. From here the supervisor may drop the context flags from
+# relaunches; a worker dying before this point is retried with them.
+if [[ "$ROLE" == "worker" ]]; then
+  : > "$STATE_DIR/context.applied"
+fi
 
 log "------------------------------------------------------------"
 log "AI PR loop starting"
@@ -592,11 +1238,74 @@ LAST_CLAUDE=$(latest_ai_comment_iter claude)
 LAST_CODEX="${LAST_CODEX:-0}"
 LAST_CLAUDE="${LAST_CLAUDE:-0}"
 
+# A codex run can crash after its summary POSTs but before the thread read
+# that gates canonical persistence succeeds — its stdout record survives as
+# provisional *.stdout files. The fetch above just confirmed which summaries
+# are public: adopt the provisional counts/verdict for the landed iteration
+# when the canonical files are missing, so convergence accounting and the
+# verdict-aware resume see what the PR already shows. Provisional files of
+# an iteration whose summary never landed are never adopted.
+adopt_landed_codex_artifacts() {
+  local it="$1" d
+  (( it > 0 )) || return 0
+  d="$STATE_DIR/$(printf 'iter-%02d' "$it")"
+  # Copy-then-rename: a kill mid-adoption must not leave a truncated
+  # canonical file that would block a later retry of the same adoption.
+  if [[ ! -f "$d/issue_counts" && -f "$d/issue_counts.stdout" ]]; then
+    cp "$d/issue_counts.stdout" "$d/issue_counts.tmp.$$"
+    mv -f "$d/issue_counts.tmp.$$" "$d/issue_counts"
+    log "resume: adopted stdout issue counts for landed codex iter $it"
+  fi
+  if [[ ! -f "$d/verdict" && -f "$d/verdict.stdout" ]]; then
+    cp "$d/verdict.stdout" "$d/verdict.tmp.$$"
+    mv -f "$d/verdict.tmp.$$" "$d/verdict"
+    log "resume: adopted stdout verdict for landed codex iter $it"
+  fi
+}
+adopt_landed_codex_artifacts "$LAST_CODEX"
+
 RESUME_CLAUDE_FIRST=0
 if (( RESTART == 1 )) && (( LAST_CODEX > 0 || LAST_CLAUDE > 0 )); then
-  HIGH=$(( LAST_CODEX > LAST_CLAUDE ? LAST_CODEX : LAST_CLAUDE ))
-  ITER=$(( HIGH + 1 ))
-  log "--restart: bypassing prior APPROVED state — starting fresh at iter $ITER (codex first)"
+  # --restart exists to get past a prior APPROVED verdict; it must not skip
+  # work the thread still owes. A pending half-step — codex posted a
+  # non-APPROVED review and claude did not reply, e.g. the restarted round
+  # died mid-way and this is the relaunch — resumes as usual; only a
+  # completed round bumps to a fresh one. The verdict check matters: the
+  # natural post-approval state has the same codex>claude count shape
+  # (claude never answers an approval), and --restart there means a new
+  # round, not a claude reply to the approval. That makes the flag safe to
+  # replay on auto-resume relaunches, and a relaunch that finds no new
+  # posts still gets the forced round instead of the "already APPROVED —
+  # nothing to do" exit.
+  RESTART_VERDICT_FILE="$STATE_DIR/$(printf 'iter-%02d' "$LAST_CODEX")/verdict"
+  RESTART_APPROVED=0
+  [[ -f "$RESTART_VERDICT_FILE" && "$(cat "$RESTART_VERDICT_FILE")" == "APPROVED" ]] \
+    && RESTART_APPROVED=1
+  if (( LAST_CODEX > LAST_CLAUDE && REVIEW_ONLY == 0 && RESTART_APPROVED == 0 )); then
+    ITER="$LAST_CODEX"
+    RESUME_CLAUDE_FIRST=1
+    log "--restart: codex iter=$LAST_CODEX awaits a claude reply — running the half-step first"
+  else
+    # An approval at or past the invocation's baseline landed during THIS
+    # invocation: the forced round already ran and codex approved it. The
+    # replayed --restart of a relaunch must end as approved, not force yet
+    # another round on the approval it just earned. (BASE exists only on
+    # relaunches; a first worker — where the approval predates the
+    # invocation — bumps as requested.)
+    RESTART_BASE=''
+    [[ "$ROLE" == "worker" && -f "$STATE_DIR/worker.progress" ]] \
+      && RESTART_BASE=$(awk -F= '/^BASE=/{print $2}' "$STATE_DIR/worker.progress")
+    if (( RESTART_APPROVED == 1 )) && [[ "$RESTART_BASE" =~ ^[0-9]+$ ]] \
+       && (( LAST_CODEX >= RESTART_BASE )); then
+      log "--restart: the forced round already ran — codex APPROVED at iter $LAST_CODEX; nothing to do"
+      log "PR: $PR_URL"
+      write_worker_status approved
+      exit 0
+    fi
+    HIGH=$(( LAST_CODEX > LAST_CLAUDE ? LAST_CODEX : LAST_CLAUDE ))
+    ITER=$(( HIGH + 1 ))
+    log "--restart: bypassing prior APPROVED state — starting fresh at iter $ITER (codex first)"
+  fi
 elif (( LAST_CODEX == 0 && LAST_CLAUDE == 0 )); then
   ITER=1
   log "no prior AI thread on this PR — starting fresh at iter 1"
@@ -607,6 +1316,7 @@ elif (( LAST_CODEX > LAST_CLAUDE )); then
   if [[ -f "$PRIOR_VERDICT_FILE" && "$(cat "$PRIOR_VERDICT_FILE")" == "APPROVED" ]]; then
     log "codex already APPROVED at iter $LAST_CODEX — nothing to do"
     log "PR: $PR_URL"
+    write_worker_status approved
     exit 0
   fi
   if (( REVIEW_ONLY == 1 )); then
@@ -629,6 +1339,47 @@ fi
 FINAL_STATUS="unknown"
 RUNS=0
 CONVERGE_STREAK=0   # consecutive codex iters with BLOCKER=0 MAJOR=0
+STREAK_AT=0         # last iteration the streak accounted
+RUNS_BASE_ITER="$ITER"
+
+# A relaunched worker continues the invocation's budget. The supervisor
+# clears this file before its first worker, so values here are what this
+# invocation's earlier workers already spent. RUNS alone can trail the
+# public thread — a claude summary that landed right before the worker
+# failed was never counted — so reconcile against the resume point: every
+# iteration between the invocation's baseline and where this worker starts
+# completed publicly and is spent budget.
+if [[ "$ROLE" == "worker" && -f "$STATE_DIR/worker.progress" ]]; then
+  RUNS=$(awk -F= '/^RUNS=/{print $2}' "$STATE_DIR/worker.progress")
+  CONVERGE_STREAK=$(awk -F= '/^STREAK=/{print $2}' "$STATE_DIR/worker.progress")
+  STREAK_AT=$(awk -F= '/^STREAK_AT=/{print $2}' "$STATE_DIR/worker.progress")
+  RUNS_BASE_ITER=$(awk -F= '/^BASE=/{print $2}' "$STATE_DIR/worker.progress")
+  [[ "$RUNS" =~ ^[0-9]+$ ]] || RUNS=0
+  [[ "$CONVERGE_STREAK" =~ ^[0-9]+$ ]] || CONVERGE_STREAK=0
+  [[ "$STREAK_AT" =~ ^[0-9]+$ ]] || STREAK_AT=0
+  [[ "$RUNS_BASE_ITER" =~ ^[0-9]+$ ]] || RUNS_BASE_ITER="$ITER"
+  LANDED=$(( ITER - RUNS_BASE_ITER ))
+  if (( LANDED > RUNS )); then
+    log "auto-resume: the PR thread shows $LANDED iteration(s) completed this invocation (persisted count $RUNS) — reconciling the budget"
+    RUNS="$LANDED"
+  fi
+  if (( RUNS > 0 || CONVERGE_STREAK > 0 )); then
+    log "auto-resume: this invocation already ran $RUNS of $MAX_ITER iteration(s) (converge streak $CONVERGE_STREAK) — continuing on the remaining budget"
+  fi
+  # A streak at the threshold means the run converged and was killed in
+  # the moment between persisting the streak and writing its status. The
+  # outcome already happened; report it instead of running more turns on
+  # a converged review.
+  if (( CONVERGE_N > 0 && CONVERGE_STREAK >= CONVERGE_N )); then
+    log "convergence: restored streak $CONVERGE_STREAK already meets $CONVERGE_N — the run converged before this relaunch; nothing to do"
+    write_worker_status converged_no_major
+    exit 0
+  fi
+elif [[ "$ROLE" == "worker" ]]; then
+  # First worker of the invocation: record the baseline immediately, so a
+  # relaunch can reconcile even when no counter was ever incremented.
+  persist_worker_progress
+fi
 
 while (( RUNS < MAX_ITER )); do
   export ITER
@@ -638,6 +1389,14 @@ while (( RUNS < MAX_ITER )); do
   if (( RESUME_CLAUDE_FIRST == 1 )); then
     log "skipping codex turn — codex already posted at iter $ITER in a prior run"
     RESUME_CLAUDE_FIRST=0
+    # The skipped turn's review is landed and counts: reconcile the streak
+    # from its persisted issue_counts so a qualifying review posted right
+    # before a crash is not lost from convergence (STREAK_AT keeps replays
+    # of the same landed review from counting twice).
+    if update_converge_streak "$ITER"; then
+      FINAL_STATUS="converged_no_major"
+      break
+    fi
   else
     # Codex review.
     set +e
@@ -660,28 +1419,9 @@ while (( RUNS < MAX_ITER )); do
     esac
 
     # Convergence check (NITs only for N consecutive iterations).
-    if (( CONVERGE_N > 0 )); then
-      COUNTS_FILE="$STATE_DIR/$(printf 'iter-%02d' "$ITER")/issue_counts"
-      if [[ -f "$COUNTS_FILE" ]]; then
-        IB=$(awk -F= '/^BLOCKER=/{print $2}' "$COUNTS_FILE")
-        IM=$(awk -F= '/^MAJOR=/{print $2}'   "$COUNTS_FILE")
-        if [[ "$IB" == "0" && "$IM" == "0" ]]; then
-          CONVERGE_STREAK=$((CONVERGE_STREAK + 1))
-          log "convergence: iter $ITER BLOCKER=0 MAJOR=0 (streak $CONVERGE_STREAK / $CONVERGE_N)"
-          if (( CONVERGE_STREAK >= CONVERGE_N )); then
-            log "convergence: $CONVERGE_N consecutive NIT-only iterations — exiting"
-            FINAL_STATUS="converged_no_major"
-            break
-          fi
-        else
-          if (( CONVERGE_STREAK > 0 )); then
-            log "convergence: streak reset (BLOCKER=$IB MAJOR=$IM at iter $ITER)"
-          fi
-          CONVERGE_STREAK=0
-        fi
-      else
-        log "convergence: no issue_counts file for iter $ITER — streak unchanged"
-      fi
+    if update_converge_streak "$ITER"; then
+      FINAL_STATUS="converged_no_major"
+      break
     fi
 
     # Re-sync to the PR head in case anything landed remotely between turns.
@@ -700,11 +1440,15 @@ while (( RUNS < MAX_ITER )); do
     break
   fi
 
-  # Re-sync — Claude pushed; the local checkout must track the new PR head.
-  sync_repo_to_pr_head
-
+  # The round is complete once claude answered: persist the spent iteration
+  # before the sync below, whose network fetch can kill the worker — a
+  # relaunch must not be granted this iteration again.
   ITER=$((ITER + 1))
   RUNS=$((RUNS + 1))
+  persist_worker_progress
+
+  # Re-sync — Claude pushed; the local checkout must track the new PR head.
+  sync_repo_to_pr_head
 done
 
 if [[ "$FINAL_STATUS" == "unknown" ]]; then
@@ -721,6 +1465,8 @@ fi
 log "  PR:    $PR_URL"
 log "  Logs:  $STATE_DIR"
 log "============================================================"
+
+write_worker_status "$FINAL_STATUS"
 
 case "$FINAL_STATUS" in
   approved|converged_no_major|review_posted) exit 0 ;;
