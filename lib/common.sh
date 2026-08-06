@@ -20,6 +20,26 @@
 
 FORGE="${FORGE:-github}"
 
+# --- Review exchange mode -------------------------------------------------
+#
+# LOCAL_MODE selects how the two agents exchange the review:
+#   0 (default) — forge mode: the reviewer posts {{PR_NOUN}} comments, the
+#                 implementer replies to them, and every iteration's commit
+#                 is pushed as it is made.
+#   1           — local mode: the review never touches the forge. The
+#                 reviewer writes $STATE_DIR/iter-NN/codex-review.md, the
+#                 implementer writes $STATE_DIR/iter-NN/claude-response.md
+#                 and commits locally without pushing. When the review ends
+#                 in agreement, finalize_turn.sh squashes every local round
+#                 into ONE commit and pushes that.
+#
+# LOCAL_SCOPE says what local mode is reviewing:
+#   pr     — a PR/MR (the forge is still read for metadata, and the single
+#            squashed commit is pushed to the PR/MR's source branch).
+#   branch — a local branch against a base ref, with no PR/MR at all.
+LOCAL_MODE="${LOCAL_MODE:-0}"
+LOCAL_SCOPE="${LOCAL_SCOPE:-pr}"
+
 # --- Identity / marker scheme -------------------------------------------------
 #
 # Both bots authenticate to the forge via the same user token (the human's),
@@ -79,6 +99,23 @@ CLAUDE_GIT_EMAIL="claude-implementer+bot@users.noreply.github.com"
 
 log()  { printf '[ai-loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
+
+# Every git command the ORCHESTRATOR runs against a checkout an agent turn
+# can write to. The turn may plant hooks there — pre-commit, pre-push,
+# post-checkout, reference-transaction (which fires on ref updates, so
+# reset/update-ref/fetch are ref-changing commands too) — and none of them
+# may execute with the loop's authority after the turn. core.fsmonitor is
+# likewise a config-planted program, and a "nothing changed" answer from
+# one would also fake the cleanliness probes.
+git_safe() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+
+# Publish a state file so a kill mid-write leaves either the old content
+# or the new one — never a truncated file a later run would misread. (A
+# plain '>' redirection truncates first and writes second.)
+write_state_atomic() {  # <path> <content>
+  printf '%s\n' "$2" > "$1.tmp" \
+    && mv -f "$1.tmp" "$1"
+}
 
 # --- Pre-flight ---------------------------------------------------------------
 
@@ -162,6 +199,14 @@ preflight() {
   require_cmd claude
   require_cmd git
   require_cmd jq
+  # Local branch scope never speaks to a forge: no CLI, no token, no
+  # identity. GH_USER is exported empty so the fail-closed author filter in
+  # fetch_ai_thread can never match anything if some path reaches it.
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    export GH_USER=''
+    log "local branch review: no forge credential needed"
+    return
+  fi
   case "$FORGE" in
     github)
       require_cmd gh
@@ -612,6 +657,118 @@ ensure_repo_clone() {
 # process. Reset at source time — an inherited environment value must never
 # be able to skip the first-sync safety checks.
 SYNC_DIR_TRUSTED=0
+# 1 once THIS process's own fetch saw the remote at the finalized squash
+# (local_setup_repo sets it). Reset at source time: an inherited
+# environment value must never stand in for that fetch.
+LOCAL_FINALIZE_LANDED=0
+
+# Force $1's worktree onto commit $2, dropping everything not in that commit.
+# $3 selects how HEAD gets there:
+#   detach (default) — check out the commit detached, so a turn's commit can
+#                      never advance a branch the caller cares about.
+#   attach           — keep HEAD on its current branch and reset it to the
+#                      commit. Used by local branch reviews, where the branch
+#                      IS the work product and its tip is already $2; the
+#                      branch name is never re-parsed (an option-like name
+#                      like `-f` would be read as a flag).
+# Shared by the PR-head sync and the local-head sync so both clean identically.
+force_clean_to_commit() {
+  local d="$1" target="$2" mode="${3:-detach}" dirt
+  # --force drops staged/unstaged changes; clean -ffd drops untracked files
+  # including embedded git repos (single -f leaves those, and `git add -A`
+  # would publish one as a gitlink). Ignored files may stay — `git add -A`
+  # never commits them. core.hooksPath=/dev/null: no caller-installed hook
+  # may run (a post-checkout hook could recreate artifacts right after
+  # cleanup).
+  if [[ "$mode" == "attach" ]]; then
+    git_safe -C "$d" reset --quiet --hard "$target" \
+      || die "could not reset $d to $target"
+  else
+    git_safe -C "$d" checkout --quiet --force --detach "$target" \
+      || die "could not check out $target in $d"
+  fi
+  git -C "$d" -c core.fsmonitor=false clean -qffd \
+    || die "could not remove untracked files in $d"
+  # An initialized submodule left on a different commit would be staged by
+  # `git add -A` as a changed gitlink; put every initialized one back on the
+  # recorded commit, and drop untracked artifacts inside them — not
+  # publishable through a superproject commit, but they change builds, tests,
+  # and what the agents analyze. --checkout: the update strategy must never
+  # come from the just-checked-out .gitmodules (update=merge/rebase would
+  # create commits instead of detaching). (Both are no-ops when there are no
+  # submodules.)
+  git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
+    || die "could not reset initialized submodules in $d"
+  git_safe -C "$d" submodule --quiet foreach --recursive \
+      git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
+    || die "could not clean initialized submodules in $d"
+  # Fail closed on anything the cleanup above did not cover.
+  # --ignore-submodules=dirty is config-independent where it matters: it
+  # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
+  # GITLINK (publishable via `git add -A`), while tolerating
+  # submodule-internal worktree state — which cannot be published through a
+  # superproject commit, and whose eol/filter non-idempotent variant no
+  # cleanup could ever silence (dying on it would wedge the loop). A
+  # top-level ' M' here includes checkout-non-idempotent eol/filter content:
+  # an agent's ordinary `git add -A` would stage that renormalization diff,
+  # publishing content the turn did not author — refusing to run is the only
+  # way to keep the commit invariant; the repo owner can fix the branch with
+  # `git add --renormalize . && git commit`.
+  # core.fsmonitor=false: a formerly---dir clone keeps its caller config, and
+  # a "nothing changed" fsmonitor answer must not fake this probe.
+  dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+    || die "git status failed in $d"
+  [[ -z "$dirt" ]] \
+    || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
+}
+
+# Refuse a caller-supplied (--dir) clone that carries ANY state this
+# invocation's later forced syncs would destroy: worktree dirt (superproject
+# or submodule), a sparse checkout, or index bits that hide edits from
+# status. Target-independent, so both the PR-head sync and a local branch
+# review run it before taking ownership of the clone.
+verify_caller_clone_clean() {
+  local d="$1" dirt
+  # Probe config-independently: a caller's submodule.<name>.ignore=all would
+  # otherwise hide a drifted gitlink from this check, and a turn's `git add
+  # -A` would stage it. core.fsmonitor=false: a caller's fsmonitor
+  # hook/daemon claiming "nothing changed" would make status skip the real
+  # worktree and report a tracked edit as clean.
+  dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    || die "git status failed in $d"
+  [[ -z "$dirt" ]] \
+    || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
+  # Probe every initialized submodule's own worktree as well: the
+  # superproject probe recurses using EACH SUBMODULE's config, so a
+  # submodule-local status.showUntrackedFiles=no (or a nested
+  # submodule.<name>.ignore=all) could hide caller state that this
+  # invocation's later trusted syncs would clean away.
+  dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
+           git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    || die "git submodule status probe failed in $d"
+  [[ -z "$dirt" ]] \
+    || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
+  # An active sparse checkout marks every out-of-cone file skip-worktree,
+  # hiding it from the status probes; refuse it with accurate guidance (the
+  # generic index-bits advice below would only mislead here).
+  if [[ "$(git -C "$d" config --get core.sparseCheckout 2>/dev/null)" == "true" ]]; then
+    die "REPO_DIR=$d uses sparse-checkout, which the loop cannot safely run on (out-of-cone files are hidden from its safety probes) — run 'git sparse-checkout disable' first, or omit --dir to use a managed checkout"
+  fi
+  # assume-unchanged / skip-worktree index bits make status skip a file
+  # entirely: a caller edit behind one would pass the probes above and be
+  # destroyed by this invocation's later forced syncs. ls-files -v tags them
+  # (lowercase = assume-unchanged, 'S'/'s' = skip-worktree); refuse both, in
+  # the superproject and in every initialized submodule.
+  dirt=$(git -C "$d" ls-files -v | { grep -E '^(S|[a-z]) ' || true; }) \
+    || die "git ls-files probe failed in $d"
+  [[ -z "$dirt" ]] \
+    || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries that hide edits from status — clear them (git update-index --no-assume-unchanged/--no-skip-worktree) before running with --dir: $dirt"
+  dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
+           'git ls-files -v | { grep -E "^(S|[a-z]) " || true; }') \
+    || die "git submodule ls-files probe failed in $d"
+  [[ -z "$dirt" ]] \
+    || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries inside initialized submodules — clear them before running with --dir: $dirt"
+}
 
 sync_repo_to_pr_head() {
   local d="$REPO_DIR" target head dirt r
@@ -620,98 +777,20 @@ sync_repo_to_pr_head() {
   # branch it points at. --no-deref delete removes the symref itself (rc 0
   # when absent), so the fetch below always creates fresh direct refs.
   for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
-    git -C "$d" update-ref --no-deref -d "$r" \
+    git_safe -C "$d" update-ref --no-deref -d "$r" \
       || die "could not clear stale ref $r in $d"
   done
-  git -C "$d" fetch --quiet origin \
+  git_safe -C "$d" fetch --quiet origin \
       "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
       "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
     || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
   target=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
     || die "could not resolve the PR head (refs/ai-pr-loop/head) after fetch"
   if [[ "${MANAGED_CLONE:-1}" == "1" || "$SYNC_DIR_TRUSTED" == "1" ]]; then
-    # Unconditionally (even when HEAD already matches): --force drops
-    # staged/unstaged changes; clean -ffd drops untracked files including
-    # embedded git repos (single -f leaves those, and `git add -A` would
-    # publish one as a gitlink). Ignored files may stay — `git add -A`
-    # never commits them. core.hooksPath=/dev/null: no caller-installed
-    # hook may run (a post-checkout hook could recreate artifacts right
-    # after cleanup).
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --force --detach "$target" \
-      || die "could not check out the PR head $target in $d"
-    git -C "$d" -c core.fsmonitor=false clean -qffd \
-      || die "could not remove untracked files in $d"
-    # An initialized submodule left on a different commit would be staged
-    # by `git add -A` as a changed gitlink; put every initialized one back
-    # on the recorded commit, and drop untracked artifacts inside them —
-    # not publishable through a superproject commit, but they change
-    # builds, tests, and what the agents analyze. --checkout: the update
-    # strategy must never come from the just-checked-out .gitmodules
-    # (update=merge/rebase would create commits instead of detaching).
-    # (Both are no-ops when there are no submodules.)
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule update --quiet --checkout --recursive --force \
-      || die "could not reset initialized submodules in $d"
-    git -C "$d" submodule --quiet foreach --recursive git -c core.fsmonitor=false clean -qffd \
-      || die "could not clean initialized submodules in $d"
-    # Fail closed on anything the cleanup above did not cover.
-    # --ignore-submodules=dirty is config-independent where it matters: it
-    # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
-    # GITLINK (publishable via `git add -A`), while tolerating
-    # submodule-internal worktree state — which cannot be published through
-    # a superproject commit, and whose eol/filter non-idempotent variant no
-    # cleanup could ever silence (dying on it would wedge the loop). A
-    # top-level ' M' here includes checkout-non-idempotent eol/filter
-    # content: an agent's ordinary `git add -A` would stage that
-    # renormalization diff, publishing content the turn did not author —
-    # refusing to run is the only way to keep the commit invariant; the
-    # repo owner can fix the branch with `git add --renormalize . && git
-    # commit`.
-    # core.fsmonitor=false: a formerly---dir clone keeps its caller config,
-    # and a "nothing changed" fsmonitor answer must not fake this probe.
-    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
-      || die "git status failed in $d"
-    [[ -z "$dirt" ]] \
-      || die "residual uncommitted state in $d survived cleanup — refusing to run agents on it (if this is eol/filter renormalization noise, fix the branch with 'git add --renormalize . && git commit'): $dirt"
+    # Unconditionally, even when HEAD already matches.
+    force_clean_to_commit "$d" "$target" detach
   else
-    # Probe config-independently: a caller's submodule.<name>.ignore=all
-    # would otherwise hide a drifted gitlink from this check, and a turn's
-    # `git add -A` would stage it. core.fsmonitor=false: a caller's
-    # fsmonitor hook/daemon claiming "nothing changed" would make status
-    # skip the real worktree and report a tracked edit as clean.
-    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
-      || die "git status failed in $d"
-    [[ -z "$dirt" ]] \
-      || die "REPO_DIR=$d has uncommitted changes (staged, unstaged, untracked, or submodule drift) — refusing to run agents in a dirty --dir clone (a turn's git add/commit would publish them); commit, stash, or clean first"
-    # Probe every initialized submodule's own worktree as well: the
-    # superproject probe recurses using EACH SUBMODULE's config, so a
-    # submodule-local status.showUntrackedFiles=no (or a nested
-    # submodule.<name>.ignore=all) could hide caller state that this
-    # invocation's later trusted syncs would clean away.
-    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
-      || die "git submodule status probe failed in $d"
-    [[ -z "$dirt" ]] \
-      || die "REPO_DIR=$d has uncommitted changes inside initialized submodules — refusing to run agents in a dirty --dir clone; commit, stash, or clean them first: $dirt"
-    # An active sparse checkout marks every out-of-cone file skip-worktree,
-    # hiding it from the status probes; refuse it with accurate guidance
-    # (the generic index-bits advice below would only mislead here).
-    if [[ "$(git -C "$d" config --get core.sparseCheckout 2>/dev/null)" == "true" ]]; then
-      die "REPO_DIR=$d uses sparse-checkout, which the loop cannot safely run on (out-of-cone files are hidden from its safety probes) — run 'git sparse-checkout disable' first, or omit --dir to use a managed checkout"
-    fi
-    # assume-unchanged / skip-worktree index bits make status skip a file
-    # entirely: a caller edit behind one would pass the probes above and be
-    # destroyed by this invocation's later forced syncs. ls-files -v tags
-    # them (lowercase = assume-unchanged, 'S'/'s' = skip-worktree); refuse
-    # both, in the superproject and in every initialized submodule.
-    dirt=$(git -C "$d" ls-files -v | { grep -E '^(S|[a-z]) ' || true; }) \
-      || die "git ls-files probe failed in $d"
-    [[ -z "$dirt" ]] \
-      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries that hide edits from status — clear them (git update-index --no-assume-unchanged/--no-skip-worktree) before running with --dir: $dirt"
-    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             'git ls-files -v | { grep -E "^(S|[a-z]) " || true; }') \
-      || die "git submodule ls-files probe failed in $d"
-    [[ -z "$dirt" ]] \
-      || die "REPO_DIR=$d has assume-unchanged/skip-worktree index entries inside initialized submodules — clear them before running with --dir: $dirt"
+    verify_caller_clone_clean "$d"
     head=$(git -C "$d" rev-parse --verify --quiet HEAD 2>/dev/null) || head=''
     if [[ -n "$head" && "$head" != "$target" ]] \
        && ! git -C "$d" merge-base --is-ancestor HEAD "$target" 2>/dev/null; then
@@ -724,7 +803,7 @@ sync_repo_to_pr_head() {
     # probe above cannot see ignored files. core.hooksPath=/dev/null: a
     # caller-installed post-checkout hook must not run (it could create
     # artifacts a turn's `git add -A` would publish).
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false checkout --quiet --detach --no-overwrite-ignore "$target" \
+    git_safe -C "$d" checkout --quiet --detach --no-overwrite-ignore "$target" \
       || die "could not check out the PR head $target in $d (a caller file may collide with a path the PR tracks; reconcile manually)"
     # Align each initialized submodule with the gitlink its (just-updated)
     # superproject records, exactly as the superproject was treated: a
@@ -739,7 +818,7 @@ sync_repo_to_pr_head() {
     # fetch.recurseSubmodules=false), try to fetch it best-effort first —
     # 'submodule update' used to do this; the checkout still fails closed
     # if the commit stays unavailable.
-    git -C "$d" -c core.hooksPath=/dev/null -c core.fsmonitor=false submodule --quiet foreach --recursive \
+    git_safe -C "$d" submodule --quiet foreach --recursive \
         'git rev-parse --verify --quiet "$sha1^{commit}" >/dev/null 2>&1 \
            || git -c core.hooksPath=/dev/null fetch --quiet origin "$sha1" 2>/dev/null \
            || git -c core.hooksPath=/dev/null fetch --quiet origin 2>/dev/null \
@@ -750,12 +829,12 @@ sync_repo_to_pr_head() {
     # worktrees): nothing — hook output, submodule drift, filter effects —
     # may have appeared between the pre-check and here. Caller-preserving:
     # on failure we die without cleaning.
-    dirt=$(git -C "$d" -c core.fsmonitor=false status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    dirt=$(git_safe -C "$d" status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git status failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d is not clean after checking out the PR head (a hook or filter may have produced state a turn could publish): $dirt"
-    dirt=$(git -C "$d" submodule --quiet foreach --recursive \
-             git -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
+    dirt=$(git_safe -C "$d" submodule --quiet foreach --recursive \
+             git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c status.showUntrackedFiles=normal status --porcelain --untracked-files=normal --ignore-submodules=none) \
       || die "git submodule status probe failed in $d"
     [[ -z "$dirt" ]] \
       || die "REPO_DIR=$d has state inside initialized submodules after checking out the PR head: $dirt"
@@ -765,6 +844,432 @@ sync_repo_to_pr_head() {
   fi
   [[ "$(git -C "$d" rev-parse HEAD)" == "$target" ]] \
     || die "post-sync HEAD in $d is not the PR head $target"
+}
+
+# --- Local mode: checkout positioning -------------------------------------
+#
+# Local rounds are committed but never pushed, so between turns the checkout
+# must be cleaned WITHOUT being reset to the forge head — that would delete
+# the very commits the run is producing. The loop's local tip is tracked by a
+# ref of its own:
+#   pr scope     — refs/ai-pr-loop/local/pr-<N>, because local rounds sit on
+#                  a detached HEAD in a managed checkout shared with other
+#                  PRs of the same repo; another PR's sync would otherwise
+#                  leave them unreachable (and collectable).
+#   branch scope — refs/heads/<branch>: the branch under review IS the work
+#                  product, so HEAD stays attached to it.
+
+# Run-level local metadata (base.sha, the composed commit message, the
+# pushed/finalized markers). Per-iteration review files live in iter-NN/.
+local_state_dir() { printf '%s/local\n' "$STATE_DIR"; }
+
+local_tip_ref() {
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    printf 'refs/heads/%s\n' "$HEAD_REF"
+  else
+    printf 'refs/ai-pr-loop/local/pr-%s\n' "$PR_NUMBER"
+  fi
+}
+
+# The commit the whole local run started from: everything after it is the
+# loop's own work, and exactly that range is squashed into the single pushed
+# commit. Written once per run and read by finalize_turn.sh.
+local_base_file() { printf '%s/base.sha\n' "$(local_state_dir)"; }
+
+# Where the last committed round left HEAD. The tip ref keeps pr-scope
+# rounds reachable; this file is the EXPECTED tip for both scopes, checked
+# on every resume and sync so a branch or ref that moved outside the loop's
+# own turns is caught instead of silently adopted (rounds lost, or foreign
+# commits squashed as review work).
+local_tip_file() { printf '%s/tip.sha\n' "$(local_state_dir)"; }
+
+# The finalize outcome journal: one line "<kind> <sha>" written atomically,
+# so an interruption during publication never leaves a half-recorded
+# outcome (a kind without its SHA, or the reverse). kind is 'squash' (a
+# commit to push) or 'nocommit' (nothing lands; only a title/description
+# proposal) — a nocommit's SHA equals the base, so the SHA alone cannot
+# tell the two apart. Records a held --no-push outcome or a rejected push
+# awaiting retry, until it lands terminally.
+local_finalized_file() { printf '%s/finalized\n' "$(local_state_dir)"; }
+local_finalized_kind() { local f; f=$(local_finalized_file); [[ -s "$f" ]] && awk '{print $1}' "$f"; return 0; }
+local_finalized_sha()  { local f; f=$(local_finalized_file); [[ -s "$f" ]] && awk '{print $2}' "$f"; return 0; }
+# <sha> <kind> — one atomic write.
+local_write_finalized() { write_state_atomic "$(local_finalized_file)" "$2 $1"; }
+
+# Written before the squash commit moves HEAD, "<base> <approved-tree>": a
+# finalize interrupted before it journaled its squash is recognized by it.
+local_finalize_inprogress_file() { printf '%s/finalize-inprogress\n' "$(local_state_dir)"; }
+
+# The review's terminal marker: its single commit was pushed, or landed as
+# the local tip when there is no origin, or the rounds landed nothing. A
+# plain rerun of a completed review is a no-op; --restart clears this.
+local_completed_file() { printf '%s/completed.sha\n' "$(local_state_dir)"; }
+
+# Iterations at or below this floor belong to earlier, completed reviews
+# whose artifacts remain on disk as history; resume detection reads them as
+# absent. Written by run.sh when --restart follows a completed review.
+local_iter_floor_file() { printf '%s/iter-floor\n' "$(local_state_dir)"; }
+
+# Durable --restart intent. Written before the floor and every marker a
+# restart consumes, cleared only once the new review's base is established:
+# a restart interrupted anywhere in between is re-driven by the next run,
+# so no plain retry can resurrect the superseded review or exit as
+# "already completed" without the requested new review.
+local_restart_pending_file() { printf '%s/restart-pending\n' "$(local_state_dir)"; }
+
+# A receipt written before each implementer round and cleared once its
+# commit is anchored: "<iter> <pre-turn-tip>". Recovers the crash window
+# where the turn committed and wrote its response but the loop was killed
+# before anchoring the commit to the tip ref.
+local_pending_turn_file() { printf '%s/pending-turn\n' "$(local_state_dir)"; }
+
+# The origin destination the review is allowed to push to, recorded once
+# when the review starts and held for its whole life. A missing file mid-
+# review fails finalize closed (a turn could otherwise delete it to get a
+# poisoned re-pin); an operator who legitimately moved the remote writes
+# the new destination into the file by hand.
+local_origin_file() { printf '%s/origin.url\n' "$(local_state_dir)"; }
+
+# The effective fetch and push destinations of origin — every configured
+# url/pushurl, with url.*.insteadOf / url.*.pushInsteadOf rewrites applied
+# — or "(none)" when the remote does not exist. This covers the URL level
+# only: transport config a turn could plant (core.sshCommand,
+# credential.helper, http.proxy, remote.*.receivepack) is arbitrary code
+# execution with the operator's powers and cannot be policed here.
+origin_dest() {
+  if git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+    printf '%s\n%s\n' "$(git -C "$REPO_DIR" remote get-url --all origin)" \
+                      "$(git -C "$REPO_DIR" remote get-url --push --all origin)"
+  else
+    printf '(none)\n'
+  fi
+}
+
+# Record HEAD as the local tip: point the pr-scope ref at it (branch scope
+# needs no ref — the branch itself is the tip), and persist it as the
+# expected tip for later syncs and resumes. Runs at setup and after every
+# turn that may have committed.
+local_record_tip() {
+  local ref head
+  head=$(git -C "$REPO_DIR" rev-parse HEAD) || die "could not read HEAD in $REPO_DIR"
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    # The branch is the work product: recording a detached or off-branch
+    # HEAD would poison the expected tip with a commit the branch never
+    # carried. Keep the previous round's record and stop.
+    [[ "$(git -C "$REPO_DIR" symbolic-ref --quiet HEAD 2>/dev/null)" == "$(local_tip_ref)" ]] \
+      || die "HEAD in $REPO_DIR is not on the branch under review — refusing to record it as the local tip; put the branch back and re-run"
+  else
+    ref=$(local_tip_ref)
+    git_safe -C "$REPO_DIR" update-ref "$ref" "$head" \
+      || die "could not update $ref in $REPO_DIR"
+  fi
+  write_state_atomic "$(local_tip_file)" "$head"
+}
+
+# A finalize was interrupted mid-publication: its squash commit exists but
+# the tip is not yet anchored to it. Recover from EVERY partial state and
+# leave a consistent, journaled, anchored tip so finalize can complete it.
+# Returns 1 when there is nothing to repair; safe to call unconditionally,
+# since during active rounds neither the outcome journal nor the in-progress
+# marker exists.
+#
+# The squash is recognized two ways:
+#   - the outcome journal (kind squash + its SHA), written after the commit;
+#   - or, before that journal was written, the in-progress marker (base +
+#     approved tree): the tip ref or HEAD is then a commit collapsing that
+#     base onto that tree, which only the loop's own squash can be.
+local_adopt_finalized_squash() {
+  local fsha base cur ibase itree iround c ref_head head
+  base=''; [[ -s "$(local_base_file)" ]] && base=$(<"$(local_base_file)")
+  [[ -n "$base" ]] || return 1
+  ref_head=$(git -C "$REPO_DIR" rev-parse --verify --quiet "$(local_tip_ref)^{commit}" 2>/dev/null || true)
+  head=$(git -C "$REPO_DIR" rev-parse --verify --quiet HEAD 2>/dev/null || true)
+
+  fsha=$(local_finalized_sha)
+  if [[ "$(local_finalized_kind)" != "squash" || -z "$fsha" ]]; then
+    # No squash journal yet. Was one being published? The in-progress marker
+    # names the base and the approved tree; the squash is the ref/HEAD commit
+    # that collapses them.
+    [[ -s "$(local_finalize_inprogress_file)" ]] || return 1
+    read -r ibase itree < "$(local_finalize_inprogress_file)"
+    [[ "$ibase" == "$base" ]] || return 1
+    # The recorded round must NOT be mistaken for the squash: a single round
+    # has the same parent (base) and tree (approved) as its squash, so only a
+    # DIFFERENT commit is the real squash. tip.sha still names that round (the
+    # squash is journaled before local_record_tip advances tip.sha).
+    iround=''; [[ -s "$(local_tip_file)" ]] && iround=$(<"$(local_tip_file)")
+    fsha=''
+    for c in "$ref_head" "$head"; do
+      [[ -n "$c" ]] || continue
+      [[ -n "$iround" && "$c" == "$iround" ]] && continue
+      [[ "$(git -C "$REPO_DIR" rev-parse --verify --quiet "${c}^" 2>/dev/null)" == "$base" ]] || continue
+      [[ "$(git -C "$REPO_DIR" rev-parse --verify --quiet "${c}^{tree}" 2>/dev/null)" == "$itree" ]] || continue
+      fsha="$c"; break
+    done
+    [[ -n "$fsha" ]] || return 1
+    # Journal it now — from here it is an ordinary recorded squash.
+    local_write_finalized "$fsha" squash
+  fi
+
+  # Already anchored — nothing to repair.
+  [[ -s "$(local_tip_file)" && "$(<"$(local_tip_file)")" == "$fsha" ]] && return 1
+  # It must be a real commit that collapses base.. onto the base.
+  git -C "$REPO_DIR" rev-parse --verify --quiet "${fsha}^{commit}" >/dev/null 2>&1 || return 1
+  git -C "$REPO_DIR" merge-base --is-ancestor "$base" "$fsha" >/dev/null 2>&1 || return 1
+  # The tip ref must be exactly where the loop's own finalize left it — the
+  # squash (already advanced) or the recorded round (not yet) — never a
+  # human's commit, which would be a descendant to fail closed on.
+  cur="$ref_head"
+  if [[ "$cur" == "$fsha" ]]; then
+    : # ref already advanced (branch commit, or a killed adopt's update-ref); only tip.sha lags
+  elif [[ -s "$(local_tip_file)" && "$cur" == "$(<"$(local_tip_file)")" ]]; then
+    if [[ "$LOCAL_SCOPE" != "branch" ]]; then
+      git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$fsha" \
+        || die "could not anchor the interrupted finalize squash $fsha in $REPO_DIR"
+    else
+      # Branch scope: the commit itself moves the branch. A branch still at
+      # the round means the squash lives only on a detached HEAD; move the
+      # branch onto it (the loop's own squash), not a foreign commit.
+      git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$fsha" \
+        || die "could not anchor the interrupted finalize squash $fsha in $REPO_DIR"
+    fi
+  else
+    return 1
+  fi
+  write_state_atomic "$(local_tip_file)" "$fsha"
+  log "local: recovered an interrupted finalize — anchored the squash $fsha as the local tip"
+  return 0
+}
+
+# Recover a round killed in the window between its commit and the anchoring
+# of that commit to the tip ref. The `done` receipt names the EXACT commit
+# the validated turn produced; recovery re-points the tip ref at precisely
+# that commit — never at whatever HEAD happens to hold, so a human commit or
+# a turn claude_turn.sh rejected is never adopted. A `pending` receipt (turn
+# outcome never validated) invalidates the round so it re-runs. Runs on
+# every startup, including under --restart, so a validated fix is anchored
+# into the current state before the restart re-bases from it.
+reconcile_pending_turn() {
+  local pt state piter ptip post reftip
+  pt=$(cat "$(local_pending_turn_file)" 2>/dev/null) || pt=''
+  read -r state piter ptip post <<<"$pt"
+  if [[ "$state" == "done" && "$piter" =~ ^[0-9]+$ ]] \
+     && [[ "$ptip" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+     && [[ "$post" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] \
+     && [[ -s "$(local_artifact_path claude "$piter")" ]] \
+     && git -C "$REPO_DIR" rev-parse --verify --quiet "${post}^{commit}" >/dev/null 2>&1; then
+    # The turn validated and produced exactly $post. Anchor it, but only
+    # when the tip ref is where the loop itself left it — already at $post
+    # (the branch-scope commit moved it, or a re-run already anchored) or
+    # still at the pre-turn tip (never advanced). A ref anywhere else is a
+    # human's; refuse rather than clobber it.
+    reftip=$(git -C "$REPO_DIR" rev-parse --verify --quiet "$(local_tip_ref)^{commit}" 2>/dev/null || true)
+    if [[ "$reftip" == "$post" || "$reftip" == "$ptip" ]]; then
+      if [[ "$reftip" != "$post" ]]; then
+        git_safe -C "$REPO_DIR" update-ref "$(local_tip_ref)" "$post" \
+          || die "could not anchor iter $piter's commit $post in $REPO_DIR"
+      fi
+      write_state_atomic "$(local_tip_file)" "$post"
+      log "local: recovered iter $piter — anchored its commit $post"
+    else
+      rm -f "$(local_pending_turn_file)"
+      die "iter $piter produced commit $post but $(local_tip_ref) now points at $reftip — refusing to move it. Reconcile $REPO_DIR by hand, or remove $(local_state_dir) to start over"
+    fi
+  elif [[ "$piter" =~ ^[0-9]+$ ]]; then
+    # `pending` (or malformed): the turn's outcome was never validated, and
+    # the receipt records no committed SHA to prove which commit — if any —
+    # the turn produced. Invalidate the round so it re-runs. A PR-scope
+    # commit is on a detached HEAD local_setup_repo cleans; a branch-scope
+    # commit left the branch ahead of the recorded tip, which — since it
+    # cannot be told from a human commit — is left to local_setup_repo's
+    # fail-closed "moved outside the loop" check rather than force-reset
+    # (which would clobber a human commit made in the crash window).
+    rm -f "$(local_artifact_path claude "$piter")"
+  fi
+  rm -f "$(local_pending_turn_file)"
+}
+
+# Position the checkout for the first turn of this invocation. Fresh run:
+# start from the forge head (pr scope) or the branch tip (branch scope) and
+# record it as the squash base. Resumed run: restore the local tip so earlier
+# rounds are not lost.
+local_setup_repo() {
+  local d="$REPO_DIR" ref tip base origin_head r expected finalized
+  mkdir -p "$(local_state_dir)"
+  # Pin the push destination for the review's whole life: finalize refuses
+  # to push anywhere else, whichever turn or invocation changed the
+  # configuration in between. Written only when the review STARTS — a
+  # missing pin mid-review is not re-adopted (a turn could delete the file
+  # and redirect the remote); finalize fails closed on it instead.
+  [[ -s "$(local_base_file)" ]] || origin_dest > "$(local_origin_file)"
+  ref=$(local_tip_ref)
+  # A caller-supplied clone is checked ONCE per invocation before this
+  # process takes it over, exactly as sync_repo_to_pr_head does — every
+  # positioning path below force-cleans, and a resumed local run reaches
+  # those paths without going through that sync.
+  if [[ "${MANAGED_CLONE:-1}" != "1" && "$SYNC_DIR_TRUSTED" != "1" ]]; then
+    verify_caller_clone_clean "$d"
+    SYNC_DIR_TRUSTED=1
+  fi
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
+      || die "could not resolve the branch under review ($ref) in $d"
+    # Resumed run: only this loop's own turns may move the branch mid-review.
+    # Check it against the expected tip recorded after the last committed
+    # round — before any cleanup touches the worktree. A branch that was
+    # reset lost rounds; one that advanced would get foreign commits squashed
+    # as review work. Both fail closed.
+    if [[ -s "$(local_base_file)" ]]; then
+      # A finalize interrupted before it anchored its squash left the branch
+      # at that squash while tip.sha still names the round; adopt it before
+      # comparing, so the loop's own work is not read as foreign movement.
+      local_adopt_finalized_squash || true
+      expected=''
+      [[ -s "$(local_tip_file)" ]] && expected=$(<"$(local_tip_file)")
+      [[ -n "$expected" ]] \
+        || die "local rounds are recorded for branch $HEAD_REF (base $(<"$(local_base_file)")) but no expected tip is — the state at $(local_state_dir) is incomplete; remove it to review the branch as it is now"
+      [[ "$tip" == "$expected" ]] \
+        || die "branch $HEAD_REF is at $tip but the last committed round left it at $expected — the branch moved outside the loop. Put it back on $expected to continue this review, or remove $(local_state_dir) to review the branch as it is now"
+    fi
+    # Pin the diff base for the whole review. Both prompts diff against
+    # refs/ai-pr-loop/base; with no forge to fetch it from, it comes from
+    # --base (resolved by run.sh). The --no-deref delete first: a pre-planted
+    # symref at that path would otherwise redirect the update onto some other
+    # ref (rc 0 when the ref does not exist).
+    git_safe -C "$d" update-ref --no-deref -d refs/ai-pr-loop/base \
+      || die "could not clear stale ref refs/ai-pr-loop/base in $d"
+    git_safe -C "$d" update-ref refs/ai-pr-loop/base "$LOCAL_BASE_SHA" \
+      || die "could not point refs/ai-pr-loop/base at $LOCAL_BASE_SHA in $d"
+    force_clean_to_commit "$d" "$tip" attach
+    if [[ ! -s "$(local_base_file)" ]]; then
+      printf '%s\n' "$tip" > "$(local_base_file)"
+      local_record_tip
+      log "local: squash base recorded at $tip (branch $HEAD_REF)"
+    fi
+    return
+  fi
+  base=''
+  [[ -s "$(local_base_file)" ]] && base=$(<"$(local_base_file)")
+  if [[ -n "$base" ]]; then
+    # A finalize interrupted before it anchored its squash left the ref at
+    # the round while finalized.sha names the squash; advance the ref to it
+    # (the killed local_record_tip's job) before resolving the tip.
+    local_adopt_finalized_squash || true
+    tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
+      || die "local rounds are recorded for this PR (base $base) but their commits are not in $d — the checkout was recreated or pruned, and that work cannot be recovered; remove $(local_state_dir) to start a fresh local run"
+    # The tip ref must still name the last committed round: a ref that moved
+    # outside the loop's own turns would silently drop rounds or adopt
+    # commits no turn produced.
+    expected=''
+    [[ -s "$(local_tip_file)" ]] && expected=$(<"$(local_tip_file)")
+    [[ -n "$expected" ]] \
+      || die "local rounds are recorded for this PR (base $base) but no expected tip is — the state at $(local_state_dir) is incomplete; remove it to start a fresh local run"
+    [[ "$tip" == "$expected" ]] \
+      || die "the local tip ref $ref is at $tip but the last committed round left it at $expected — it moved outside the loop; repoint it at $expected to continue this review, or remove $(local_state_dir) to start a fresh local run"
+    # Refresh the base ref for this invocation's diffs, and prove the PR head
+    # has not moved under us: local rounds are stacked on $base, so a remote
+    # that advanced past it makes the eventual single push a non-fast-forward
+    # (and the loop never force-pushes). Better to say so now than after
+    # another few hours of agent turns.
+    for r in refs/ai-pr-loop/base refs/ai-pr-loop/head; do
+      git_safe -C "$d" update-ref --no-deref -d "$r" || die "could not clear stale ref $r in $d"
+    done
+    git_safe -C "$d" fetch --quiet origin \
+        "+refs/heads/$BASE_REF:refs/ai-pr-loop/base" \
+        "+refs/heads/$HEAD_REF:refs/ai-pr-loop/head" \
+      || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
+    origin_head=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
+      || die "could not resolve the PR head after fetch"
+    if [[ "$origin_head" != "$base" ]]; then
+      # One remote position is not external movement: the exact squash this
+      # run already validated and pushed, with the crash landing between
+      # the push and the terminal marker. Resume so the finalize shortcut
+      # can complete the interrupted run (its re-push is a no-op).
+      finalized=$(local_finalized_sha)
+      if [[ -n "$finalized" && "$origin_head" == "$finalized" && "$tip" == "$finalized" ]] \
+         && [[ "$(local_finalized_kind)" == "squash" ]]; then
+        # Proof for the caller: this fetch saw the remote at the finalized
+        # squash, so a later probe that cannot reach the remote must not
+        # downgrade the conclusion.
+        LOCAL_FINALIZE_LANDED=1
+        log "local: the squashed commit $finalized already reached the remote — completing the interrupted finalization"
+      else
+        die "the PR head moved to $origin_head since this local run started at $base — its rounds can no longer be pushed as a fast-forward. Reconcile $d manually (the local rounds are at $ref), or remove $(local_state_dir) and re-run to review the new head from scratch"
+      fi
+    fi
+    force_clean_to_commit "$d" "$tip" detach
+    log "local: resuming local rounds at $tip (squash base $base)"
+  else
+    sync_repo_to_pr_head
+    tip=$(git -C "$d" rev-parse HEAD) || die "could not read HEAD in $d"
+    printf '%s\n' "$tip" > "$(local_base_file)"
+    local_record_tip
+    log "local: squash base recorded at $tip (PR head)"
+  fi
+}
+
+# Between-turn cleanup: drop whatever the last turn left in the worktree,
+# keep every local round.
+sync_repo_to_local_head() {
+  local d="$REPO_DIR" ref tip mode=detach
+  ref=$(local_tip_ref)
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    mode=attach
+    # The branch IS the work product: a turn that detached HEAD would commit
+    # onto nothing the loop tracks, and resetting the branch here would drop
+    # those commits. Stop instead of choosing for the operator.
+    [[ "$(git -C "$d" symbolic-ref --quiet HEAD 2>/dev/null)" == "$ref" ]] \
+      || die "HEAD in $d is not on $ref any more (a turn detached or switched it) — a local branch review commits onto that branch; put it back before re-running"
+  fi
+  # A finalize interrupted before it anchored its squash left the tip at
+  # that squash while tip.sha still names the round; adopt it as the loop's
+  # own work before the check below would read it as foreign movement.
+  local_adopt_finalized_squash || true
+  tip=$(git -C "$d" rev-parse --verify --quiet "${ref}^{commit}") \
+    || die "local tip ref $ref is missing in $d — this run's local rounds are unreachable"
+  # The expected tip is recorded right after every committed round; a tip
+  # that moved off it means something other than an implementer turn
+  # committed, and syncing to it would adopt content no round produced.
+  # Checked only when recorded — this function is also driven standalone.
+  if [[ -s "$(local_tip_file)" ]] && [[ "$tip" != "$(<"$(local_tip_file)")" ]]; then
+    die "local tip $ref is at $tip but the last committed round left it at $(<"$(local_tip_file)") — it moved outside the loop's own turns; refusing to sync to it"
+  fi
+  force_clean_to_commit "$d" "$tip" "$mode"
+  [[ "$(git -C "$d" rev-parse HEAD)" == "$tip" ]] \
+    || die "post-sync HEAD in $d is not the local tip $tip"
+}
+
+# --- Local mode: the review exchange --------------------------------------
+#
+# Forge mode's completion contract is the summary comment; local mode's is a
+# file. The reviewer writes iter-NN/codex-review.md, the implementer writes
+# iter-NN/claude-response.md, and each turn script deletes its own artifact
+# before running so a crashed turn's leftovers can never read as completion.
+
+local_artifact_path() {  # <codex|claude> <iter>
+  case "$1" in
+    codex)  printf '%s/codex-review.md\n'    "$(iter_dir "$2")" ;;
+    claude) printf '%s/claude-response.md\n' "$(iter_dir "$2")" ;;
+    *) die "unknown bot tag: $1" ;;
+  esac
+}
+
+# True iff the bot's iteration-$2 artifact exists and has content.
+local_artifact_written() { [[ -s "$(local_artifact_path "$1" "$2")" ]]; }
+
+# Highest iteration the bot completed — the local counterpart of
+# latest_ai_comment_iter. Prints 0 when it has never run.
+latest_local_iter() {
+  local who="$1" d n hi=0
+  for d in "$STATE_DIR"/iter-*; do
+    [[ -d "$d" ]] || continue
+    n="${d##*/iter-}"
+    [[ "$n" =~ ^[0-9]+$ ]] || continue
+    n=$((10#$n))
+    local_artifact_written "$who" "$n" || continue
+    (( n > hi )) && hi=$n
+  done
+  printf '%s\n' "$hi"
 }
 
 # --- GitLab API helper ----------------------------------------------------------
@@ -1050,6 +1555,12 @@ auto_resume_decision() {
   case "$status" in
     approved|converged_no_major|review_posted|max_iterations_reached)
       printf 'stop worker finished: %s\n' "$status" ;;
+    finalize_error)
+      # The review itself is over; only the squash or its push failed, and
+      # the usual cause — the branch moved on the remote — is not something
+      # another worker can resolve. The rounds stay in the checkout for the
+      # operator, who re-runs once the branch is reconciled.
+      printf 'stop the review finished but its single commit could not be landed (%s)\n' "$status" ;;
     codex_error|claude_error)
       printf 'restart agent turn failed (%s)\n' "$status" ;;
     '')
@@ -1106,12 +1617,39 @@ auto_resume_backoff() {
 # the clone origin check both validate the full identity and fail loudly
 # rather than silently share.
 repo_ident_name() {
-  if [[ "${FORGE:-github}" == "github" ]]; then
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    printf 'local__%s-%s\n' "$(ident_slug "$(basename -- "$REPO_DIR_CANON")")" \
+                            "$(printf '%s' "$REPO_DIR_CANON" | short_hash)"
+  elif [[ "${FORGE:-github}" == "github" ]]; then
     printf '%s\n' "${REPO_SLUG//\//__}"
   else
     printf '%s__%s\n' "$FORGE_HOST" "${REPO_SLUG//\//__}"
   fi
 }
+
+# Per-target leaf under the repo identity: one PR/MR, or one branch of one
+# checkout.
+state_leaf_name() {
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    printf 'branch-%s-%s\n' "$(ident_slug "$HEAD_REF")" "$(printf '%s' "$HEAD_REF" | short_hash)"
+  else
+    printf 'pr-%s\n' "$PR_NUMBER"
+  fi
+}
+
+# Readable, filesystem-safe stub of an arbitrary string (path component,
+# branch name). Never identifying on its own — every name that uses it also
+# carries a hash of the full value, and the state marker validates the whole
+# identity anyway.
+ident_slug() {
+  local s
+  s=$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+  printf '%s\n' "${s:0:40}"
+}
+
+# 8 hex chars over stdin. git is already required, so its hasher saves
+# depending on one of sha256sum / shasum / openssl being installed.
+short_hash() { git hash-object --stdin | cut -c1-8; }
 
 # Full repo identity for marker files. GitHub keeps the bare slug (the
 # pre-gitlab marker format, so existing state dirs validate unchanged);
@@ -1120,7 +1658,9 @@ repo_ident_name() {
 # (port 443) are different endpoints, and the flat directory name alone
 # cannot tell them apart.
 repo_ident() {
-  if [[ "${FORGE:-github}" == "github" ]]; then
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    printf 'local %s %s\n' "$REPO_DIR_CANON" "$HEAD_REF"
+  elif [[ "${FORGE:-github}" == "github" ]]; then
     printf '%s\n' "$REPO_SLUG"
   else
     printf '%s %s://%s %s\n' "$FORGE" "${FORGE_SCHEME:-https}" "$FORGE_HOST" "$REPO_SLUG"
@@ -1211,7 +1751,7 @@ claim_state_marker() {
 }
 
 ensure_state_dir() {
-  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
+  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/$(state_leaf_name)"
   mkdir -p "$STATE_DIR"
   claim_state_marker "$STATE_DIR"
 }
@@ -1349,39 +1889,320 @@ resolve_codex_root_session_id() {
   return 1
 }
 
+
+# --- Claude CLI invocation ------------------------------------------------
+#
+# Shared by claude_turn.sh (one implementer round) and finalize_turn.sh (the
+# closing turn of a local review): both run `claude -p` against the same
+# per-PR session, model, effort, and permission handling, so a knob resolved
+# one way for a round can never resolve the other way for the finalize.
+#
+#   claude_prepare_cli                 — resolve every knob into the *_ARG
+#                                        arrays (call once per script).
+#   claude_run_prompt <prompt> <out> <err>
+#                                      — run one prompt through them; the
+#                                        CLI's exit status lands in
+#                                        $CLAUDE_RUN_RC.
+
+claude_prepare_cli() {
+  # Persistent session: pin a UUID on iter 1 via --session-id, then --resume it.
+  # This gives Claude its own internal memory of the whole review, on top of the
+  # public PR thread it re-reads from disk each turn.
+  CLAUDE_SESSION_FILE="$STATE_DIR/claude.session.uuid"
+  if [[ -s "$CLAUDE_SESSION_FILE" ]]; then
+    CLAUDE_SESSION_UUID=$(<"$CLAUDE_SESSION_FILE")
+    CLAUDE_SESSION_ARG=(--resume "$CLAUDE_SESSION_UUID")
+    log "claude: resuming session $CLAUDE_SESSION_UUID"
+  else
+    CLAUDE_SESSION_UUID=$(gen_uuid)
+    printf '%s\n' "$CLAUDE_SESSION_UUID" > "$CLAUDE_SESSION_FILE"
+    CLAUDE_SESSION_ARG=(--session-id "$CLAUDE_SESSION_UUID")
+    log "claude: starting new session $CLAUDE_SESSION_UUID"
+  fi
+
+  # Model for the implementer, set by the orchestrator's --claude-model
+  # (default: fable — Claude Fable 5; the alias resolves to the latest model in
+  # the claude CLI). "off" leaves the CLI/settings default untouched.
+  CLAUDE_MODEL_ARG=()
+  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-fable}"
+  case "$CLAUDE_MODEL_RESOLVED" in
+    off|'') CLAUDE_MODEL_ARG=() ;;
+    *)      CLAUDE_MODEL_ARG=(--model "$CLAUDE_MODEL_RESOLVED") ;;
+  esac
+  (( ${#CLAUDE_MODEL_ARG[@]} > 0 )) && log "claude: model = ${CLAUDE_MODEL_RESOLVED}"
+
+  # Permission handling for the implementer, set by the orchestrator's
+  # --claude-perms (default: auto).
+  #   auto   — --permission-mode auto: every action is gated by the Claude Code
+  #            auto-mode classifier, which approves task-aligned actions
+  #            headlessly and works on hosts where bypass is policy-disabled.
+  #            Auto mode is not available on every account/provider (Pro and
+  #            Bedrock/Vertex/Foundry are excluded; Team/Enterprise needs admin
+  #            enablement). Ineligible hosts SILENTLY DOWNGRADE to default mode
+  #            (rc 0, empty stderr, every headless action denied), so a
+  #            deterministic preflight probe reads the CLI-reported effective
+  #            mode first and switches to the settings safety net when auto
+  #            does not stick (cached per PR). A CLI that instead hard-rejects
+  #            the flag at startup is handled by a one-shot retry (see below).
+  #   bypass — --dangerously-skip-permissions, plus a settings safety net for
+  #            hosts that silently downgrade bypass (managed no-bypass policies,
+  #            nested launches from inside another Claude Code session — the
+  #            skill path): auto-accepted edits + allowed Bash/WebFetch/
+  #            WebSearch. Where bypass is honored the net is a no-op.
+  #   off    — leave the host's CLI/settings default untouched.
+  # In every mode $STATE_DIR is mounted as a second working dir below so the
+  # turn can always read the codex review files.
+  CLAUDE_PERMISSIONS_NET='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}'
+  CLAUDE_PERMS_RESOLVED="${CLAUDE_PERMS:-auto}"
+  CLAUDE_PERMS_ARG=()
+  CLAUDE_PERMISSIONS=''
+
+  # Print the effective permission mode the CLI grants for --permission-mode
+  # auto, or nothing when the probe is inconclusive. The stream-json init event
+  # is emitted by the CLI itself at startup — before any model or tool activity
+  # — and reports the mode actually in effect, so this detects the silent
+  # downgrade deterministically (verified on claude 2.1.211: an ineligible host
+  # reports "default" here while exiting 0 with empty stderr). Probing with the
+  # turn's own model args matters: eligibility can be per-model. The watchdog is
+  # run_with_timeout (lib/common.sh) — portable across hosts without GNU
+  # timeout, where a bare `timeout` would silently make every probe
+  # inconclusive.
+  probe_claude_effective_auto_mode() {
+    ( cd "$REPO_DIR" && run_with_timeout 60 claude -p \
+        "${CLAUDE_MODEL_ARG[@]}" \
+        --permission-mode auto \
+        --output-format stream-json --verbose \
+        'Reply with exactly: OK' 2>/dev/null \
+      | head -1 | jq -r '.permissionMode // empty' 2>/dev/null )
+  }
+
+  case "$CLAUDE_PERMS_RESOLVED" in
+    auto)
+      # Definitive probe results are cached per PR AND per resolved model —
+      # eligibility is account/host/model state, and --claude-model can change
+      # between invocations sharing this state dir ('off' = host default model
+      # is a key of its own). A cache line is "<mode> <model>", mode first
+      # because modes are single tokens while a model string could contain
+      # whitespace — `read` hands the remainder to the model field verbatim,
+      # so the match is exact for any model. A stored line for a different
+      # model (or the older formats) is treated as absent and re-probed.
+      # Delete the cache file after changing auto-mode enablement to re-probe.
+      AUTOMODE_CACHE="$STATE_DIR/claude.automode.effective"
+      EFFECTIVE_AUTO=''
+      if [[ -s "$AUTOMODE_CACHE" ]]; then
+        read -r CACHED_MODE CACHED_MODEL < "$AUTOMODE_CACHE" || true
+        if [[ "${CACHED_MODEL:-}" == "$CLAUDE_MODEL_RESOLVED" && -n "${CACHED_MODE:-}" ]]; then
+          EFFECTIVE_AUTO="$CACHED_MODE"
+          log "claude: auto-mode probe (cached for model '$CACHED_MODEL') = '$EFFECTIVE_AUTO'"
+        fi
+      fi
+      if [[ -z "$EFFECTIVE_AUTO" ]]; then
+        EFFECTIVE_AUTO=$(probe_claude_effective_auto_mode || true)
+        if [[ -n "$EFFECTIVE_AUTO" ]]; then
+          printf '%s %s\n' "$EFFECTIVE_AUTO" "$CLAUDE_MODEL_RESOLVED" > "$AUTOMODE_CACHE"
+          log "claude: auto-mode probe (model '$CLAUDE_MODEL_RESOLVED') = '$EFFECTIVE_AUTO'"
+        else
+          log "claude: auto-mode probe inconclusive — proceeding with auto (startup-rejection retry still applies)"
+        fi
+      fi
+      if [[ -z "$EFFECTIVE_AUTO" || "$EFFECTIVE_AUTO" == "auto" ]]; then
+        CLAUDE_PERMS_ARG=(--permission-mode auto)
+      else
+        log "claude: auto mode silently downgraded to '$EFFECTIVE_AUTO' on this host — using the settings safety net"
+        CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET"
+      fi
+      ;;
+    bypass) CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
+            CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET" ;;
+    off|'') ;;
+    *)      log "claude: unknown CLAUDE_PERMS='${CLAUDE_PERMS_RESOLVED}' — using CLI default" ;;
+  esac
+  (( ${#CLAUDE_PERMS_ARG[@]} > 0 )) && log "claude: permission mode = ${CLAUDE_PERMS_RESOLVED}"
+
+  # Reasoning effort for the implementer, set by the orchestrator's --claude-effort
+  # (default: ultracode). "ultracode" sends xhigh reasoning + dynamic-workflow
+  # orchestration via a --settings payload (the documented headless mechanism;
+  # degrades to plain xhigh if orchestration doesn't apply in -p mode). A bare
+  # level uses --effort. "off" leaves the CLI/settings effort default untouched.
+  # The bypass-mode permission safety net rides in the same --settings payload.
+  CLAUDE_EFFORT_ARG=()
+  SETTINGS_PARTS=()
+  case "${CLAUDE_EFFORT:-ultracode}" in
+    ultracode)                 SETTINGS_PARTS+=('"ultracode": true') ;;
+    low|medium|high|xhigh|max) CLAUDE_EFFORT_ARG=(--effort "${CLAUDE_EFFORT}") ;;
+    off|'')                    ;;
+    *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT}' — using CLI default" ;;
+  esac
+  log "claude: effort = ${CLAUDE_EFFORT:-ultracode}"
+  [[ -n "$CLAUDE_PERMISSIONS" ]] && SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS")
+  CLAUDE_SETTINGS_ARG=()
+  if (( ${#SETTINGS_PARTS[@]} > 0 )); then
+    _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+    CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+  fi
+
+  # The implementer sometimes launches a long build/test as a background task
+  # and ends its message expecting to be re-invoked when the task completes.
+  # Headless claude holds the final message while background tasks are pending,
+  # but only up to CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS (default 600s) — past
+  # that it terminates the turn WITHOUT emitting the final message, so the
+  # orchestrator sees a marker-less exit 0 and fails the iteration even though
+  # work happened (observed on ovstage-internal PR 58 iter 1). Give such tasks
+  # a bounded but realistic window; 0 (= wait forever) is unsafe here because
+  # no outer watchdog wraps the turn. Override via env if a repo needs more.
+  : "${CLAUDE_BG_WAIT_CEILING_MS:=3600000}"
+
+  # A -p turn is a one-shot process: when the model ends its turn the CLI
+  # exits (it waits only for pending background tasks, bounded above). Tools
+  # that yield the turn expecting a later re-invocation — scheduled wakeups,
+  # monitors, cron jobs — therefore end the run with NO final message and no
+  # completion marker: observed on ovstage-internal PR 58 iter 9, where the
+  # implementer backgrounded a stress run and called ScheduleWakeup as a
+  # "fallback heartbeat", killing the turn 6s later with empty stdout. Ban
+  # them outright; the prompt also says to drain work in-turn.
+  CLAUDE_DISALLOWED_TOOLS="ScheduleWakeup,Monitor,CronCreate"
+}
+
+# Run <prompt-file>, writing stdout to <out> and stderr to <err>. Sets
+# $CLAUDE_RUN_RC (and returns it).
+claude_run_prompt() {
+  _CLAUDE_PROMPT_FILE="$1"; _CLAUDE_OUT="$2"; _CLAUDE_ERR="$3"
+  # A failing turn is a value this function RETURNS, not a script-ending
+  # error, so errexit is off inside it and restored exactly as the caller
+  # had it — leaving it on would abort the caller at the `return` instead of
+  # letting it inspect the status.
+  local _saved_errexit=0
+  case $- in *e*) _saved_errexit=1 ;; esac
+  # claude -p runs non-interactively; permission handling for unattended
+  # operation (user authorized this) is selected above via --claude-perms.
+  _claude_exec() {
+    ( cd "$REPO_DIR" && \
+      CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
+      claude -p \
+        --disallowedTools "$CLAUDE_DISALLOWED_TOOLS" \
+        "${CLAUDE_SESSION_ARG[@]}" \
+        "${CLAUDE_MODEL_ARG[@]}" \
+        "${CLAUDE_EFFORT_ARG[@]}" \
+        "${CLAUDE_PERMS_ARG[@]}" \
+        "${CLAUDE_SETTINGS_ARG[@]}" \
+        --add-dir "$REPO_DIR" \
+        --add-dir "$STATE_DIR" \
+        --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
+        "$(cat "$_CLAUDE_PROMPT_FILE")" \
+        > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
+  }
+
+  set +e
+  TURN_START=$SECONDS
+  _claude_exec
+  CLAUDE_RUN_RC=$?
+  TURN_ELAPSED=$(( SECONDS - TURN_START ))
+
+  # Auto mode is not available on every account/provider; the CLI refuses the
+  # flag at startup there — before any turn work runs — so a retry cannot
+  # duplicate side effects. Fall back once to the broadly available settings
+  # safety net rather than failing every iteration on such hosts. Retry ONLY
+  # on proven startup ineligibility, never on a turn that may have done work:
+  #   - stderr must carry one of the CLI's startup-eligibility diagnostics
+  #     ("auto mode disabled by settings" / "is unavailable for your plan" /
+  #     "requires CLAUDE_CODE_ENABLE_AUTO_MODE" / "unavailable for this model",
+  #     extracted from the claude 2.1.211 bundle), and must NOT be the
+  #     documented runtime classifier abort ("auto mode cannot determine the
+  #     safety ..."), which can fire after tool side effects;
+  #   - stdout must be empty (text mode prints only the final response, so
+  #     this alone cannot prove no work — hence the checks above);
+  #   - the attempt must have died almost immediately: a turn that reached
+  #     the model and executed tools cannot finish this fast.
+  if [[ $CLAUDE_RUN_RC -ne 0 && "$CLAUDE_PERMS_RESOLVED" == "auto" ]] \
+     && (( ${#CLAUDE_PERMS_ARG[@]} > 0 )) \
+     && (( TURN_ELAPSED < 15 )) \
+     && [[ ! -s "$_CLAUDE_OUT" ]] \
+     && ! grep -qi 'cannot determine the safety' "$_CLAUDE_ERR" \
+     && grep -qiE 'auto[ -]mode (is )?(disabled by settings|unavailable for (your plan|this model)|requires CLAUDE_CODE_ENABLE_AUTO_MODE)' "$_CLAUDE_ERR"; then
+    log "claude: permission mode 'auto' unavailable on this host — retrying with the settings safety net"
+    mv "$_CLAUDE_ERR" "${_CLAUDE_ERR}.auto-rejected"
+    CLAUDE_PERMS_ARG=()
+    SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
+    _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+    CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+    _claude_exec
+    CLAUDE_RUN_RC=$?
+  fi
+  (( _saved_errexit == 1 )) && set -e
+  return "$CLAUDE_RUN_RC"
+}
+
 # ---------------------------------------------------------------------------
 # Prompt rendering
 # ---------------------------------------------------------------------------
-# The two agent prompts (prompts/claude.md, prompts/codex.md) are a single
-# source shared by every forge. Passages that differ are wrapped in
-# forge blocks whose open/close markers sit alone on their own lines:
+# The two agent prompts (prompts/claude.md, prompts/codex.md) and the
+# finalize prompt are a single source shared by every forge and both review
+# exchange modes. Passages that differ are wrapped in blocks whose open/close
+# markers sit alone on their own lines:
 #
-#   {{#github}}
-#   ...GitHub-only text...
-#   {{/github}}
+#   {{#github}} … {{/github}}   forge is GitHub
+#   {{#gitlab}} … {{/gitlab}}   forge is GitLab
+#   {{#forge}}  … {{/forge}}    the review is exchanged as PR/MR comments
+#   {{#local}}  … {{/local}}    the review is exchanged as files on disk
+#   {{#pr}}     … {{/pr}}       a PR/MR exists, so its metadata is readable
+#   {{#branch}} … {{/branch}}   no PR/MR: a local branch against a base ref
 #
-# render_forge_blocks keeps the blocks matching $2 and drops the others; text
-# outside any block is always kept. It runs BEFORE placeholder substitution,
-# so block bodies may use {{PLACEHOLDER}} freely. Blocks do not nest, and an
-# unclosed or unmatched marker is an error rather than a silent mis-render —
-# a dropped block would quietly strip an agent's posting recipe.
+# render_forge_blocks keeps the blocks whose tag is in the ACTIVE SET ($2, a
+# space-separated list built by prompt_tags) and drops the rest; text outside
+# any block is always kept. Blocks nest — a {{#pr}} section may hold
+# {{#github}} and {{#gitlab}} variants — and an inner block is kept only when
+# every block enclosing it is. Rendering runs BEFORE placeholder
+# substitution, so block bodies may use {{PLACEHOLDER}} freely.
+#
+# An unclosed marker, a mismatched close, or a tag outside the vocabulary is
+# an error rather than a silent mis-render: a dropped block would quietly
+# strip an agent's posting recipe, and a typo ({{#gitlba}}) has no other
+# symptom.
+# squash / nocommit select the finalize prompt's job: compose the squashed
+# commit's message, or — when the rounds land no net change on a PR/MR —
+# only assess the title/description.
+PROMPT_BLOCK_TAGS='github gitlab forge local pr branch squash nocommit'
+
 render_forge_blocks() {
   local template="$1" want="$2"
-  awk -v want="$want" '
-    function fail(msg) { printf("prompt template %s: %s (line %d)\n", FILENAME, msg, FNR) > "/dev/stderr"; exit 3 }
+  awk -v want="$want" -v vocab="$PROMPT_BLOCK_TAGS" '
+    function fail(msg) { printf("prompt template %s: %s (line %d)\n", FILENAME, msg, FNR) > "/dev/stderr"; failed = 1; exit 3 }
+    BEGIN {
+      n = split(want,  a, /[ \t]+/); for (i = 1; i <= n; i++) if (a[i] != "") active[a[i]] = 1
+      n = split(vocab, b, /[ \t]+/); for (i = 1; i <= n; i++) if (b[i] != "") known[b[i]] = 1
+      depth = 0; keep[0] = 1
+    }
     /^[[:space:]]*\{\{#[a-z]+\}\}[[:space:]]*$/ {
       tag = $0; sub(/^[[:space:]]*\{\{#/, "", tag); sub(/\}\}[[:space:]]*$/, "", tag)
-      if (depth) fail("nested forge block {{#" tag "}}")
-      depth = 1; keep = (tag == want); next
+      if (!(tag in known)) fail("unknown block tag {{#" tag "}}")
+      depth++
+      opened[depth] = tag
+      keep[depth] = (keep[depth - 1] && (tag in active))
+      next
     }
     /^[[:space:]]*\{\{\/[a-z]+\}\}[[:space:]]*$/ {
       tag = $0; sub(/^[[:space:]]*\{\{\//, "", tag); sub(/\}\}[[:space:]]*$/, "", tag)
       if (!depth) fail("unmatched {{/" tag "}}")
-      depth = 0; next
+      if (opened[depth] != tag) fail("{{/" tag "}} closes {{#" opened[depth] "}}")
+      depth--
+      next
     }
-    { if (!depth || keep) print }
-    END { if (depth) fail("unclosed forge block") }
+    { if (keep[depth]) print }
+    END { if (!failed && depth) fail("unclosed block {{#" opened[depth] "}}") }
   ' "$template"
+}
+
+# The active block set for this run: exchange mode, review scope, and (when a
+# forge is involved) which forge.
+prompt_tags() {
+  local tags
+  if [[ "$LOCAL_MODE" == "1" ]]; then tags='local'; else tags='forge'; fi
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    tags="$tags branch"
+  else
+    tags="$tags pr ${FORGE:-github}"
+  fi
+  printf '%s\n' "$tags"
 }
 
 # Export the forge-specific vocabulary the shared prompts interpolate, so the
@@ -1390,6 +2211,21 @@ render_forge_blocks() {
 # gitlab) FORGE_HOST set.
 forge_vocab() {
   local slug="${REPO_SLUG:-${REPO_OWNER:-}/${REPO_NAME:-}}"
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    # No forge at all. PR_REF names the branch through the exported shell
+    # variable, never the literal name — the branch name is deliberately kept
+    # out of every sed-substituted value (see the turn scripts).
+    FORGE_NAME='git'
+    PR_NOUN='change'
+    PR_NOUN_LONG='local review'
+    PR_REF='of the branch `$HEAD_REF`'
+    SUMMARY_NOUN='review file'
+    INLINE_NOUN='findings'
+    INLINE_NOUN_TITLE='Findings'
+    TOKEN_NOUN='credential'
+    AUTOLINK_SIGILS='`#N`'
+    return
+  fi
   if [[ "${FORGE:-github}" == "gitlab" ]]; then
     FORGE_NAME='GitLab'
     PR_NOUN='MR'

@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
-description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted). Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate on a PR/MR autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account.
-argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
+description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted), or locally on a branch. Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", "review this branch locally", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account. With --local it posts nothing and lands the whole review as one squashed commit.
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -23,6 +23,12 @@ user, then stream progress back into the conversation.
 
 Each agent's session persists across iterations (per-PR), so memory
 accumulates round over round.
+
+With `--local` the same two agents exchange the review through files
+under the state dir instead of PR/MR comments, the implementer commits
+without pushing, and when they agree a final `claude -p` turn composes one
+commit message for the whole review — the orchestrator then squashes every
+round into that single commit and pushes it.
 
 ## Inputs
 
@@ -75,6 +81,37 @@ Optional flags worth surfacing if the user mentions a constraint:
   thread, marks resolved findings with `Resolved.`, and re-reviews the
   new HEAD at `last_codex+1`. If codex previously APPROVED, add
   `--restart` to force a fresh round.
+
+- `--local` — keep the review off the forge and land **one** squashed
+  commit instead of a comment thread and a chain of fixup commits. Use it
+  when the user says "don't clutter the PR", "review it locally", "just
+  one commit", "no bot comments", "squash the review into a single
+  commit". Details:
+  - No comments are posted. Reviews and responses are files under
+    `state/<repo-ident>/<target>/iter-NN/`.
+  - Rounds are committed locally and pushed only once, on agreement
+    (`approved` / `converged_no_major`). The commit's message carries the
+    review's findings, fixes, and decisions. A review that changes nothing
+    (all findings answered by pushback, or edits that cancel out) lands no
+    commit; the exchange files are its only record — say so when reporting.
+  - A completed review is terminal: re-running exits without doing
+    anything. `--restart` reviews the target as it now stands.
+  - The push is fast-forward only. If the branch moved on the remote, the
+    run fails with the squashed commit left in the checkout — report that
+    to the user; never force-push on their behalf.
+  - On a PR/MR, the forge is read-only for the whole review except that
+    final push plus one title/description refresh if the change made them
+    stale.
+  - Hitting `--max` pushes nothing; the rounds stay in the checkout and
+    the next invocation continues them. Say so when reporting.
+- `--base REF` + no PR/MR — a **local review with no PR/MR at all**:
+  reviews the branch `--dir` has checked out (default: cwd) against `REF`
+  (`main`, `origin/main`, a tag, a SHA). Only valid with `--local`. Use
+  when the user asks to review a local branch or work-in-progress that has
+  no PR yet. No forge credential is used.
+- `--no-push` — `--local` only: create the squashed commit but stop before
+  pushing, for inspection ("let me look before it goes up"). Re-running
+  without the flag pushes it without composing the message again.
 
 - **Additional context** (shared by both agents) — when the user wants the
   bots to consider external reference material (a design doc, RFC, related
@@ -214,6 +251,14 @@ host", "MR is not open", "GitLab auth failed", "no GitLab token", and
 
 ### 3. Confirm before posting
 
+With `--local` there is less to confirm but it still ends in a push: say
+that no comments will be posted, that the review lands as **one commit**
+pushed through the checkout's git credential, and (on a PR/MR) that the
+title/description may be refreshed once afterwards. With `--local --base`
+and no PR/MR, no forge identity is involved at all — confirm the checkout,
+the branch, and the base instead. `--no-push` means nothing leaves the
+machine; say so.
+
 The loop writes to a live PR/MR: it posts comments under the user's forge
 API identity (gh PAT on GitHub, GitLab token on GitLab), and (via Claude)
 pushes commits through the checkout's git credential. Always tell the
@@ -284,11 +329,15 @@ finishes.
 When the background `run.sh` completes, summarize:
 
 - Final status: `approved`, `converged_no_major`, `review_posted` (only
-  with `--review-only`), `max_iterations_reached`, `codex_error`, or
-  `claude_error`.
+  with `--review-only`), `max_iterations_reached`, `codex_error`,
+  `claude_error`, or `finalize_error` (only with `--local`: the squash or
+  the push failed; the rounds are still in the checkout).
 - Iter count + last codex `BLOCKER=… MAJOR=… NIT=…` counts.
 - Wall time per iter (read from the timestamps in the log).
 - PR URL so the user can audit.
+- With `--local`: the pushed commit's sha and subject (the `finalize:`
+  lines in the log), or — when nothing was pushed — where the rounds are
+  and what to run next.
 
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
@@ -299,8 +348,10 @@ stdout/stderr, fetched thread, codex verdict file).
 
 The loop is fully resumable across invocations. If a prior run hit `--max`
 or died mid-iteration, just re-run the same `run.sh` command — the
-orchestrator inspects the PR's existing AI comments and continues from
-the high-water mark. Per-PR session ids for both agents are persisted in
+orchestrator inspects the PR's existing AI comments (with `--local`: the
+review files under the state dir) and continues from the high-water mark.
+A `--local` re-run also restores the earlier rounds' commits, which exist
+only in the checkout — so re-run with the **same** `--dir`. Per-PR session ids for both agents are persisted in
 `state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`, so
 agents keep their internal memory across re-runs too.
 
@@ -327,4 +378,8 @@ they remember the prior discussion.
 - Default to `--max 0` without warning the user. Uncapped runs can post
   many commits and many comments before reaching convergence.
 - Try to "help" by editing the prompts in `prompts/codex.md` /
-  `prompts/claude.md` mid-run. Re-tune them between runs, not during.
+  `prompts/claude.md` / `prompts/finalize.md` mid-run. Re-tune them
+  between runs, not during.
+- Force-push, rebase, or "fix up" a `--local` run's rounds by hand. If the
+  push was refused because the branch moved, report it and let the user
+  decide.

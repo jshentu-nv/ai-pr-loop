@@ -6,11 +6,18 @@
 #     iterations (NIT-only, "converged_no_major")                 → exit 0
 #   - This invocation's iteration cap is hit                      → exit 1
 #   - A turn errors                                               → exit 1
+#   - --local only: the closing squash or its push fails          → exit 1
 #
-# Resume: on each launch the orchestrator inspects the PR's existing AI
-# comments and continues from the high-water mark. If codex posted but claude
-# didn't respond (prior run died or hit max between turns), claude runs first
-# at that iteration.
+# The review is exchanged as PR/MR comments by default, or — with --local —
+# through files under the state dir, in which case the implementer's rounds
+# are committed locally and squashed into the ONE commit that gets pushed
+# when the two agents agree. See --local below.
+#
+# Resume: on each launch the orchestrator inspects what each agent has
+# already completed — the PR's existing AI comments, or (with --local) the
+# review files on disk — and continues from the high-water mark. If codex
+# posted but claude didn't respond (prior run died or hit max between
+# turns), claude runs first at that iteration.
 #
 # Auto-resume: a supervisor in its own session restarts the loop when a run
 # dies without finishing, so an external kill does not end the review. On by
@@ -20,6 +27,7 @@
 #   run.sh <pr-number-or-url> [--repo OWNER/NAME] [--dir REPO_DIR]
 #                      [--forge github|gitlab] [--host HOST]
 #                      [--max N] [--converge N] [--review-only]
+#                      [--local] [--no-push]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
 #                      [--claude-model MODEL] [--claude-effort LEVEL]
@@ -28,11 +36,15 @@
 #                      [--codex-tier TIER] [--print-config]
 #                      [--auto-resume N] [--no-auto-resume] [--stop]
 #
+#   run.sh --local --base REF [--dir REPO_DIR] [other flags...]
+#
 # The positional argument is either a PR/MR number (with --repo) or a full
 # PR/MR URL, from which the forge, host, repo, and number are all derived:
 #   https://github.com/OWNER/NAME/pull/42                     → GitHub
 #   https://<gitlab-host>/<group>/<project>/-/merge_requests/7 → GitLab
 #                                            (gitlab.com or self-hosted)
+# With --local --base REF and no positional, there is no PR/MR at all: the
+# loop reviews the branch checked out in --dir against REF.
 #
 # Arguments:
 #   --repo        Repo slug (required unless a URL is given). GitHub:
@@ -65,6 +77,26 @@
 #                 claude implementer. Useful when you want feedback without
 #                 auto-fixups. Implies --max 1, disables --converge. Both
 #                 APPROVED and CHANGES_REQUESTED exit 0 (review posted).
+#   --local       Local review mode: the two agents exchange the review
+#                 through files under the state dir instead of PR/MR
+#                 comments, and the implementer commits without pushing.
+#                 When the review ends in agreement (APPROVED, or the
+#                 --converge streak), every local round is squashed into ONE
+#                 commit, whose message carries the findings, fixes, and
+#                 decisions that shaped the final diff, and that single
+#                 commit is pushed. Nothing is posted to the forge; a PR/MR
+#                 target is still read for its metadata, and its title and
+#                 description are refreshed once after the push if the
+#                 change made them stale. Ending at the iteration cap or on
+#                 an error pushes nothing — the local rounds stay in the
+#                 checkout and the next invocation continues them.
+#   --base REF    The base to review against when there is no PR/MR (local
+#                 mode with no positional argument). Any committish git can
+#                 resolve — `main`, `origin/main`, a tag, a SHA. The branch
+#                 under review is whatever --dir has checked out.
+#   --no-push     Local mode only: create the squashed commit but stop
+#                 before pushing it, so it can be inspected first. Re-run
+#                 without the flag to push it.
 #   --context-url URL
 #                 Web link to attach as reference material for BOTH agents
 #                 (design doc, RFC, related issue, API reference, ...). The
@@ -208,6 +240,7 @@ AUTO_RESUME_DEFAULT=10    # restart budget for the auto-resume supervisor
 
 REPO_SLUG=""
 REPO_DIR=""
+REPO_DIR_CANON=""     # set for local branch reviews, where it is the identity
 MANAGED_CLONE=1          # 0 when --dir points at a caller-supplied clone
 MAX_ITER="$MAX_ITER_DEFAULT"
 CONVERGE_N="$CONVERGE_DEFAULT"
@@ -219,6 +252,10 @@ RESTART=0
 REVIEW_ONLY=0
 PRINT_CONFIG=0
 PREFLIGHT_ONLY=0
+LOCAL_MODE=0
+LOCAL_SCOPE=pr
+BASE_ARG=""
+NO_PUSH=0
 CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
@@ -249,6 +286,9 @@ while [[ $# -gt 0 ]]; do
     --converge)      CONVERGE_N="$2"; shift 2 ;;
     --restart)       RESTART=1; shift ;;
     --review-only)   REVIEW_ONLY=1; shift ;;
+    --local)         LOCAL_MODE=1; shift ;;
+    --base)          [[ $# -ge 2 && -n "$2" ]] || die "--base needs a git ref"; BASE_ARG="$2"; shift 2 ;;
+    --no-push)       NO_PUSH=1; shift ;;
     --context-url)   [[ $# -ge 2 ]] || die "--context-url needs a URL";  CONTEXT_URLS+=("$2");  shift 2 ;;
     --context)       [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
     --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
@@ -290,6 +330,22 @@ done
 
 [[ "$AUTO_RESUME" =~ ^[0-9]+$ ]] || die "--auto-resume needs a non-negative count (got: $AUTO_RESUME)"
 
+# --- review mode / scope --------------------------------------------------------
+#
+# --local without a PR/MR positional means there is no forge target at all:
+# the loop reviews the branch checked out in --dir against --base. Everything
+# below that reads or writes a forge is skipped in that scope.
+if (( LOCAL_MODE == 0 )); then
+  [[ -z "$BASE_ARG" ]] || die "--base only applies to --local (without a PR/MR, the base comes from --base; with one, from the PR/MR)"
+  (( NO_PUSH == 0 )) || die "--no-push only applies to --local (forge mode pushes each iteration's commit as it is made)"
+fi
+if (( LOCAL_MODE == 1 )) && [[ -z "$PR_NUMBER" && -z "$URL_ARG" ]]; then
+  LOCAL_SCOPE=branch
+fi
+if [[ "$LOCAL_SCOPE" != "branch" && -n "$BASE_ARG" ]]; then
+  die "--base is for a local review with no PR/MR; the base branch of $( ((LOCAL_MODE)) && echo 'this PR/MR' || echo 'a PR/MR' ) comes from the forge"
+fi
+
 # --- forge resolution -----------------------------------------------------------
 #
 # A URL positional pins forge, host, repo, number, and scheme all at once;
@@ -302,131 +358,147 @@ done
 # calls and both rendered prompts — so an HTTP-only self-hosted GitLab is
 # reached on the scheme it actually serves. --host may carry it explicitly
 # (--host http://gitlab.lab) for slug+number invocations without a URL.
-FORGE_SCHEME=""
-if [[ "$FORGE_HOST" =~ ^(https?)://(.+)$ ]]; then
-  FORGE_SCHEME="${BASH_REMATCH[1]}"
-  FORGE_HOST="${BASH_REMATCH[2]%/}"
-fi
-if [[ -n "$URL_ARG" ]]; then
-  # Split scheme/authority/path FIRST, validate the authority (userinfo
-  # smuggling dies here, before any classification), then classify on the
-  # CANONICAL authority: https://GITHUB.COM/..., github.com./..., and
-  # github.com:443/... are all links to the supported GitHub endpoint.
-  # FORGE_HOST keeps the RAW spelling — the later canonicalization step
-  # normalizes it while preserving ORIG_HOST for glab's exact-key probe.
-  [[ "$URL_ARG" =~ ^(https?)://([^/]+)(/.+)$ ]] \
-    || die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
-  URL_SCHEME="${BASH_REMATCH[1]}"; URL_AUTH="${BASH_REMATCH[2]}"; URL_PATH="${BASH_REMATCH[3]}"
-  validate_forge_authority "$URL_AUTH"
-  URL_CANON=$(canon_authority "$URL_AUTH" "$URL_SCHEME")
-  if [[ "$URL_CANON" == "github.com" && "$URL_PATH" =~ ^/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
-    # gh always speaks https to github.com; an http:// link is just a link.
-    URL_FORGE=github; URL_AUTH=github.com; URL_CANON=github.com; URL_SCHEME=https
-    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
-  elif [[ "$URL_PATH" =~ ^/(.+)/-/merge_requests/([0-9]+) ]]; then
-    URL_FORGE=gitlab
-    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
-  elif [[ "$URL_PATH" =~ ^/(.+)/merge_requests/([0-9]+) ]]; then
-    # Legacy GitLab URL form (pre-13.0, no /-/ separator).
-    URL_FORGE=gitlab
-    URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
-  else
-    die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
+if [[ "$LOCAL_SCOPE" != "branch" ]]; then
+  FORGE_SCHEME=""
+  if [[ "$FORGE_HOST" =~ ^(https?)://(.+)$ ]]; then
+    FORGE_SCHEME="${BASH_REMATCH[1]}"
+    FORGE_HOST="${BASH_REMATCH[2]%/}"
   fi
-  [[ -z "$FORGE" || "$FORGE" == "$URL_FORGE" ]] \
-    || die "--forge $FORGE conflicts with the URL (a $URL_FORGE link)"
-  # Redundant flags may agree in ANY equivalent spelling (case, trailing
-  # dot, default port) — compare canonically.
-  [[ -z "$FORGE_HOST" || "$(canon_authority "$FORGE_HOST" "$URL_SCHEME")" == "$URL_CANON" ]] \
-    || die "--host $FORGE_HOST conflicts with the URL host ($URL_CANON)"
-  [[ -z "$FORGE_SCHEME" || "$FORGE_SCHEME" == "$URL_SCHEME" ]] \
-    || die "--host scheme ${FORGE_SCHEME}:// conflicts with the URL scheme (${URL_SCHEME}://)"
-  [[ -z "$REPO_SLUG" || "$REPO_SLUG" == "$URL_SLUG" ]] \
-    || die "--repo $REPO_SLUG conflicts with the URL repo ($URL_SLUG)"
-  FORGE="$URL_FORGE"; FORGE_HOST="$URL_AUTH"; FORGE_SCHEME="$URL_SCHEME"
-  REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
-fi
-# Forge inference and the GitHub host check compare CANONICAL authorities:
-# GITHUB.COM and github.com:443 are spellings of the supported GitHub
-# endpoint, and matching the literal string would route them through the
-# GitLab path (or reject them as self-hosted GitHub).
-if [[ -z "$FORGE" ]]; then
-  if [[ -n "$FORGE_HOST" ]] \
-     && [[ "$(canon_authority "$FORGE_HOST" "${FORGE_SCHEME:-https}")" != "github.com" ]]; then
-    FORGE=gitlab
-  else
-    FORGE=github
-  fi
-fi
-case "$FORGE" in
-  github)
-    FORGE_HOST="${FORGE_HOST:-github.com}"
-    [[ "$(canon_authority "$FORGE_HOST" https)" == "github.com" ]] \
-      || die "self-hosted GitHub is not supported (--host $FORGE_HOST)"
-    FORGE_HOST="github.com"
-    FORGE_SCHEME=https
-    ;;
-  gitlab)
-    FORGE_HOST="${FORGE_HOST:-gitlab.com}"
-    FORGE_SCHEME="${FORGE_SCHEME:-https}"
-    ;;
-  *) die "--forge must be github or gitlab (got: $FORGE)" ;;
-esac
-# The resolved authority goes verbatim into every API URL both here and in
-# the agents' prompts — reject anything that isn't host[:port] (userinfo in
-# a crafted MR link would redirect PAT-bearing calls to another server).
-validate_forge_authority "$FORGE_HOST"
-# Canonicalize an explicit default port away: https://gl.example:443 and
-# https://gl.example are the same endpoint, and every consumer of
-# FORGE_HOST — managed checkout/state naming, identity markers, API URLs,
-# prompts, the clone guard — must agree on ONE spelling, or re-invoking
-# the same MR in the equivalent form would split its state (losing
-# sessions, context, and the on-disk verdict that makes an approved
-# resume a no-op).
-# Canonicalize the authority's port NUMERICALLY (shared canon_authority:
-# curl reaches the same endpoint for :0443 and :443, so no equivalent
-# spelling may fork the identity; the scheme's default port drops, other
-# ports keep canonical digits). ORIG_HOST keeps the validated original
-# spelling for the glab config probe — glab keys host config by the exact
-# login string.
-ORIG_HOST="$FORGE_HOST"
-CANON_HOST=$(canon_authority "$FORGE_HOST" "$FORGE_SCHEME")
-FORGE_HOST="$CANON_HOST"
-# One-time upgrade guard, ALL equivalent spellings: DISCOVER managed state
-# trees whose authority spelling canonicalizes to this target ('gl.example',
-# 'gl.example:443', 'gl.example:0443', ... for an https gl.example) instead
-# of enumerating spellings — re-entry through ANY equivalent form must
-# refuse loudly rather than silently fork a fresh tree and orphan the
-# legacy one (sessions, context, and the approved-resume verdict). Only a
-# tree's markers prove it is OURS: the same directory name is legitimate
-# CANONICAL state for the opposite scheme (443 is not http's default port),
-# so match same-scheme markers and the ambiguous pre-scheme form — a tree
-# whose markers all name the other scheme is left alone. Migration is
-# per-PR (never a whole-tree rename: with an existing canonical tree, mv
-# would NEST the legacy tree inside it, hiding the very sessions/verdicts
-# this guard protects).
-if [[ "$FORGE" == "gitlab" ]]; then
-  FLAT_SLUG="${REPO_SLUG//\//__}"
-  NEW_IDENT="${CANON_HOST}__${FLAT_SLUG}"
-  for LEGACY_DIR in "$LOOP_HOME/state"/*"__${FLAT_SLUG}"; do
-    [[ -d "$LEGACY_DIR" ]] || continue
-    LEGACY_AUTH="${LEGACY_DIR##*/}"; LEGACY_AUTH="${LEGACY_AUTH%__${FLAT_SLUG}}"
-    [[ "$LEGACY_AUTH" == "$CANON_HOST" ]] && continue
-    [[ "$(canon_authority "$LEGACY_AUTH" "$FORGE_SCHEME")" == "$CANON_HOST" ]] || continue
-    if grep -qsxF \
-         -e "gitlab ${FORGE_SCHEME}://${LEGACY_AUTH} ${REPO_SLUG}" \
-         -e "gitlab ${LEGACY_AUTH} ${REPO_SLUG}" \
-         "$LEGACY_DIR"/pr-*/.repo-slug; then
-      die "state keyed by the pre-canonicalization spelling '${LEGACY_AUTH}' exists under $LEGACY_DIR; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any matching legacy checkouts dir) — or simply remove the legacy dirs to start fresh"
+  if [[ -n "$URL_ARG" ]]; then
+    # Split scheme/authority/path FIRST, validate the authority (userinfo
+    # smuggling dies here, before any classification), then classify on the
+    # CANONICAL authority: https://GITHUB.COM/..., github.com./..., and
+    # github.com:443/... are all links to the supported GitHub endpoint.
+    # FORGE_HOST keeps the RAW spelling — the later canonicalization step
+    # normalizes it while preserving ORIG_HOST for glab's exact-key probe.
+    [[ "$URL_ARG" =~ ^(https?)://([^/]+)(/.+)$ ]] \
+      || die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
+    URL_SCHEME="${BASH_REMATCH[1]}"; URL_AUTH="${BASH_REMATCH[2]}"; URL_PATH="${BASH_REMATCH[3]}"
+    validate_forge_authority "$URL_AUTH"
+    URL_CANON=$(canon_authority "$URL_AUTH" "$URL_SCHEME")
+    if [[ "$URL_CANON" == "github.com" && "$URL_PATH" =~ ^/([^/]+/[^/]+)/pull/([0-9]+) ]]; then
+      # gh always speaks https to github.com; an http:// link is just a link.
+      URL_FORGE=github; URL_AUTH=github.com; URL_CANON=github.com; URL_SCHEME=https
+      URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
+    elif [[ "$URL_PATH" =~ ^/(.+)/-/merge_requests/([0-9]+) ]]; then
+      URL_FORGE=gitlab
+      URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
+    elif [[ "$URL_PATH" =~ ^/(.+)/merge_requests/([0-9]+) ]]; then
+      # Legacy GitLab URL form (pre-13.0, no /-/ separator).
+      URL_FORGE=gitlab
+      URL_SLUG="${BASH_REMATCH[1]}"; URL_PR="${BASH_REMATCH[2]}"
+    else
+      die "unrecognized PR/MR URL: $URL_ARG (expected .../pull/N or .../-/merge_requests/N)"
     fi
-  done
-fi
-if [[ "$FORGE_SCHEME" == "http" ]]; then
-  log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
-fi
+    [[ -z "$FORGE" || "$FORGE" == "$URL_FORGE" ]] \
+      || die "--forge $FORGE conflicts with the URL (a $URL_FORGE link)"
+    # Redundant flags may agree in ANY equivalent spelling (case, trailing
+    # dot, default port) — compare canonically.
+    [[ -z "$FORGE_HOST" || "$(canon_authority "$FORGE_HOST" "$URL_SCHEME")" == "$URL_CANON" ]] \
+      || die "--host $FORGE_HOST conflicts with the URL host ($URL_CANON)"
+    [[ -z "$FORGE_SCHEME" || "$FORGE_SCHEME" == "$URL_SCHEME" ]] \
+      || die "--host scheme ${FORGE_SCHEME}:// conflicts with the URL scheme (${URL_SCHEME}://)"
+    [[ -z "$REPO_SLUG" || "$REPO_SLUG" == "$URL_SLUG" ]] \
+      || die "--repo $REPO_SLUG conflicts with the URL repo ($URL_SLUG)"
+    FORGE="$URL_FORGE"; FORGE_HOST="$URL_AUTH"; FORGE_SCHEME="$URL_SCHEME"
+    REPO_SLUG="$URL_SLUG"; PR_NUMBER="$URL_PR"
+  fi
+  # Forge inference and the GitHub host check compare CANONICAL authorities:
+  # GITHUB.COM and github.com:443 are spellings of the supported GitHub
+  # endpoint, and matching the literal string would route them through the
+  # GitLab path (or reject them as self-hosted GitHub).
+  if [[ -z "$FORGE" ]]; then
+    if [[ -n "$FORGE_HOST" ]] \
+       && [[ "$(canon_authority "$FORGE_HOST" "${FORGE_SCHEME:-https}")" != "github.com" ]]; then
+      FORGE=gitlab
+    else
+      FORGE=github
+    fi
+  fi
+  case "$FORGE" in
+    github)
+      FORGE_HOST="${FORGE_HOST:-github.com}"
+      [[ "$(canon_authority "$FORGE_HOST" https)" == "github.com" ]] \
+        || die "self-hosted GitHub is not supported (--host $FORGE_HOST)"
+      FORGE_HOST="github.com"
+      FORGE_SCHEME=https
+      ;;
+    gitlab)
+      FORGE_HOST="${FORGE_HOST:-gitlab.com}"
+      FORGE_SCHEME="${FORGE_SCHEME:-https}"
+      ;;
+    *) die "--forge must be github or gitlab (got: $FORGE)" ;;
+  esac
+  # The resolved authority goes verbatim into every API URL both here and in
+  # the agents' prompts — reject anything that isn't host[:port] (userinfo in
+  # a crafted MR link would redirect PAT-bearing calls to another server).
+  validate_forge_authority "$FORGE_HOST"
+  # Canonicalize an explicit default port away: https://gl.example:443 and
+  # https://gl.example are the same endpoint, and every consumer of
+  # FORGE_HOST — managed checkout/state naming, identity markers, API URLs,
+  # prompts, the clone guard — must agree on ONE spelling, or re-invoking
+  # the same MR in the equivalent form would split its state (losing
+  # sessions, context, and the on-disk verdict that makes an approved
+  # resume a no-op).
+  # Canonicalize the authority's port NUMERICALLY (shared canon_authority:
+  # curl reaches the same endpoint for :0443 and :443, so no equivalent
+  # spelling may fork the identity; the scheme's default port drops, other
+  # ports keep canonical digits). ORIG_HOST keeps the validated original
+  # spelling for the glab config probe — glab keys host config by the exact
+  # login string.
+  ORIG_HOST="$FORGE_HOST"
+  CANON_HOST=$(canon_authority "$FORGE_HOST" "$FORGE_SCHEME")
+  FORGE_HOST="$CANON_HOST"
+  # One-time upgrade guard, ALL equivalent spellings: DISCOVER managed state
+  # trees whose authority spelling canonicalizes to this target ('gl.example',
+  # 'gl.example:443', 'gl.example:0443', ... for an https gl.example) instead
+  # of enumerating spellings — re-entry through ANY equivalent form must
+  # refuse loudly rather than silently fork a fresh tree and orphan the
+  # legacy one (sessions, context, and the approved-resume verdict). Only a
+  # tree's markers prove it is OURS: the same directory name is legitimate
+  # CANONICAL state for the opposite scheme (443 is not http's default port),
+  # so match same-scheme markers and the ambiguous pre-scheme form — a tree
+  # whose markers all name the other scheme is left alone. Migration is
+  # per-PR (never a whole-tree rename: with an existing canonical tree, mv
+  # would NEST the legacy tree inside it, hiding the very sessions/verdicts
+  # this guard protects).
+  if [[ "$FORGE" == "gitlab" ]]; then
+    FLAT_SLUG="${REPO_SLUG//\//__}"
+    NEW_IDENT="${CANON_HOST}__${FLAT_SLUG}"
+    for LEGACY_DIR in "$LOOP_HOME/state"/*"__${FLAT_SLUG}"; do
+      [[ -d "$LEGACY_DIR" ]] || continue
+      LEGACY_AUTH="${LEGACY_DIR##*/}"; LEGACY_AUTH="${LEGACY_AUTH%__${FLAT_SLUG}}"
+      [[ "$LEGACY_AUTH" == "$CANON_HOST" ]] && continue
+      [[ "$(canon_authority "$LEGACY_AUTH" "$FORGE_SCHEME")" == "$CANON_HOST" ]] || continue
+      if grep -qsxF \
+           -e "gitlab ${FORGE_SCHEME}://${LEGACY_AUTH} ${REPO_SLUG}" \
+           -e "gitlab ${LEGACY_AUTH} ${REPO_SLUG}" \
+           "$LEGACY_DIR"/pr-*/.repo-slug; then
+        die "state keyed by the pre-canonicalization spelling '${LEGACY_AUTH}' exists under $LEGACY_DIR; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any matching legacy checkouts dir) — or simply remove the legacy dirs to start fresh"
+      fi
+    done
+  fi
+  if [[ "$FORGE_SCHEME" == "http" ]]; then
+    log "WARNING: plain-HTTP API base http://$FORGE_HOST/api/v4 (from the MR URL / --host) — the token travels unencrypted"
+  fi
 
-[[ -n "$REPO_SLUG" ]] || die "--repo OWNER/NAME is required (see --help)"
-[[ "$REPO_SLUG" == */* ]] || die "--repo must be in OWNER/NAME form, got: $REPO_SLUG"
+  [[ -n "$REPO_SLUG" ]] || die "--repo OWNER/NAME is required (see --help)"
+  [[ "$REPO_SLUG" == */* ]] || die "--repo must be in OWNER/NAME form, got: $REPO_SLUG"
+else
+  # --- local branch scope: no forge involved ------------------------------
+  # Identity is the checkout plus the branch it has checked out; the base is
+  # whatever --base names. Nothing here contacts a forge, so no slug, host,
+  # scheme, or credential is used — and passing one is a mistake worth
+  # naming rather than ignoring.
+  [[ -z "$REPO_SLUG"   ]] || die "--repo is not used by a local review with no PR/MR (identity comes from the checkout)"
+  [[ -z "$FORGE"       ]] || die "--forge is not used by a local review with no PR/MR"
+  [[ -z "$FORGE_HOST"  ]] || die "--host is not used by a local review with no PR/MR"
+  [[ -n "$BASE_ARG"    ]] || die "--base REF is required for a local review with no PR/MR (there is no forge to take the base branch from)"
+  FORGE=local
+  FORGE_HOST=""
+  FORGE_SCHEME=""
+  REPO_SLUG=""
+fi
 
 # --max 0 → uncapped (still honor the hard ceiling).
 if [[ "$MAX_ITER" -eq 0 ]] 2>/dev/null; then
@@ -478,8 +550,16 @@ esac
 # residual flat-name aliases (literal "__" path components, dotless intranet
 # hostnames) are caught by ensure_repo_clone's origin slug+host check and
 # ensure_state_dir's identity marker, which die rather than share.
+#
+# A local review with no PR/MR has no clone to manage: it reviews a checkout
+# that already exists, defaulting to the current directory.
 if [[ -z "$REPO_DIR" ]]; then
-  REPO_DIR="$LOOP_HOME/checkouts/$(repo_ident_name)"
+  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    REPO_DIR="$PWD"
+    MANAGED_CLONE=0
+  else
+    REPO_DIR="$LOOP_HOME/checkouts/$(repo_ident_name)"
+  fi
 fi
 
 # --print-config: report the resolved knobs and exit before any forge access.
@@ -488,13 +568,28 @@ fi
 if (( PRINT_CONFIG == 1 )); then
   printf 'forge: %s host=%s scheme=%s repo=%s pr=%s\n' "$FORGE" "$FORGE_HOST" "$FORGE_SCHEME" "$REPO_SLUG" "${PR_NUMBER:--}"
   printf 'dir: %s\n' "$REPO_DIR"
+  printf 'mode: %s scope=%s base=%s push=%s\n' \
+    "$( (( LOCAL_MODE == 1 )) && echo local || echo forge )" \
+    "$LOCAL_SCOPE" "${BASE_ARG:--}" \
+    "$( (( LOCAL_MODE == 1 && NO_PUSH == 1 )) && echo no || echo yes )"
   printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
 fi
 
-[[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
-[[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
+if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+  # The checkout is the target, so it must exist and be a work tree now (a
+  # forge-targeted run may still be about to clone one).
+  [[ -d "$REPO_DIR" ]] || die "no such directory: $REPO_DIR (pass --dir, or run from inside the checkout)"
+  REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P) \
+    || die "could not resolve $REPO_DIR"
+  REPO_DIR="$REPO_DIR_CANON"
+  git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not a git work tree: $REPO_DIR"
+else
+  [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
+  [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
+fi
 
 # --- auto-resume: front-end, supervisor, worker -------------------------------
 #
@@ -1071,17 +1166,36 @@ REPO_NAME="${REPO_SLUG##*/}"
 
 export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
+       LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON \
        CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
 # --preflight-only stops before any side effect: no clone, no state dir, no
 # comment. It still needs branch discovery below for the open check and the
 # canonical URL, so only the clone is skipped here.
-(( PREFLIGHT_ONLY == 1 )) || ensure_repo_clone
+if (( PREFLIGHT_ONLY == 0 )) && [[ "$LOCAL_SCOPE" != "branch" ]]; then
+  ensure_repo_clone
+fi
 
 # --- discover branches --------------------------------------------------------
 
 case "$FORGE" in
+  local)
+    # No PR/MR: the branch under review is the one the checkout has out (a
+    # detached HEAD has no branch to commit onto or push), and the base is
+    # whatever --base resolves to in this checkout.
+    HEAD_REF=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD) \
+      || die "HEAD in $REPO_DIR is detached — check out the branch you want reviewed"
+    BASE_REF="$BASE_ARG"
+    LOCAL_BASE_SHA=$(git -C "$REPO_DIR" rev-parse --verify --quiet --end-of-options "${BASE_ARG}^{commit}") \
+      || die "--base '$BASE_ARG' does not resolve to a commit in $REPO_DIR"
+    # local_setup_repo pins refs/ai-pr-loop/base to it — the base both agents
+    # diff against, fixed for the whole review.
+    export LOCAL_BASE_SHA
+    git -C "$REPO_DIR" merge-base "$LOCAL_BASE_SHA" HEAD >/dev/null 2>&1 \
+      || die "--base '$BASE_ARG' ($LOCAL_BASE_SHA) shares no history with the branch under review"
+    PR_URL="local branch review: $HEAD_REF in $REPO_DIR"
+    ;;
   gitlab)
     PR_JSON=$(gl_api_get "projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}") \
       || die "failed to fetch MR !${PR_NUMBER} of ${REPO_SLUG} from ${FORGE_HOST}"
@@ -1114,7 +1228,7 @@ export HEAD_REF BASE_REF
 # proves authority validation, credential resolution, and the open check
 # all passed; any failure died above with its specific message.
 if (( PREFLIGHT_ONLY == 1 )); then
-  printf 'identity: %s\n' "$GH_USER"
+  printf 'identity: %s\n' "${GH_USER:-(none — local branch review, no forge credential)}"
   printf 'pr: %s\n' "$PR_URL"
   printf 'branches: %s <- %s\n' "$BASE_REF" "$HEAD_REF"
   exit 0
@@ -1203,26 +1317,215 @@ fi
 log "------------------------------------------------------------"
 log "AI PR loop starting"
 log "  PR:    $PR_URL"
-log "  forge: $FORGE ($FORGE_SCHEME://$FORGE_HOST)"
+if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+  log "  forge: none (local branch review)"
+else
+  log "  forge: $FORGE ($FORGE_SCHEME://$FORGE_HOST)"
+fi
 log "  base:  $BASE_REF"
 log "  head:  $HEAD_REF"
 log "  dir:   $REPO_DIR"
 log "  max:   $MAX_ITER iterations (this invocation)"
 log "  mode:  $( (( REVIEW_ONLY == 1 )) && echo 'review-only (codex only, no claude)' || echo 'review + implement' )"
+if (( LOCAL_MODE == 1 )); then
+  log "  local: review exchanged on disk; local rounds squash into one commit$( (( NO_PUSH == 1 )) && echo ' (--no-push: not pushed)' )"
+fi
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
 log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
 log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 
-# Position the local checkout at the EXACT PR head (fail-closed; handles
-# option-like/ambiguous branch names and force-rewound remotes). See
-# sync_repo_to_pr_head in lib/common.sh.
-sync_repo_to_pr_head
+# Position the local checkout for the first turn. Forge mode: the EXACT PR
+# head (fail-closed; handles option-like/ambiguous branch names and
+# force-rewound remotes) — see sync_repo_to_pr_head in lib/common.sh. Local
+# mode: the same on a fresh run, but a resumed one restores its own local
+# rounds instead, since those commits exist nowhere else.
+# Squash the local rounds into one commit and push it. Runs only when the
+# review ended in agreement; rc 3 means there was nothing to squash.
+FINALIZE_RC=0
+run_finalize() {
+  set +e
+  bash "$LOOP_HOME/finalize_turn.sh"
+  FINALIZE_RC=$?
+  set -e
+  case "$FINALIZE_RC" in
+    0) : ;;
+    3) log "finalize: no local commits to squash — nothing to push" ;;
+    *) log "finalize failed (rc=$FINALIZE_RC) — the local rounds are still in $REPO_DIR" ;;
+  esac
+}
+
+# --restart in local mode is a durable decision, not a per-invocation flag.
+# A restart consumes several markers and establishes a new base — a kill
+# partway would otherwise let a plain retry resurrect the superseded review
+# or exit "already completed" without the new review. So a pending-restart
+# marker is written FIRST, before anything is consumed, and every startup
+# treats its presence as a standing --restart until the new base is set
+# (cleared below). The iteration floor is published right after it.
+EFFECTIVE_RESTART=$RESTART
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_restart_pending_file)" ]]; then
+  EFFECTIVE_RESTART=1
+  (( RESTART == 1 )) \
+    || log "local: a prior --restart was interrupted — resuming it; clean $(local_state_dir) to abandon it"
+fi
+if (( LOCAL_MODE == 1 )) && (( EFFECTIVE_RESTART == 1 )); then
+  mkdir -p "$(local_state_dir)"    # a fresh target has no local/ yet
+  : > "$(local_restart_pending_file)"    # durable intent, before any consume
+  _fc=$(latest_local_iter codex); _fl=$(latest_local_iter claude)
+  write_state_atomic "$(local_iter_floor_file)" "$(( _fc > _fl ? _fc : _fl ))" \
+    || die "could not record the --restart iteration floor at $(local_iter_floor_file)"
+fi
+
+# Iterations at or below the floor belong to a review that a --restart
+# superseded; every consumer below — the held-finalize shortcut and resume
+# detection — reads them as absent. A floor file that exists but does not
+# hold a number is a torn write from a killed run: reading it as 0 would
+# silently resurrect the superseded review, so it fails closed.
+ITER_FLOOR=0
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_iter_floor_file)" ]]; then
+  ITER_FLOOR=$(<"$(local_iter_floor_file)")
+  [[ "$ITER_FLOOR" =~ ^[0-9]+$ ]] \
+    || die "the --restart iteration floor at $(local_iter_floor_file) is empty or malformed (a killed run left it torn). Re-run with --restart to record it again and review the current state from scratch, or write the last superseded iteration number into it by hand — deleting the file resurrects the superseded review"
+fi
+
+# A completed local review is terminal: its single commit was already
+# pushed, or landed as the local tip when there is no origin. A plain rerun
+# has nothing left to do — exiting here also keeps a human commit made
+# after completion from being mistaken for review state. --restart drops
+# the marker and reviews the target as it is now, from a new base.
+if (( LOCAL_MODE == 1 )) && [[ -s "$(local_completed_file)" ]]; then
+  COMPLETED_SHA=$(<"$(local_completed_file)")
+  # completed.sha is authoritative: in-progress markers found alongside it
+  # are leftovers of an interrupted terminal transition, and resuming from
+  # them would re-squash from the old base — rewriting the completed
+  # commit. Drop them whenever the marker is present.
+  rm -f "$(local_base_file)" "$(local_tip_file)" "$(local_origin_file)" \
+        "$(local_finalized_file)" "$(local_finalize_inprogress_file)" \
+        "$(local_pending_turn_file)"
+  if (( EFFECTIVE_RESTART == 0 )); then
+    log "local: this review already completed (commit $COMPLETED_SHA) — pass --restart to start a new review of the current state"
+    log "PR: $PR_URL"
+    exit 0
+  fi
+  log "--restart: prior local review completed at $COMPLETED_SHA — starting a new review from the current head"
+  rm -f "$(local_completed_file)"
+fi
+
+# A round that committed and wrote its response but was killed before its
+# commit was anchored: recover it from the checkout's raw HEAD BEFORE
+# local_setup_repo cleans the worktree back to the (stale) tip ref and
+# resume detection counts the round as complete.
+if (( LOCAL_MODE == 1 )) && [[ -e "$(local_pending_turn_file)" ]]; then
+  reconcile_pending_turn
+fi
+
+if (( LOCAL_MODE == 1 )); then
+  local_setup_repo
+else
+  sync_repo_to_pr_head
+fi
+
+# Is the held squash already the remote branch head — i.e. did the push
+# land and only the terminal bookkeeping get interrupted?
+#   0 landed   1 definitely not landed   2 could not tell
+# Only a SQUASH outcome can land: a metadata-only hold's SHA is the base,
+# which equals the remote head by construction and would otherwise read as
+# "landed" for a review that pushed nothing.
+finalized_landed() {  # <finalized-sha>
+  local out remote_head
+  [[ "$(local_finalized_kind)" == "squash" ]] || return 1
+  # local_setup_repo already fetched and vouched for this exact state.
+  [[ "${LOCAL_FINALIZE_LANDED:-0}" == "1" ]] && return 0
+  git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1 || return 1
+  # A failed ls-remote is "unknown" (rc 2); a successful one with no ref
+  # is a definite answer — the branch is simply not there. The `||` keeps
+  # the caller's errexit state intact either way.
+  out=$(git -C "$REPO_DIR" ls-remote origin "refs/heads/$HEAD_REF" 2>/dev/null) \
+    || return 2
+  remote_head=$(awk '{print $1; exit}' <<<"$out")
+  [[ -n "$remote_head" && "$remote_head" == "$1" ]]
+}
+
+# A finalized squash that already reached the remote is LANDED work: no
+# flavor of restart or supersession may consume it. Complete it first —
+# idempotent (the compose is reused, the re-push is a no-op) — and only
+# then let --restart begin its new review, from the landed head.
+LANDED_RC=1
+HELD_SUPERSEDED=0
+if (( LOCAL_MODE == 1 )) && [[ -n "$(local_finalized_sha)" ]] \
+   && [[ "$(local_finalized_sha)" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]; then
+  set +e; finalized_landed "$(local_finalized_sha)"; LANDED_RC=$?; set -e
+  # The held outcome is discarded either by --restart now, or by the
+  # supersession drop below when a prior --restart's floor covers every
+  # round it came from.
+  (( $(latest_local_iter codex) <= ITER_FLOOR )) && HELD_SUPERSEDED=1
+  # Never discard an outcome that MIGHT already be on the remote.
+  (( LANDED_RC == 2 )) && (( EFFECTIVE_RESTART == 1 || HELD_SUPERSEDED == 1 )) \
+    && die "could not read the remote head for '$HEAD_REF', so whether this review's squashed commit already landed is unknown — refusing to discard it. Re-run when the remote is reachable"
+  if (( LANDED_RC == 0 )); then
+    log "local: the squashed commit already reached the remote — completing the interrupted finalization"
+    run_finalize
+    (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || exit 1
+    if (( EFFECTIVE_RESTART == 0 && HELD_SUPERSEDED == 0 )); then
+      log "PR: $PR_URL"
+      exit 0
+    fi
+    # rc alone does not prove terminal completion (--no-push returns 0 with
+    # the outcome still held). The marker does, and until it exists nothing
+    # may consume the landed squash.
+    [[ -s "$(local_completed_file)" ]] \
+      || die "the landed finalization did not complete (its terminal marker was not written; --no-push holds it) — re-run without --no-push to finish it before starting a new review"
+    log "local: the landed review is complete — starting a new review from its head"
+    rm -f "$(local_completed_file)"
+    local_setup_repo
+  fi
+fi
+
+# A finalize outcome from an earlier invocation that never landed — a
+# rejected push, a --no-push hold of the squash or of a metadata-only
+# finish — is finished work. Land it (finalize reuses the composed message
+# or held proposal) rather than stacking more review rounds on top of a
+# review that already ended. --restart instead CONSUMES the marker: the
+# fresh review stacks new rounds on the held state and later re-squashes
+# everything to the same base, so it stops being finished work.
+if (( LOCAL_MODE == 1 )); then
+  if (( EFFECTIVE_RESTART == 1 )); then
+    rm -f "$(local_finalized_file)" "$(local_finalize_inprogress_file)"
+  elif [[ -n "$(local_finalized_sha)" ]] \
+     && [[ "$(local_finalized_sha)" == "$(git -C "$REPO_DIR" rev-parse HEAD)" ]]; then
+    if (( HELD_SUPERSEDED == 1 )); then
+      # Every completed round sits at or below the floor: the held outcome
+      # belongs to a review a --restart superseded, and the restart was
+      # interrupted before consuming it. Consume it now — landing it would
+      # silently drop the requested restart. Nothing landed: a squash on
+      # the remote was completed above, and an unreadable remote died
+      # there rather than reach this drop.
+      log "local: dropping a held outcome superseded by --restart"
+      rm -f "$(local_finalized_file)" "$(local_finalize_inprogress_file)"
+    else
+      log "local: this review already produced its finalize outcome — landing it instead of reviewing again"
+      run_finalize
+      (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || exit 1
+      log "PR: $PR_URL"
+      exit 0
+    fi
+  fi
+fi
+
+# The restart's superseding work is done — the floor is set, the old
+# terminal/held outcome is consumed, and local_setup_repo established the
+# base the new review builds on. Clear the durable intent so a later plain
+# rerun resumes the NEW review instead of re-driving the restart.
+if (( LOCAL_MODE == 1 )) && (( EFFECTIVE_RESTART == 1 )); then
+  rm -f "$(local_restart_pending_file)"
+fi
 
 # --- resume detection ---------------------------------------------------------
 #
-# Look at the PR's existing AI comments and figure out where to resume:
+# Look at what each agent has already completed and figure out where to
+# resume. Forge mode reads the PR's AI comments; local mode reads the review
+# files under the state dir. Either way:
 #
 #   last_codex == 0 && last_claude == 0  → fresh start, ITER=1, codex first.
 #   last_codex == last_claude (= K)      → both did iter K, next round is K+1.
@@ -1233,8 +1536,15 @@ sync_repo_to_pr_head
 #
 # `--max` counts iterations *this invocation*, not total. Re-run to grant more.
 
-LAST_CODEX=$(latest_ai_comment_iter codex)
-LAST_CLAUDE=$(latest_ai_comment_iter claude)
+if (( LOCAL_MODE == 1 )); then
+  LAST_CODEX=$(latest_local_iter codex)
+  LAST_CLAUDE=$(latest_local_iter claude)
+  (( LAST_CODEX  > ITER_FLOOR )) || LAST_CODEX=$ITER_FLOOR
+  (( LAST_CLAUDE > ITER_FLOOR )) || LAST_CLAUDE=$ITER_FLOOR
+else
+  LAST_CODEX=$(latest_ai_comment_iter codex)
+  LAST_CLAUDE=$(latest_ai_comment_iter claude)
+fi
 LAST_CODEX="${LAST_CODEX:-0}"
 LAST_CLAUDE="${LAST_CLAUDE:-0}"
 
@@ -1308,13 +1618,21 @@ if (( RESTART == 1 )) && (( LAST_CODEX > 0 || LAST_CLAUDE > 0 )); then
   fi
 elif (( LAST_CODEX == 0 && LAST_CLAUDE == 0 )); then
   ITER=1
-  log "no prior AI thread on this PR — starting fresh at iter 1"
+  log "no prior AI round on this target — starting fresh at iter 1"
 elif (( LAST_CODEX > LAST_CLAUDE )); then
   # Half-step: codex reviewed but claude hasn't replied. Check on-disk verdict
   # to avoid running claude on top of an APPROVED review.
   PRIOR_VERDICT_FILE="$STATE_DIR/$(printf 'iter-%02d' "$LAST_CODEX")/verdict"
   if [[ -f "$PRIOR_VERDICT_FILE" && "$(cat "$PRIOR_VERDICT_FILE")" == "APPROVED" ]]; then
     log "codex already APPROVED at iter $LAST_CODEX — nothing to do"
+    # Local mode: the review is over but its single commit may still be
+    # unpushed — a rejected push, or a --no-push run being re-run to push.
+    # finalize_turn.sh reuses the composed message when the squash already
+    # exists, so this is a push retry, not another agent turn.
+    if (( LOCAL_MODE == 1 )); then
+      run_finalize
+      (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || exit 1
+    fi
     log "PR: $PR_URL"
     write_worker_status approved
     exit 0
@@ -1424,11 +1742,28 @@ while (( RUNS < MAX_ITER )); do
       break
     fi
 
-    # Re-sync to the PR head in case anything landed remotely between turns.
-    sync_repo_to_pr_head
+    # Drop whatever the review turn left in the worktree. Forge mode also
+    # re-syncs to the PR head in case anything landed remotely between turns;
+    # local mode keeps its own rounds, which exist nowhere else.
+    if (( LOCAL_MODE == 1 )); then
+      sync_repo_to_local_head
+    else
+      sync_repo_to_pr_head
+    fi
   fi
 
   # Claude response.
+  # Two-phase receipt for the anchor window. `pending` before the turn
+  # marks a round whose outcome is not yet validated: a kill here re-runs
+  # it, never anchors it. Only after the turn returns rc 0 — which
+  # claude_turn.sh grants only with the marker AND its response artifact —
+  # is the receipt upgraded to `done` with the EXACT committed SHA, so
+  # recovery anchors that precise commit and nothing else.
+  _pretip=''
+  if (( LOCAL_MODE == 1 )); then
+    _pretip=$(git -C "$REPO_DIR" rev-parse HEAD)
+    write_state_atomic "$(local_pending_turn_file)" "pending $ITER $_pretip"
+  fi
   set +e
   bash "$LOOP_HOME/claude_turn.sh"
   CLAUDE_RC=$?
@@ -1436,8 +1771,33 @@ while (( RUNS < MAX_ITER )); do
 
   if [[ $CLAUDE_RC -ne 0 ]]; then
     log "claude turn failed on iter $ITER (rc=$CLAUDE_RC)"
+    # A failed turn is re-run in full next invocation, so any commits it
+    # left are abandoned work. PR scope drops them by syncing to the tip
+    # ref; the branch must be put back the same way, or the next resume
+    # reads them as the branch moving outside the loop and fails closed.
+    # (A turn that detached HEAD is left for that fail-closed check.)
+    if (( LOCAL_MODE == 1 )); then
+      rm -f "$(local_pending_turn_file)"    # the round is being re-run, not anchored
+      if [[ -s "$(local_tip_file)" ]]; then
+        if [[ "$LOCAL_SCOPE" != "branch" ]]; then
+          sync_repo_to_local_head
+        elif [[ "$(git -C "$REPO_DIR" symbolic-ref --quiet HEAD 2>/dev/null)" == "refs/heads/$HEAD_REF" ]]; then
+          force_clean_to_commit "$REPO_DIR" "$(<"$(local_tip_file)")" attach
+        fi
+      fi
+    fi
     FINAL_STATUS="claude_error"
     break
+  fi
+
+  if (( LOCAL_MODE == 1 )); then
+    # The turn is validated: record the exact commit it produced, then
+    # anchor it. A kill between the two leaves a `done` receipt naming that
+    # commit, which recovery re-points the tip at. Drop the receipt last.
+    write_state_atomic "$(local_pending_turn_file)" \
+      "done $ITER $_pretip $(git -C "$REPO_DIR" rev-parse HEAD)"
+    local_record_tip
+    rm -f "$(local_pending_turn_file)"
   fi
 
   # The round is complete once claude answered: persist the spent iteration
@@ -1447,9 +1807,22 @@ while (( RUNS < MAX_ITER )); do
   RUNS=$((RUNS + 1))
   persist_worker_progress
 
-  # Re-sync — Claude pushed; the local checkout must track the new PR head.
-  sync_repo_to_pr_head
+  if (( LOCAL_MODE == 1 )); then
+    # Local rounds are never pushed: clean the worktree back to the round the
+    # turn just anchored, keeping every commit the review has produced.
+    sync_repo_to_local_head
+  else
+    # Re-sync — Claude pushed; the local checkout must track the new PR head.
+    sync_repo_to_pr_head
+  fi
 done
+
+# The review ended in agreement: collapse every local round into the single
+# commit that gets pushed.
+if (( LOCAL_MODE == 1 )) && [[ "$FINAL_STATUS" == "approved" || "$FINAL_STATUS" == "converged_no_major" ]]; then
+  run_finalize
+  (( FINALIZE_RC == 0 || FINALIZE_RC == 3 )) || FINAL_STATUS="finalize_error"
+fi
 
 if [[ "$FINAL_STATUS" == "unknown" ]]; then
   FINAL_STATUS="max_iterations_reached"
@@ -1461,6 +1834,9 @@ log "AI PR loop finished: $FINAL_STATUS"
 log "  ran $RUNS iteration(s) this invocation; last iter attempted = $ITER"
 if [[ "$FINAL_STATUS" == "max_iterations_reached" ]]; then
   log "  re-run the same command to grant another $MAX_ITER iterations"
+  if (( LOCAL_MODE == 1 )); then
+    log "  local rounds so far are committed in $REPO_DIR and unpushed; the next run continues them"
+  fi
 fi
 log "  PR:    $PR_URL"
 log "  Logs:  $STATE_DIR"
