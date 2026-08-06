@@ -286,6 +286,13 @@ if (( SUMMARY_LANDED == 1 )); then
   mv -f "$ID/verdict.tmp.$$" "$ID/verdict"
 fi
 
+# Surface the round to whoever is driving the loop. Runs before the failure
+# exits below: a review that landed is worth reporting even when the CLI then
+# died.
+if (( SUMMARY_LANDED == 1 )); then
+  emit_round_report codex "$ITER"
+fi
+
 if [[ $RC -ne 0 ]]; then
   log "codex stderr (tail):"
   tail -20 "$ID/codex.stderr" >&2 || true

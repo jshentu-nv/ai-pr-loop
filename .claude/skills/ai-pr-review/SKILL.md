@@ -324,6 +324,24 @@ Set `persistent: true` and a `timeout_ms` covering the expected run (e.g.
 count / completion. Stop the monitor with TaskStop after the bg task
 finishes.
 
+**Relay each round's report as it lands.** Every turn ends by logging its
+own summary — the reviewer's findings, the implementer's responses — and
+saving it to `iter-NN/codex-report.md` / `iter-NN/claude-report.md`. The
+announcement line
+
+```
+codex: iter 1 report (27 lines) -> …/iter-01/codex-report.md
+```
+
+fires one monitor event; the body follows it in the log between
+`----- BEGIN … -----` / `----- END … -----`, deliberately untagged so it
+does not flood the monitor. On that event, read the report and give the
+user the substance of the round — findings and severities for a codex
+turn, what was fixed and what was pushed back on for a claude turn. Do not
+hand-fetch the PR comments for this; the loop already captured it. Say
+plainly that the findings are the agent's, and that you have not verified
+them yourself unless you actually did.
+
 ### 6. Report the final state
 
 When the background `run.sh` completes, summarize:
@@ -342,7 +360,8 @@ When the background `run.sh` completes, summarize:
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
-stdout/stderr, fetched thread, codex verdict file).
+stdout/stderr, fetched thread, codex verdict file, and each turn's
+`codex-report.md` / `claude-report.md`).
 
 ## Resumability
 

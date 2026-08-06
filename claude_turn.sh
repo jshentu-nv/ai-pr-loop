@@ -41,13 +41,7 @@ else
   # ai_summary_posted: a tagged general note without the summary wrapper —
   # even one quoting the banner in its prose, e.g. an inline finding that
   # lost its position — must not be mistaken for the review to answer.
-  jq -r --arg t "$CODEX_MARKER_TAG" --arg a "$CODEX_SUMMARY_ALERT" \
-     --arg b "$CODEX_SUMMARY_BANNER_PFX" --argjson it "$ITER" \
-     "$AI_SUMMARY_JQ_DEF"'
-      select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
-      | select(is_summary($t; $a; $b; $it))
-      | .body' \
-      "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
+  extract_ai_summary_body codex "$ITER" "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
 
   jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
       select(.tag==$t and .iter==$it and .surface=="inline")
@@ -153,6 +147,8 @@ elif ! verify_ai_summary claude "$ITER"; then
   log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
   exit 1
 fi
+
+emit_round_report claude "$ITER"
 
 log "claude: turn complete"
 exit 0

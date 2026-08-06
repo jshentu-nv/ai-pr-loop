@@ -24,6 +24,11 @@
 #     inline notes, replies, banner-quoting prose, and misplaced markers
 #     are excluded; both turn scripts fail when their iteration summary
 #     never landed
+#   - round reports: each completed turn saves iter-NN/<who>-report.md and
+#     logs the body between BEGIN/END markers behind a single tagged
+#     announcement line, honours AI_REPORT_LOG_MAX_LINES while keeping the
+#     whole body on disk, reads the written review in local mode without
+#     consuming it, and writes nothing when the summary never landed
 #   - auto-resume: the restart decision table, the backoff curve, and the
 #     context-flag stripper as helpers, plus real front-end/supervisor/
 #     worker runs — default budget, inline --no-auto-resume,
@@ -1142,6 +1147,120 @@ if [[ -e "$ARGV" ]]; then
   bad "claude was invoked with an orphaned inline note as its review"
 else
   ok
+fi
+
+# --- round reports ---------------------------------------------------------
+# Every completed turn saves its own summary to iter-NN/<who>-report.md and
+# prints it, so the session driving the loop reads the round's findings and
+# responses out of the orchestrator's log instead of refetching the thread.
+
+t "codex: a completed turn exits 0 and reports"
+new_case codex-report
+run_turn codex
+assert_eq "$TURN_RC" 0
+
+t "codex: the saved report holds the summary body"
+if grep -q 'Stub codex review\.' "$CASE_DIR/state/iter-01/codex-report.md" 2>/dev/null; then
+  ok
+else
+  bad "codex-report.md missing or without the summary body"
+fi
+
+t "codex: the report is logged between BEGIN/END markers"
+if grep -qF -- '----- BEGIN codex report (iter 1) -----' "$CASE_DIR/turn.log" \
+   && grep -qF -- '----- END codex report (iter 1) -----' "$CASE_DIR/turn.log"; then
+  ok
+else
+  bad "report delimiters absent from the turn log"
+fi
+
+t "codex: the summary body reaches the log"
+if grep -q 'Stub codex review\.' "$CASE_DIR/turn.log"; then
+  ok
+else
+  bad "summary body absent from the turn log"
+fi
+
+t "codex: one logged line carries the bot tag for the report"
+# A log monitor keyed on the bot tags fires once per report, not once per
+# body line.
+assert_eq "$(grep -c 'codex: iter 1 report' "$CASE_DIR/turn.log")" 1
+
+t "claude: a completed turn exits 0 and reports"
+new_case claude-report
+run_turn claude
+assert_eq "$TURN_RC" 0
+
+t "claude: the saved report holds the reply body"
+if grep -q 'Stub claude reply\.' "$CASE_DIR/state/iter-01/claude-report.md" 2>/dev/null; then
+  ok
+else
+  bad "claude-report.md missing or without the reply body"
+fi
+
+t "claude: the report is logged between BEGIN/END markers"
+if grep -qF -- '----- BEGIN claude report (iter 1) -----' "$CASE_DIR/turn.log" \
+   && grep -qF -- '----- END claude report (iter 1) -----' "$CASE_DIR/turn.log"; then
+  ok
+else
+  bad "report delimiters absent from the turn log"
+fi
+
+t "codex: a turn whose summary never landed writes no report"
+new_case codex-report-none
+run_turn codex STUB_NO_CODEX_SUMMARY=1
+if [[ -e "$CASE_DIR/state/iter-01/codex-report.md" ]]; then
+  bad "a report was written for a turn with no landed summary"
+else
+  ok
+fi
+
+t "extract_ai_summary_body: a bannerless tagged note is not the summary"
+XB=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  . '$ROOT/lib/common.sh'
+  printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=1 -->\\nOrphaned finding.\"}' > '$WORK/xb.ndjson'
+  extract_ai_summary_body codex 1 '$WORK/xb.ndjson'")
+assert_eq "$XB" ""
+
+t "emit_round_report: the logged body stops at AI_REPORT_LOG_MAX_LINES"
+mkdir -p "$WORK/rpt/state/iter-01"
+RPT=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  STATE_DIR='$WORK/rpt/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=2
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=1 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.**\\nL1\\nL2\\nL3\"}'
+  }
+  emit_round_report codex 1" 2>&1)
+if grep -qF 'more line(s)' <<<"$RPT"; then
+  ok
+else
+  bad "no truncation notice (log: $(tr '\n' '|' <<<"$RPT"))"
+fi
+
+t "emit_round_report: the untruncated body is still on disk"
+assert_eq "$(grep -c '' "$WORK/rpt/state/iter-01/codex-report.md")" 7
+
+t "emit_round_report: local mode reports the written review file"
+mkdir -p "$WORK/rptlocal/state/iter-01"
+printf 'local review body\n' > "$WORK/rptlocal/state/iter-01/codex-review.md"
+LRPT=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  STATE_DIR='$WORK/rptlocal/state'
+  LOCAL_MODE=1
+  . '$ROOT/lib/common.sh'
+  emit_round_report codex 1" 2>&1)
+if grep -qF 'local review body' <<<"$LRPT"; then
+  ok
+else
+  bad "local review body absent from the log"
+fi
+
+t "emit_round_report: local mode leaves the review artifact in place"
+if [[ -s "$WORK/rptlocal/state/iter-01/codex-review.md" ]]; then
+  ok
+else
+  bad "the review artifact was consumed"
 fi
 
 # --- gitlab forge plumbing -------------------------------------------------

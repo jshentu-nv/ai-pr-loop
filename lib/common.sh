@@ -1415,6 +1415,17 @@ post_ai_comment() {
   esac
 }
 
+# A bot's marker and summary-wrapper strings, tab separated: hidden marker
+# tag, alert opener, banner prefix. Every consumer of the is_summary
+# predicate resolves them here so the three stay in step.
+ai_marker_fields() {  # <codex|claude>
+  case "$1" in
+    codex)  printf '%s\t%s\t%s\n' "$CODEX_MARKER_TAG"  "$CODEX_SUMMARY_ALERT"  "$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) printf '%s\t%s\t%s\n' "$CLAUDE_MARKER_TAG" "$CLAUDE_SUMMARY_ALERT" "$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    *) die "unknown bot tag: $1" ;;
+  esac
+}
+
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
 # A summary is an issue-surface thread ROOT whose body opens with the bot's
 # structural summary wrapper for its own iteration (is_summary above): the
@@ -1426,12 +1437,9 @@ post_ai_comment() {
 # incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local marker alert banner
-  case "$tag" in
-    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
-    *) die "unknown tag: $tag" ;;
-  esac
+  local fields marker alert banner
+  fields=$(ai_marker_fields "$tag") || return 1
+  IFS=$'\t' read -r marker alert banner <<<"$fields"
   fetch_ai_thread \
     | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
         "$AI_SUMMARY_JQ_DEF"'
@@ -1448,12 +1456,9 @@ latest_ai_comment_iter() {
 # summary POST failed, or die after posting only inline notes. A failed
 # thread fetch (or an empty thread) returns non-zero — fail closed.
 ai_summary_posted() {
-  local who="$1" iter="$2" marker alert banner
-  case "$who" in
-    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
-    *) die "unknown bot tag: $who" ;;
-  esac
+  local who="$1" iter="$2" fields marker alert banner
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\t' read -r marker alert banner <<<"$fields"
   fetch_ai_thread \
     | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
         "$AI_SUMMARY_JQ_DEF"'
@@ -1469,6 +1474,74 @@ verify_ai_summary() {
   ai_summary_posted "$who" "$iter" && return 0
   sleep 5
   ai_summary_posted "$who" "$iter"
+}
+
+# --- Round reports --------------------------------------------------------------
+#
+# Each turn writes its summary for the PR thread, but the session driving the
+# loop reads the orchestrator's log. So every turn ends by saving its own
+# summary to iter-NN/<who>-report.md and printing it: the reviewer's findings
+# and the implementer's responses reach the operator through the stream they
+# are already watching, with no second fetch of the thread.
+#
+# One announcement line carries the bot tag ("codex: iter N report ..."); the
+# body lines deliberately do not, so a log monitor keyed on the bot tags fires
+# once per report instead of once per line.
+
+# Print <who>'s iteration-$2 summary body out of the thread snapshot $3.
+# Same structural predicate as ai_summary_posted — a tagged general note
+# without the summary wrapper is not a summary.
+extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
+  local who="$1" iter="$2" thread="$3" fields marker alert banner
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\t' read -r marker alert banner <<<"$fields"
+  jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
+     "$AI_SUMMARY_JQ_DEF"'
+      select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
+      | select(is_summary($t; $a; $b; $it))
+      | .body' \
+     "$thread"
+}
+
+# How many body lines reach the log. The rest stay in the report file.
+AI_REPORT_LOG_MAX_LINES="${AI_REPORT_LOG_MAX_LINES:-200}"
+
+# Save and log <who>'s iteration-$2 report. Callers reach this only once the
+# summary is verified, so the body exists. Any failure here is a reporting
+# failure and returns 0 regardless: the review already landed publicly, and
+# failing the turn over a missing log line would repost the entire round.
+emit_round_report() {  # <codex|claude> <iter>
+  local who="$1" iter="$2" id report thread total line
+  id=$(iter_dir "$iter")
+  report="$id/$who-report.md"
+  rm -f "$report"
+
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    cp -f "$(local_artifact_path "$who" "$iter")" "$report" 2>/dev/null || true
+  else
+    thread="$id/thread.$who-post.ndjson"
+    if fetch_ai_thread > "$thread" 2>/dev/null; then
+      extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ ! -s "$report" ]]; then
+    rm -f "$report"
+    log "$who: WARNING — iter $iter report could not be captured for the log"
+    return 0
+  fi
+
+  total=$(grep -c '' "$report" 2>/dev/null || echo 0)
+  log "$who: iter $iter report ($total lines) -> $report"
+  log "----- BEGIN $who report (iter $iter) -----"
+  while IFS= read -r line; do
+    log "  $line"
+  done < <(head -n "$AI_REPORT_LOG_MAX_LINES" "$report")
+  if (( total > AI_REPORT_LOG_MAX_LINES )); then
+    log "  [$(( total - AI_REPORT_LOG_MAX_LINES )) more line(s) — read $report]"
+  fi
+  log "----- END $who report (iter $iter) -----"
+  return 0
 }
 
 # --- Portable watchdog ----------------------------------------------------------

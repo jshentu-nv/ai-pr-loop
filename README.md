@@ -668,6 +668,38 @@ verdict, per-iter session captures) are kept under
 `state/<owner>__<name>/pr-<N>/iter-NN/` so you can replay any decision
 after the fact.
 
+## Round reports
+
+Each turn ends by printing its own summary — the reviewer's findings, the
+implementer's responses — to the loop's log, and saving it next to the rest
+of that iteration's artifacts:
+
+```
+iter-01/codex-report.md      # the review posted for iteration 1
+iter-01/claude-report.md     # the response posted for iteration 1
+```
+
+So the round's substance reaches whoever is driving the loop through the
+stream they are already watching:
+
+```
+[ai-loop 14:49:49] codex: iter 1 report (27 lines) -> …/iter-01/codex-report.md
+[ai-loop 14:49:49] ----- BEGIN codex report (iter 1) -----
+[ai-loop 14:49:49]   ### Summary
+[ai-loop 14:49:49]   …
+[ai-loop 14:49:49] ----- END codex report (iter 1) -----
+```
+
+The announcement line is the only one carrying the bot tag, so a log
+monitor keyed on `codex:`/`claude:` fires once per report rather than once
+per line. `AI_REPORT_LOG_MAX_LINES` (default 200) caps how much body
+reaches the log; the report file always holds all of it.
+
+In local mode the report is the review/response file the turn wrote. A turn
+whose summary never landed fails on its own contract and reports nothing —
+and a report that cannot be captured logs a warning without failing a turn
+whose review already landed.
+
 ## Testing
 
 `tests/run_tests.sh` runs the loop's regression tests — no network, no real
