@@ -675,12 +675,12 @@ sees that from the diff. Each turn renders the head's check results to
 `iter-NN/ci-status.md` and points its prompt at the file:
 
 ```
-CI checks on head 0660671b
+CI checks on head 1a2b3c4d
 
-- [FAILURE] Real ovstage/ovrtx wheels (Linux CPU API)
-  https://github.com/owner/repo/actions/runs/31131061120/job/92719811650
-- [SUCCESS] linux-x86_64-py312
-  https://github.com/owner/repo/actions/runs/31131061070/job/92719811136
+- [FAILURE] integration (linux-x86_64)
+  https://github.com/owner/repo/actions/runs/1000000001/job/2000000001
+- [SUCCESS] unit (linux-x86_64)
+  https://github.com/owner/repo/actions/runs/1000000001/job/2000000002
 
 Failing: 1 of 4 check(s)
 
