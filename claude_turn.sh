@@ -71,7 +71,10 @@ fi
 
 # The head's CI results, rendered fresh for this turn. A red check caused by
 # an earlier round is this turn's work: the loop broke it, the loop fixes it.
-CI_FILE="$ID/ci-status.md"
+# Per-bot filename: the codex turn of this iteration rendered its own view,
+# and that snapshot — the evidence behind the recorded verdict — must
+# survive this turn's render.
+CI_FILE="$ID/ci-status.claude.md"
 if render_ci_status "$CI_FILE"; then
   CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it before you finish. A check failing because of a commit THIS LOOP made in an earlier round is yours to fix in THIS round, whether or not Codex raised it — read the failing job's log, fix the cause, and record it in your summary under a \"CI\" heading. Do not defer it to a later iteration and do not report the round done while CI is red from the loop's own work. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and leave it alone."
   log "claude: CI status rendered to $CI_FILE"
@@ -135,32 +138,46 @@ set -e
 
 log "claude: iter $ITER — exit $RC"
 
+# The turn's completion contract — the summary comment in forge mode, the
+# written response file in local mode. The prompt produces it LAST, after
+# every fix and reply, so the stdout marker alone isn't proof of completion:
+# a failed POST or a crash mid-reply would otherwise advance the loop past a
+# half-done response. Probed BEFORE the failure exits below, as in
+# codex_turn.sh: a response that LANDED is a real, public reply even when
+# the CLI then died or lost its stdout marker, and resume advances past this
+# iteration on that artifact — so its round report is emitted here or never.
+RESPONSE_LANDED=0
+turn_artifact_landed claude "$ITER" && RESPONSE_LANDED=1
+
+if (( RESPONSE_LANDED == 1 )); then
+  emit_round_report claude "$ITER"
+fi
+
 if [[ $RC -ne 0 ]]; then
   log "claude stderr (tail):"
   tail -20 "$ID/claude.stderr" >&2 || true
+  if (( RESPONSE_LANDED == 1 )); then
+    log "claude: the iter $ITER response landed before the CLI failure — report captured for resume"
+  fi
   exit 1
 fi
 
 if ! grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
   log "claude: missing [CLAUDE_TURN: COMPLETE] marker — assuming partial"
-  exit 1
-fi
-
-# The stdout marker alone isn't proof of completion: the written response is
-# the turn's contract (produced last, after every fix and reply), and a failed
-# POST or a crash mid-reply would otherwise advance the loop past a half-done
-# response. Require this iteration's response artifact.
-if [[ "$LOCAL_MODE" == "1" ]]; then
-  if ! local_artifact_written claude "$ITER"; then
-    log "claude: iter $ITER response file $RESPONSE_FILE is missing or empty — failing the turn (stdout marker ignored)"
-    exit 1
+  if (( RESPONSE_LANDED == 1 )); then
+    log "claude: the iter $ITER response landed despite the missing marker — report captured for resume"
   fi
-elif ! verify_ai_summary claude "$ITER"; then
-  log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
   exit 1
 fi
 
-emit_round_report claude "$ITER"
+if (( RESPONSE_LANDED == 0 )); then
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    log "claude: iter $ITER response file $RESPONSE_FILE is missing or empty — failing the turn (stdout marker ignored)"
+  else
+    log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
+  fi
+  exit 1
+fi
 
 log "claude: turn complete"
 exit 0

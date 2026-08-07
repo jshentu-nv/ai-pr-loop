@@ -360,8 +360,9 @@ When the background `run.sh` completes, summarize:
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
-stdout/stderr, fetched thread, codex verdict file, `ci-status.md`, and each
-turn's `codex-report.md` / `claude-report.md`).
+stdout/stderr, fetched thread, codex verdict file, and each turn's
+`ci-status.codex.md` / `ci-status.claude.md` and
+`codex-report.md` / `claude-report.md`).
 
 Both agents see the head's CI status each turn. A check the loop's own
 commits broke is a blocker the implementer fixes in the round it appears; a

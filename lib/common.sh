@@ -1415,13 +1415,15 @@ post_ai_comment() {
   esac
 }
 
-# A bot's marker and summary-wrapper strings, tab separated: hidden marker
-# tag, alert opener, banner prefix. Every consumer of the is_summary
-# predicate resolves them here so the three stay in step.
+# A bot's marker and summary-wrapper strings: hidden marker tag, alert
+# opener, banner prefix. Every consumer of the is_summary predicate
+# resolves them here so the three stay in step. Separated by the unit
+# separator (0x1f), which unlike tab is not IFS whitespace — an empty
+# field survives the read instead of shifting its neighbours.
 ai_marker_fields() {  # <codex|claude>
   case "$1" in
-    codex)  printf '%s\t%s\t%s\n' "$CODEX_MARKER_TAG"  "$CODEX_SUMMARY_ALERT"  "$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) printf '%s\t%s\t%s\n' "$CLAUDE_MARKER_TAG" "$CLAUDE_SUMMARY_ALERT" "$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    codex)  printf '%s\x1f%s\x1f%s\n' "$CODEX_MARKER_TAG"  "$CODEX_SUMMARY_ALERT"  "$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) printf '%s\x1f%s\x1f%s\n' "$CLAUDE_MARKER_TAG" "$CLAUDE_SUMMARY_ALERT" "$CLAUDE_SUMMARY_BANNER_PFX" ;;
     *) die "unknown bot tag: $1" ;;
   esac
 }
@@ -1439,7 +1441,7 @@ latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
   local fields marker alert banner
   fields=$(ai_marker_fields "$tag") || return 1
-  IFS=$'\t' read -r marker alert banner <<<"$fields"
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
   fetch_ai_thread \
     | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
         "$AI_SUMMARY_JQ_DEF"'
@@ -1455,11 +1457,17 @@ latest_ai_comment_iter() {
 # alone: an agent can print its verdict/completion marker even though the
 # summary POST failed, or die after posting only inline notes. A failed
 # thread fetch (or an empty thread) returns non-zero — fail closed.
+# An optional $3 saves the fetched thread there, so a caller that needs the
+# verified snapshot afterwards (emit_round_report) reads the data this
+# check was made against instead of fetching again.
 ai_summary_posted() {
-  local who="$1" iter="$2" fields marker alert banner
+  local who="$1" iter="$2" snap="${3:-}" fields marker alert banner
   fields=$(ai_marker_fields "$who") || return 1
-  IFS=$'\t' read -r marker alert banner <<<"$fields"
-  fetch_ai_thread \
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  if [[ -n "$snap" ]]; then
+    fetch_ai_thread > "$snap" 2>/dev/null || { rm -f "$snap"; return 1; }
+  fi
+  { if [[ -n "$snap" ]]; then cat "$snap"; else fetch_ai_thread; fi; } \
     | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
         "$AI_SUMMARY_JQ_DEF"'
          any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
@@ -1470,10 +1478,26 @@ ai_summary_posted() {
 # Post-turn completion check with one short retry, absorbing forge
 # read-after-write lag on the comment list endpoints just after the POST.
 verify_ai_summary() {
-  local who="$1" iter="$2"
-  ai_summary_posted "$who" "$iter" && return 0
+  local who="$1" iter="$2" snap="${3:-}"
+  ai_summary_posted "$who" "$iter" "$snap" && return 0
   sleep 5
-  ai_summary_posted "$who" "$iter"
+  ai_summary_posted "$who" "$iter" "$snap"
+}
+
+# True iff <who>'s iteration-$2 turn artifact is public: the written
+# review/response file in local mode, the verified summary comment in forge
+# mode. Both turn scripts probe through this so the completion contract
+# stays in one place. Forge mode saves the verified thread snapshot to
+# iter-NN/thread.<who>-post.ndjson for emit_round_report — the report must
+# not depend on a second network read succeeding after the verifying one
+# already did.
+turn_artifact_landed() {  # <codex|claude> <iter>
+  local who="$1" iter="$2"
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    local_artifact_written "$who" "$iter"
+  else
+    verify_ai_summary "$who" "$iter" "$(iter_dir "$iter")/thread.$who-post.ndjson"
+  fi
 }
 
 # --- CI status ------------------------------------------------------------------
@@ -1488,50 +1512,111 @@ verify_ai_summary() {
 # then says nothing about CI rather than asserting green.
 
 # GitHub: the head's check rollup, one line per check.
+#
+# The rollup mixes two shapes — CheckRuns (name/status/conclusion/detailsUrl)
+# and StatusContexts (context/state/targetUrl) — and gh serializes a missing
+# field as "" rather than omitting it. jq's `//` keeps an empty string, so a
+# still-running CheckRun (conclusion:"") must fall through to its status, not
+# render blank. Checks not yet finished are counted separately: their results
+# are not final, and the reviewer must not approve on top of them.
 render_ci_status_github() {
-  local out="$1" json rows head
-  json=$(gh pr view "$PR_NUMBER" --repo "${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}" \
+  local out="$1" json rows head total failing pending
+  local repo="${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}"
+  json=$(gh pr view "$PR_NUMBER" --repo "$repo" \
            --json statusCheckRollup,headRefOid 2>/dev/null) || return 1
   rows=$(jq -r '
+      def pick($alts): [$alts[] | select(. != null and . != "")] | first;
       (.statusCheckRollup // [])[]
-      | "\((.conclusion // .state // .status // "PENDING") | ascii_upcase)\t\(.name // .context // "check")\t\(.detailsUrl // .targetUrl // "-")"
+      | "\((pick([.conclusion, .state, .status]) // "PENDING") | ascii_upcase)\t\(pick([.name, .context]) // "check")\t\(pick([.detailsUrl, .targetUrl]) // "-")"
     ' <<<"$json" 2>/dev/null) || return 1
   [[ -n "$rows" ]] || return 1
   head=$(jq -r '.headRefOid // ""' <<<"$json" 2>/dev/null)
 
+  total=$(printf '%s\n' "$rows" | grep -c '' || true)
+  failing=$(printf '%s\n' "$rows" \
+    | grep -cE '^(FAILURE|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED|STARTUP_FAILURE)' || true)
+  pending=$(printf '%s\n' "$rows" \
+    | grep -cE '^(PENDING|QUEUED|IN_PROGRESS|WAITING|REQUESTED|EXPECTED)' || true)
+
   {
     printf 'CI checks on head %s\n\n' "${head:0:8}"
     printf '%s\n' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
-    printf '\nFailing: %s of %s check(s)\n' \
-      "$(printf '%s\n' "$rows" | grep -cE '^(FAILURE|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED)' || true)" \
-      "$(printf '%s\n' "$rows" | grep -c '' || true)"
+    printf '\nFailing: %s of %s check(s)\n' "$failing" "$total"
+    if (( pending > 0 )); then
+      printf 'Pending: %s of %s check(s) — these results are NOT final.\n' "$pending" "$total"
+      printf 'To wait for the pending checks to finish:\n'
+      printf '  gh pr checks %s --repo %s --watch\n' "$PR_NUMBER" "$repo"
+    fi
     printf '\nTo read a failing GitHub Actions job:\n'
-    printf '  gh run view --repo %s --job JOB_ID --log-failed\n' \
-      "${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}"
+    printf '  gh run view --repo %s --job JOB_ID --log-failed\n' "$repo"
     printf 'JOB_ID is the trailing number of the job URL above.\n'
   } > "$out"
 }
 
-# GitLab: the MR's head pipeline, one line per job.
+# GitLab: the MR's head pipeline. The pipeline's own status heads the
+# report — a broken .gitlab-ci.yml fails the pipeline with zero jobs, so an
+# empty job list is not proof of health. The jobs endpoint returns at most
+# 100 items per page; every page is read.
 render_ci_status_gitlab() {
-  local out="$1" mr pid sha rows
+  local out="$1" mr pid sha status yaml_errors rows page chunk chunk_rows n
+  local total failing pending truncated=0
   mr=$(gl_api_get "projects/$PROJECT_ENC/merge_requests/$PR_NUMBER" 2>/dev/null) || return 1
   pid=$(jq -r '.head_pipeline.id // empty' <<<"$mr" 2>/dev/null)
   [[ -n "$pid" ]] || return 1
   sha=$(jq -r '.head_pipeline.sha // ""' <<<"$mr" 2>/dev/null)
-  rows=$(gl_api_get "projects/$PROJECT_ENC/pipelines/$pid/jobs?per_page=100" 2>/dev/null \
-         | jq -r '.[] | "\((.status // "unknown") | ascii_upcase)\t\(.name)\t\(.web_url // "-")"' 2>/dev/null) || return 1
-  [[ -n "$rows" ]] || return 1
+  status=$(jq -r '(.head_pipeline.status // "unknown") | ascii_upcase' <<<"$mr" 2>/dev/null)
+  yaml_errors=$(jq -r '.head_pipeline.yaml_errors // empty' <<<"$mr" 2>/dev/null)
+
+  rows=''
+  page=1
+  while :; do
+    chunk=$(gl_api_get "projects/$PROJECT_ENC/pipelines/$pid/jobs?per_page=100&page=$page" 2>/dev/null) \
+      || return 1
+    # A 200 whose body is not a job array (proxy error page, {"message":...})
+    # must suppress the report, not fabricate entries from it.
+    n=$(jq -er 'if type == "array" then length else empty end' <<<"$chunk" 2>/dev/null) || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    if (( n > 0 )); then
+      chunk_rows=$(jq -r '.[] | "\((.status // "unknown") | ascii_upcase)\t\(.name)\t\(.web_url // "-")"' \
+                     <<<"$chunk" 2>/dev/null) || return 1
+      rows+="$chunk_rows"$'\n'
+    fi
+    (( n == 100 )) || break
+    page=$(( page + 1 ))
+    if (( page > 100 )); then truncated=1; break; fi  # 10k jobs — never spin on a broken API
+  done
 
   {
-    printf 'CI jobs in pipeline %s (head %s)\n\n' "$pid" "${sha:0:8}"
-    printf '%s\n' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
-    printf '\nFailing: %s of %s job(s)\n' \
-      "$(printf '%s\n' "$rows" | grep -cE '^FAILED' || true)" \
-      "$(printf '%s\n' "$rows" | grep -c '' || true)"
-    printf '\nTo read a failing job:\n'
-    printf '  curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" %s://%s/api/v4/projects/%s/jobs/JOB_ID/trace\n' \
-      "${FORGE_SCHEME:-https}" "${FORGE_HOST:-gitlab.com}" "$PROJECT_ENC"
+    printf 'CI pipeline %s (head %s): %s\n' "$pid" "${sha:0:8}" "$status"
+    if [[ -n "$yaml_errors" ]]; then
+      printf '\nPipeline configuration errors:\n%s\n' "$yaml_errors"
+    fi
+    if [[ -n "$rows" ]]; then
+      total=$(printf '%s' "$rows" | grep -c '' || true)
+      # CANCELED counts as failing, as on GitHub: a canceled job never
+      # validated the head, and 'Failing: 0' must not read as green.
+      failing=$(printf '%s' "$rows" | grep -cE '^(FAILED|CANCELED)' || true)
+      pending=$(printf '%s' "$rows" \
+        | grep -cE '^(CREATED|PENDING|RUNNING|WAITING_FOR_RESOURCE|PREPARING|SCHEDULED)' || true)
+      printf '\n'
+      printf '%s' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
+      if (( truncated )); then
+        printf '  [job list truncated at %s jobs — the pipeline has more]\n' "$total"
+      fi
+      printf '\nFailing: %s of %s job(s)\n' "$failing" "$total"
+      if (( pending > 0 )); then
+        printf 'Pending: %s of %s job(s) — these results are NOT final.\n' "$pending" "$total"
+        printf 'Re-run the re-check command below until the pipeline settles.\n'
+      fi
+      printf '\nTo read a failing job:\n'
+      printf '  curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" %s://%s/api/v4/projects/%s/jobs/JOB_ID/trace\n' \
+        "${FORGE_SCHEME:-https}" "${FORGE_HOST:-gitlab.com}" "$PROJECT_ENC"
+    else
+      printf '\nThe pipeline reports no jobs.\n'
+    fi
+    printf '\nTo re-check this pipeline:\n'
+    printf '  curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" %s://%s/api/v4/projects/%s/pipelines/%s\n' \
+      "${FORGE_SCHEME:-https}" "${FORGE_HOST:-gitlab.com}" "$PROJECT_ENC" "$pid"
   } > "$out"
 }
 
@@ -1540,7 +1625,11 @@ render_ci_status_gitlab() {
 render_ci_status() {
   local out="$1" rc=0
 
-  # A --local --base review has no target and so no pipeline to read.
+  # A local review never pushes during the loop, so the forge's checks
+  # describe a head without the loop's commits — reporting them would key
+  # the "loop broke it" directives to code the loop cannot affect. A
+  # --local --base review has no target at all.
+  [[ "${LOCAL_MODE:-0}" == "1" ]] && return 1
   [[ "${LOCAL_SCOPE:-pr}" == "branch" ]] && return 1
 
   if [[ "${FORGE:-github}" == "gitlab" ]]; then
@@ -1574,7 +1663,7 @@ render_ci_status() {
 extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
   local who="$1" iter="$2" thread="$3" fields marker alert banner
   fields=$(ai_marker_fields "$who") || return 1
-  IFS=$'\t' read -r marker alert banner <<<"$fields"
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
   jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
      "$AI_SUMMARY_JQ_DEF"'
       select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
@@ -1584,23 +1673,54 @@ extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
 }
 
 # How many body lines reach the log. The rest stay in the report file.
+# Validated at source time, before any turn work: a malformed value would
+# otherwise blow up `head`/arithmetic inside emit_round_report — after the
+# round already landed publicly — and turn a reporting problem into a
+# failed turn. Anything but a non-negative integer warns and uses 200; the
+# 10# strips leading zeros, which bash arithmetic would read as octal.
 AI_REPORT_LOG_MAX_LINES="${AI_REPORT_LOG_MAX_LINES:-200}"
+case "$AI_REPORT_LOG_MAX_LINES" in
+  ''|*[!0-9]*)
+    log "WARNING: AI_REPORT_LOG_MAX_LINES='$AI_REPORT_LOG_MAX_LINES' is not a non-negative integer — using 200"
+    AI_REPORT_LOG_MAX_LINES=200
+    ;;
+  *) AI_REPORT_LOG_MAX_LINES=$(( 10#$AI_REPORT_LOG_MAX_LINES )) ;;
+esac
 
 # Save and log <who>'s iteration-$2 report. Callers reach this only once the
 # summary is verified, so the body exists. Any failure here is a reporting
 # failure and returns 0 regardless: the review already landed publicly, and
 # failing the turn over a missing log line would repost the entire round.
 emit_round_report() {  # <codex|claude> <iter>
-  local who="$1" iter="$2" id report thread total line
+  local who="$1" iter="$2" id report thread total line cap
   id=$(iter_dir "$iter")
   report="$id/$who-report.md"
   rm -f "$report"
 
+  # A second guard on the cap, local to the function: the source-time
+  # validation above cannot see a value assigned after common.sh loaded,
+  # and this function must stay nonfatal.
+  cap="${AI_REPORT_LOG_MAX_LINES:-200}"
+  case "$cap" in
+    ''|*[!0-9]*)
+      log "WARNING: AI_REPORT_LOG_MAX_LINES='$cap' is not a non-negative integer — using 200"
+      cap=200
+      ;;
+    *) cap=$(( 10#$cap )) ;;
+  esac
+
   if [[ "$LOCAL_MODE" == "1" ]]; then
     cp -f "$(local_artifact_path "$who" "$iter")" "$report" 2>/dev/null || true
   else
+    # turn_artifact_landed saved the thread snapshot it verified; extract
+    # from that first. Fetch only when the snapshot is missing or holds no
+    # summary — a fresh network read can fail transiently right after the
+    # verifying one succeeded, and this report has no later chance.
     thread="$id/thread.$who-post.ndjson"
-    if fetch_ai_thread > "$thread" 2>/dev/null; then
+    if [[ -s "$thread" ]]; then
+      extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
+    fi
+    if [[ ! -s "$report" ]] && fetch_ai_thread > "$thread" 2>/dev/null; then
       extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
     fi
   fi
@@ -1614,11 +1734,14 @@ emit_round_report() {  # <codex|claude> <iter>
   total=$(grep -c '' "$report" 2>/dev/null || echo 0)
   log "$who: iter $iter report ($total lines) -> $report"
   log "----- BEGIN $who report (iter $iter) -----"
-  while IFS= read -r line; do
+  # `|| [[ -n "$line" ]]` keeps a final line that lacks a trailing newline —
+  # local mode copies agent-written files verbatim, and those often end
+  # without one.
+  while IFS= read -r line || [[ -n "$line" ]]; do
     log "  $line"
-  done < <(head -n "$AI_REPORT_LOG_MAX_LINES" "$report")
-  if (( total > AI_REPORT_LOG_MAX_LINES )); then
-    log "  [$(( total - AI_REPORT_LOG_MAX_LINES )) more line(s) — read $report]"
+  done < <(head -n "$cap" "$report")
+  if (( total > cap )); then
+    log "  [$(( total - cap )) more line(s) — read $report]"
   fi
   log "----- END $who report (iter $iter) -----"
   return 0

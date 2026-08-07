@@ -672,7 +672,9 @@ after the fact.
 
 A fix the loop lands can turn the target's checks red, and neither agent
 sees that from the diff. Each turn renders the head's check results to
-`iter-NN/ci-status.md` and points its prompt at the file:
+its own `iter-NN/ci-status.<codex|claude>.md` — one file per turn, so the
+snapshot the reviewer's verdict was based on survives the implementer's
+render — and points its prompt at the file:
 
 ```
 CI checks on head 1a2b3c4d
@@ -694,10 +696,21 @@ appears rather than deferring it. A check already failing on the base for
 reasons the change did not introduce is out of scope — the agents name it,
 say it is pre-existing, and leave it alone.
 
-GitLab reads the MR's head pipeline and its jobs instead. The read is
-never fatal: no checks configured, no permission, a `--base` branch review
-with no target, or an API hiccup leaves no file, and the prompt then says
-nothing about CI rather than asserting green.
+A check still running renders its live state (`[IN_PROGRESS]`,
+`[PENDING]`) with a `Pending:` count and the command that waits for it.
+Those results are not final: the reviewer's prompt forbids an APPROVED
+verdict while a check on the head is unfinished, because approval ends the
+loop and a failure after it goes unseen.
+
+GitLab reads the MR's head pipeline and its jobs instead. The pipeline's
+own status heads the report — a broken `.gitlab-ci.yml` fails the pipeline
+with zero jobs, and the report then carries the configuration errors — and
+the job list is read across every page of the paginated endpoint. The read
+is never fatal: no checks configured, no permission, a `--base` branch
+review with no target, or an API hiccup leaves no file, and the prompt then
+says nothing about CI rather than asserting green. A `--local` review also
+renders no CI: its commits never reach the forge during the loop, so the
+forge's checks describe a head without them.
 
 ## Round reports
 
@@ -724,12 +737,16 @@ stream they are already watching:
 The announcement line is the only one carrying the bot tag, so a log
 monitor keyed on `codex:`/`claude:` fires once per report rather than once
 per line. `AI_REPORT_LOG_MAX_LINES` (default 200) caps how much body
-reaches the log; the report file always holds all of it.
+reaches the log; the report file always holds all of it. A value that is
+not a non-negative integer warns and uses the default.
 
 In local mode the report is the review/response file the turn wrote. A turn
-whose summary never landed fails on its own contract and reports nothing —
-and a report that cannot be captured logs a warning without failing a turn
-whose review already landed.
+whose summary never landed fails on its own contract and reports nothing. A
+summary that landed just before the CLI died (or lost its stdout marker) is
+reported before the turn exits — resume advances past that iteration on the
+landed artifact, so the failing turn is the report's only chance. And a
+report that cannot be captured logs a warning without failing a turn whose
+review already landed.
 
 ## Testing
 

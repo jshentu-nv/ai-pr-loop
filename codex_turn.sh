@@ -56,10 +56,12 @@ else
 fi
 
 # The head's CI results, rendered fresh for this turn. Absent when the forge
-# reports no checks — the prompt then says nothing about CI.
-CI_FILE="$ID/ci-status.md"
+# reports no checks — the prompt then says nothing about CI. Per-bot
+# filename: the claude turn of this iteration renders its own view, and this
+# snapshot — the evidence behind the recorded verdict — must survive it.
+CI_FILE="$ID/ci-status.codex.md"
 if render_ci_status "$CI_FILE"; then
-  CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it. A check failing because of a commit THIS LOOP made is a BLOCKER finding — report it with the failing job and the error from its log. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and move on."
+  CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it. A check failing because of a commit THIS LOOP made is a BLOCKER finding — report it with the failing job and the error from its log. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and move on. A pending or running check is not a pass: an APPROVED verdict ends the loop, and a check that fails after it fails unseen. If the file reports pending checks, re-check them before you settle your verdict — wait for them with the command the file names — and never issue APPROVED while a check on this head is still unfinished."
   log "codex: CI status rendered to $CI_FILE"
 else
   CI_NOTE=''
@@ -247,11 +249,7 @@ log "codex: iter $ITER — exit $RC"
 # has no public surface to confirm against: the file on disk IS the record, so
 # the probe below is the only check and adoption never applies.
 SUMMARY_LANDED=0
-if [[ "$LOCAL_MODE" == "1" ]]; then
-  local_artifact_written codex "$ITER" && SUMMARY_LANDED=1
-else
-  verify_ai_summary codex "$ITER" && SUMMARY_LANDED=1
-fi
+turn_artifact_landed codex "$ITER" && SUMMARY_LANDED=1
 
 # Parse issue counts (last occurrence wins). Missing line → counts unknown,
 # orchestrator treats convergence as not-met.

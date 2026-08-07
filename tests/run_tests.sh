@@ -24,15 +24,24 @@
 #     inline notes, replies, banner-quoting prose, and misplaced markers
 #     are excluded; both turn scripts fail when their iteration summary
 #     never landed
-#   - CI status: each turn renders the head's checks to iter-NN/ci-status.md
+#   - CI status: each turn renders the head's checks to its own
+#     iter-NN/ci-status.<who>.md (the reviewer's snapshot survives the
+#     implementer's render)
 #     and injects the pointer plus the fix/report directives into its prompt;
 #     no checks (or a branch review with no target) writes no file and leaves
-#     the prompt silent about CI rather than asserting green
+#     the prompt silent about CI rather than asserting green; an unfinished
+#     CheckRun renders its live status (gh's empty conclusion normalized),
+#     pending checks are counted with a watch hint, and the codex prompt
+#     forbids approving over them; gitlab renders a red zero-job pipeline
+#     (config errors included) and reads every jobs page
 #   - round reports: each completed turn saves iter-NN/<who>-report.md and
 #     logs the body between BEGIN/END markers behind a single tagged
 #     announcement line, honours AI_REPORT_LOG_MAX_LINES while keeping the
 #     whole body on disk, reads the written review in local mode without
-#     consuming it, and writes nothing when the summary never landed
+#     consuming it, and writes nothing when the summary never landed; a
+#     response that landed before a CLI failure or lost stdout marker still
+#     reports; a malformed AI_REPORT_LOG_MAX_LINES warns and falls back
+#     instead of failing a landed turn
 #   - auto-resume: the restart decision table, the backoff curve, and the
 #     context-flag stripper as helpers, plus real front-end/supervisor/
 #     worker runs — default budget, inline --no-auto-resume,
@@ -232,7 +241,12 @@ if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" \
       && "${STUB_NO_CLAUDE_LOCAL_ARTIFACT:-0}" != "1" ]]; then
   printf 'stub response\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/claude-response.md"
 fi
-echo "[CLAUDE_TURN: COMPLETE]"
+# The crash window after the response landed: STUB_CLAUDE_SILENT drops the
+# stdout marker, STUB_CLAUDE_EXIT fails the CLI after everything else ran.
+if [[ "${STUB_CLAUDE_SILENT:-0}" != "1" ]]; then
+  echo "[CLAUDE_TURN: COMPLETE]"
+fi
+exit "${STUB_CLAUDE_EXIT:-0}"
 EOF
 
 cat > "$STUBS/codex" <<'EOF'
@@ -321,12 +335,17 @@ case "$*" in
     ;;
   *"pr view"*)
     # The head's check rollup, when that is what was asked for. STUB_CI picks
-    # the shape: a red check, an all-green run, or a repo with no checks.
+    # the shape: a red check, an all-green run, a run still in flight, or a
+    # repo with no checks. `running` is serialized the way gh does it: the
+    # unfinished CheckRun carries conclusion:"" (empty, not absent) plus its
+    # status, and the StatusContext has context/state/targetUrl instead of
+    # name/conclusion/detailsUrl.
     if [[ "$*" == *statusCheckRollup* ]]; then
       case "${STUB_CI:-none}" in
-        fail) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"wheels","conclusion":"FAILURE","detailsUrl":"http://ci/2"}]}\n' ;;
-        pass) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"}]}\n' ;;
-        *)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[]}\n' ;;
+        fail)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"wheels","conclusion":"FAILURE","detailsUrl":"http://ci/2"}]}\n' ;;
+        pass)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"}]}\n' ;;
+        running) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"integration","conclusion":"","status":"IN_PROGRESS","detailsUrl":"http://ci/3"},{"context":"ci/legacy","state":"PENDING","targetUrl":"http://ci/4"}]}\n' ;;
+        *)       printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[]}\n' ;;
       esac
       exit 0
     fi
@@ -429,10 +448,46 @@ case "$method $url" in
 ]
 PAYLOAD
     ;;
+  "GET "*"/pipelines/"*"/jobs"*)
+    # Pipeline jobs, paginated like the real endpoint (100 per page).
+    # STUB_GL_JOBS picks the shape; `paged` spreads 101 jobs over two pages
+    # with the only failure on page 2.
+    page=1
+    pg_re='[?&]page=([0-9]+)'
+    [[ "$url" =~ $pg_re ]] && page="${BASH_REMATCH[1]}"
+    case "${STUB_GL_JOBS:-empty}" in
+      fail)
+        if [[ "$page" == "1" ]]; then
+          echo '[{"status":"failed","name":"unit","web_url":"http://gl/j/1"},{"status":"success","name":"build","web_url":"http://gl/j/2"}]'
+        else
+          echo '[]'
+        fi ;;
+      running)
+        if [[ "$page" == "1" ]]; then
+          echo '[{"status":"running","name":"unit","web_url":"http://gl/j/1"}]'
+        else
+          echo '[]'
+        fi ;;
+      paged)
+        case "$page" in
+          1) jq -nc '[range(100) | {status:"success", name:"job-\(.)", web_url:"http://gl/j/\(.)"}]' ;;
+          2) echo '[{"status":"failed","name":"job-tail","web_url":"http://gl/j/tail"}]' ;;
+          *) echo '[]' ;;
+        esac ;;
+      *) echo '[]' ;;
+    esac
+    ;;
   "GET "*"/merge_requests/"*)
-    # Gated: most tests want the terminal "MR is not open" die; the
-    # --preflight-only tests need a real open MR.
-    if [[ "${STUB_MR_OPEN:-0}" == "1" ]]; then
+    # The MR's head pipeline when STUB_GL_PIPELINE names its status
+    # (`yamlerr` = failed with config errors and, per the invalid-config
+    # case, zero jobs). Otherwise gated: most tests want the terminal "MR
+    # is not open" die; the --preflight-only tests need a real open MR.
+    if [[ -n "${STUB_GL_PIPELINE:-}" ]]; then
+      case "$STUB_GL_PIPELINE" in
+        yamlerr) echo '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"failed","yaml_errors":"jobs config should contain at least one visible job"}}' ;;
+        *)       printf '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"%s","yaml_errors":null}}\n' "$STUB_GL_PIPELINE" ;;
+      esac
+    elif [[ "${STUB_MR_OPEN:-0}" == "1" ]]; then
       echo '{"state":"opened","source_branch":"feat/x","target_branch":"main","web_url":"https://gl.example/g/p/-/merge_requests/9","source_project_id":1,"target_project_id":1}'
     else
       echo '{}'
@@ -1229,12 +1284,55 @@ else
   ok
 fi
 
+# The crash window: the response landed publicly, then the CLI exited
+# nonzero (or its stdout marker never printed). Resume advances past the
+# iteration on the landed artifact, so the report must be emitted by the
+# failing turn itself or never.
+
+t "claude: a landed response followed by a CLI failure still reports"
+new_case claude-report-crash
+run_turn claude STUB_CLAUDE_EXIT=17
+assert_eq "$TURN_RC" 1
+if grep -q 'Stub claude reply\.' "$CASE_DIR/state/iter-01/claude-report.md" 2>/dev/null; then
+  ok
+else
+  bad "claude-report.md missing after the crash-window failure"
+fi
+
+t "claude: the crash window is named in the log"
+assert_substr "$CASE_DIR/turn.log" 'response landed before the CLI failure'
+
+t "claude: a landed response without the stdout marker still reports"
+new_case claude-report-nomarker
+run_turn claude STUB_CLAUDE_SILENT=1
+assert_eq "$TURN_RC" 1
+if grep -q 'Stub claude reply\.' "$CASE_DIR/state/iter-01/claude-report.md" 2>/dev/null; then
+  ok
+else
+  bad "claude-report.md missing after the marker-less turn"
+fi
+
+t "claude: a CLI failure with nothing landed reports nothing"
+new_case claude-report-crash-none
+run_turn claude STUB_CLAUDE_EXIT=17 STUB_NO_CLAUDE_SUMMARY=1
+assert_eq "$TURN_RC" 1
+if [[ -e "$CASE_DIR/state/iter-01/claude-report.md" ]]; then
+  bad "a report was written with no landed response"
+else
+  ok
+fi
+
 t "extract_ai_summary_body: a bannerless tagged note is not the summary"
 XB=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
   . '$ROOT/lib/common.sh'
   printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=1 -->\\nOrphaned finding.\"}' > '$WORK/xb.ndjson'
   extract_ai_summary_body codex 1 '$WORK/xb.ndjson'")
 assert_eq "$XB" ""
+
+# One summary note as fetch_ai_thread maps it: the structural wrapper around
+# a three-line body (7 lines in all). Shared by the emit_round_report tests;
+# interpolated into their inner scripts, so it must stay single-quote-free.
+RPT_SUMMARY_LINE='{"tag":"ai-loop:codex-reviewer","iter":1,"surface":"issue","in_reply_to_id":null,"body":"<!-- ai-loop:codex-reviewer iter=1 -->\n\n> [!IMPORTANT]\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.**\nL1\nL2\nL3"}'
 
 t "emit_round_report: the logged body stops at AI_REPORT_LOG_MAX_LINES"
 mkdir -p "$WORK/rpt/state/iter-01"
@@ -1244,7 +1342,7 @@ RPT=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
   AI_REPORT_LOG_MAX_LINES=2
   . '$ROOT/lib/common.sh'
   fetch_ai_thread() {
-    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":1,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=1 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.**\\nL1\\nL2\\nL3\"}'
+    printf '%s\n' '$RPT_SUMMARY_LINE'
   }
   emit_round_report codex 1" 2>&1)
 if grep -qF 'more line(s)' <<<"$RPT"; then
@@ -1277,27 +1375,156 @@ else
   bad "the review artifact was consumed"
 fi
 
+# AI_REPORT_LOG_MAX_LINES is a documented knob: a malformed value must warn
+# and fall back to the default, never blow up head/arithmetic under
+# `set -euo pipefail` after the round already landed publicly.
+
+t "emit_round_report: a malformed AI_REPORT_LOG_MAX_LINES is nonfatal"
+mkdir -p "$WORK/rptbad/state/iter-01"
+BADCAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptbad/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=banana
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$BADCAP"; then
+  ok
+else
+  bad "emit_round_report died on the malformed cap (log: $(tr '\n' '|' <<<"$BADCAP"))"
+fi
+
+t "emit_round_report: the malformed cap warns and logs the whole body"
+if grep -qF "AI_REPORT_LOG_MAX_LINES='banana'" <<<"$BADCAP" && grep -qF 'L3' <<<"$BADCAP"; then
+  ok
+else
+  bad "warning or body missing (log: $(tr '\n' '|' <<<"$BADCAP"))"
+fi
+
+t "emit_round_report: a negative cap falls back the same way"
+mkdir -p "$WORK/rptneg/state/iter-01"
+NEGCAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptneg/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=-5
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$NEGCAP" && grep -qF "AI_REPORT_LOG_MAX_LINES='-5'" <<<"$NEGCAP"; then
+  ok
+else
+  bad "negative cap not handled (log: $(tr '\n' '|' <<<"$NEGCAP"))"
+fi
+
+t "emit_round_report: a leading-zero cap is decimal, not octal"
+# '010' must mean ten: head and the truncation arithmetic read it the same
+# way, with no 'value too great for base' error and no bogus notice on a
+# 7-line body.
+mkdir -p "$WORK/rptoct/state/iter-01"
+OCTCAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptoct/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=010
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$OCTCAP" && ! grep -q 'value too great' <<<"$OCTCAP" \
+   && ! grep -qF 'more line(s)' <<<"$OCTCAP" && grep -qF 'L3' <<<"$OCTCAP"; then
+  ok
+else
+  bad "leading-zero cap mishandled (log: $(tr '\n' '|' <<<"$OCTCAP"))"
+fi
+
+t "emit_round_report: a cap assigned after sourcing is still guarded"
+mkdir -p "$WORK/rptlate/state/iter-01"
+LATECAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptlate/state'
+  LOCAL_MODE=0
+  . '$ROOT/lib/common.sh'
+  AI_REPORT_LOG_MAX_LINES=banana
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$LATECAP" && grep -qF 'L3' <<<"$LATECAP"; then
+  ok
+else
+  bad "post-source malformed cap not guarded (log: $(tr '\n' '|' <<<"$LATECAP"))"
+fi
+
+t "emit_round_report: the verified snapshot survives a dead thread fetch"
+# turn_artifact_landed saved the snapshot it verified; a transient fetch
+# failure right after must not lose the round's report.
+mkdir -p "$WORK/rptsnap/state/iter-01"
+printf '%s\n' "$RPT_SUMMARY_LINE" > "$WORK/rptsnap/state/iter-01/thread.codex-post.ndjson"
+SNAPO=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptsnap/state'
+  LOCAL_MODE=0
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() { return 1; }
+  emit_round_report codex 1" 2>&1)
+if grep -qF 'L1' <<<"$SNAPO"; then
+  ok
+else
+  bad "report not captured from the saved snapshot (log: $(tr '\n' '|' <<<"$SNAPO"))"
+fi
+
+t "emit_round_report: a report without a trailing newline logs its last line"
+mkdir -p "$WORK/rptnonl/state/iter-01"
+printf 'first line\nlast line, no newline' > "$WORK/rptnonl/state/iter-01/codex-review.md"
+NONL=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptnonl/state'
+  LOCAL_MODE=1
+  . '$ROOT/lib/common.sh'
+  emit_round_report codex 1" 2>&1)
+if grep -qF 'last line, no newline' <<<"$NONL"; then
+  ok
+else
+  bad "the unterminated last line never reached the log (log: $(tr '\n' '|' <<<"$NONL"))"
+fi
+
+t "codex: a malformed report cap never fails a landed turn"
+new_case codex-report-badcap
+run_turn codex AI_REPORT_LOG_MAX_LINES=banana
+assert_eq "$TURN_RC" 0
+
 # --- CI status -------------------------------------------------------------
 # The loop's own commits can turn the checks red, and neither agent sees that
 # from the diff. Each turn renders the head's checks and points its prompt at
 # the file; with no checks to report, the prompt says nothing about CI rather
 # than asserting green.
 
-t "codex: a failing check is rendered to iter-NN/ci-status.md"
+t "codex: a failing check is rendered to iter-NN/ci-status.codex.md"
 new_case codex-ci-fail
 run_turn codex STUB_CI=fail
 assert_eq "$TURN_RC" 0
-if grep -q 'FAILURE. wheels' "$CASE_DIR/state/iter-01/ci-status.md" 2>/dev/null; then
+if grep -q 'FAILURE. wheels' "$CASE_DIR/state/iter-01/ci-status.codex.md" 2>/dev/null; then
   ok
 else
-  bad "ci-status.md missing the failing check"
+  bad "ci-status.codex.md missing the failing check"
 fi
 
 t "codex: the rendered report counts the failures"
-assert_eq "$(grep -c 'Failing: 1 of 2 check(s)' "$CASE_DIR/state/iter-01/ci-status.md")" 1
+assert_eq "$(grep -c 'Failing: 1 of 2 check(s)' "$CASE_DIR/state/iter-01/ci-status.codex.md")" 1
 
 t "codex: the prompt points at the CI file and calls a loop-caused failure a blocker"
-assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'ci-status.md'
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'ci-status.codex.md'
 t "codex: the CI directive reaches the prompt"
 assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'is a BLOCKER finding'
 
@@ -1313,14 +1540,14 @@ assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'pre-existing'
 t "codex: a repo with no checks renders no CI file"
 new_case codex-ci-none
 run_turn codex
-if [[ -e "$CASE_DIR/state/iter-01/ci-status.md" ]]; then
+if [[ -e "$CASE_DIR/state/iter-01/ci-status.codex.md" ]]; then
   bad "a CI file was written for a head with no checks"
 else
   ok
 fi
 
 t "codex: with no checks the prompt says nothing about CI"
-if grep -q 'ci-status.md' "$CASE_DIR/state/iter-01/codex.prompt.md"; then
+if grep -q 'ci-status' "$CASE_DIR/state/iter-01/codex.prompt.md"; then
   bad "the prompt claims a CI file that was never written"
 else
   ok
@@ -1346,6 +1573,61 @@ if [[ -e "$WORK/ci-branch.md" ]]; then
 else
   ok
 fi
+
+# gh serializes an unfinished CheckRun with conclusion:"" (empty, not
+# absent); the renderer must fall through to the live status instead of
+# printing a blank, count the unfinished checks, and tell the reviewer how
+# to wait for them.
+
+t "codex: an unfinished CheckRun renders its live status, not a blank"
+new_case codex-ci-running
+run_turn codex STUB_CI=running
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" '- [IN_PROGRESS] integration'
+
+t "codex: an empty conclusion never renders as an empty status"
+if grep -qF -- '- [] ' "$CASE_DIR/state/iter-01/ci-status.codex.md"; then
+  bad "a check rendered with a blank status"
+else
+  ok
+fi
+
+t "codex: a pending StatusContext renders under its context name"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" '- [PENDING] ci/legacy'
+
+t "codex: unfinished checks are counted as pending, not passing"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Pending: 2 of 3 check(s)'
+
+t "codex: the report names the command that waits for pending checks"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'gh pr checks 1 --repo o/r --watch'
+
+t "codex: the prompt forbids approval while checks are unfinished"
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'never issue APPROVED while a check on this head is still unfinished'
+
+t "codex: a finished rollup reports no pending line"
+if grep -q 'Pending:' "$WORK/case-codex-ci-fail/state/iter-01/ci-status.codex.md"; then
+  bad "a finished rollup claims pending checks"
+else
+  ok
+fi
+
+t "ci status: the reviewer's snapshot survives the implementer's render"
+new_case ci-both
+run_turn codex STUB_CI=fail
+run_turn claude STUB_CI=fail
+if [[ -s "$CASE_DIR/state/iter-01/ci-status.codex.md" \
+   && -s "$CASE_DIR/state/iter-01/ci-status.claude.md" ]]; then
+  ok
+else
+  bad "expected both per-bot CI snapshots in the iteration dir"
+fi
+
+t "render_ci_status: a local review reports nothing (forge head lacks loop commits)"
+LM=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  LOCAL_MODE=1
+  . '$ROOT/lib/common.sh'
+  if render_ci_status '$WORK/ci-local.md'; then echo rendered; else echo none; fi")
+assert_eq "$LM" "none"
 
 # --- gitlab forge plumbing -------------------------------------------------
 # The gitlab path talks to /api/v4 via the curl stub: one summary note, one
@@ -1382,6 +1664,47 @@ t "gitlab thread: unpositioned DiscussionNote reply inherits the root's inline c
 # inline reply degrades to a context-less issue note.
 assert_eq "$(jq -r 'select(.id==302) | "\(.surface) \(.path) \(.line)"' <<<"$GL_THREAD")" \
           "inline src/a.c 12"
+
+# --- gitlab CI status -------------------------------------------------------
+# The head pipeline's own status is the health signal: an invalid
+# .gitlab-ci.yml fails the pipeline with zero jobs, and the jobs endpoint
+# pages at 100 items, so the first page alone proves nothing.
+
+t "gitlab ci: a red zero-job pipeline still renders (invalid config)"
+GLCI="$WORK/gl-ci-yamlerr.md"
+if env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=yamlerr STUB_GL_JOBS=empty "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCI'"; then
+  ok
+else
+  bad "render_ci_status reported nothing for a failed zero-job pipeline"
+fi
+
+t "gitlab ci: the pipeline status heads the zero-job report"
+assert_substr "$GLCI" 'CI pipeline 77 (head cafe1234): FAILED'
+
+t "gitlab ci: the configuration error reaches the report"
+assert_substr "$GLCI" 'jobs config should contain at least one visible job'
+
+t "gitlab ci: the zero-job report says so instead of listing nothing"
+assert_substr "$GLCI" 'The pipeline reports no jobs.'
+
+t "gitlab ci: the second jobs page is read (101 jobs)"
+GLCIP="$WORK/gl-ci-paged.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=failed STUB_GL_JOBS=paged "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIP'"
+assert_substr "$GLCIP" '- [FAILED] job-tail'
+
+t "gitlab ci: the failure count covers every page"
+assert_substr "$GLCIP" 'Failing: 1 of 101 job(s)'
+
+t "gitlab ci: a running pipeline flags its results as not final"
+GLCIR="$WORK/gl-ci-running.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=running STUB_GL_JOBS=running "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIR'"
+assert_substr "$GLCIR" 'Pending: 1 of 1 job(s)'
+
+t "gitlab ci: the running pipeline's status heads the report"
+assert_substr "$GLCIR" 'CI pipeline 77 (head cafe1234): RUNNING'
 
 # --- forged-author rejection (trust boundary) ------------------------------
 # The ai-loop marker is public; only comments authored by the token identity
