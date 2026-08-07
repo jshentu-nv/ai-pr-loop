@@ -69,6 +69,17 @@ else
   CONTEXT_NOTE=''
 fi
 
+# The head's CI results, rendered fresh for this turn. A red check caused by
+# an earlier round is this turn's work: the loop broke it, the loop fixes it.
+CI_FILE="$ID/ci-status.md"
+if render_ci_status "$CI_FILE"; then
+  CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it before you finish. A check failing because of a commit THIS LOOP made in an earlier round is yours to fix in THIS round, whether or not Codex raised it — read the failing job's log, fix the cause, and record it in your summary under a \"CI\" heading. Do not defer it to a later iteration and do not report the round done while CI is red from the loop's own work. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and leave it alone."
+  log "claude: CI status rendered to $CI_FILE"
+else
+  CI_NOTE=''
+  log "claude: no CI status available for this head"
+fi
+
 # Render the prompt. GitLab loops use the gitlab prompt variant — same
 # implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
 # instead of gh.
@@ -108,6 +119,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
+  -e "s|{{CI_NOTE}}|${CI_NOTE}|g" \
   > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"

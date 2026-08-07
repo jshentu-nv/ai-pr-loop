@@ -24,6 +24,10 @@
 #     inline notes, replies, banner-quoting prose, and misplaced markers
 #     are excluded; both turn scripts fail when their iteration summary
 #     never landed
+#   - CI status: each turn renders the head's checks to iter-NN/ci-status.md
+#     and injects the pointer plus the fix/report directives into its prompt;
+#     no checks (or a branch review with no target) writes no file and leaves
+#     the prompt silent about CI rather than asserting green
 #   - round reports: each completed turn saves iter-NN/<who>-report.md and
 #     logs the body between BEGIN/END markers behind a single tagged
 #     announcement line, honours AI_REPORT_LOG_MAX_LINES while keeping the
@@ -316,6 +320,16 @@ case "$*" in
     RAW="[$(IFS=,; echo "${els[*]}")]"
     ;;
   *"pr view"*)
+    # The head's check rollup, when that is what was asked for. STUB_CI picks
+    # the shape: a red check, an all-green run, or a repo with no checks.
+    if [[ "$*" == *statusCheckRollup* ]]; then
+      case "${STUB_CI:-none}" in
+        fail) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"wheels","conclusion":"FAILURE","detailsUrl":"http://ci/2"}]}\n' ;;
+        pass) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"}]}\n' ;;
+        *)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[]}\n' ;;
+      esac
+      exit 0
+    fi
     # The live PR text finalize baselines a proposal against; the knobs
     # emulate a human editing the PR while a proposal is held.
     printf '{"title":"%s","body":"%s"}\n' \
@@ -1261,6 +1275,76 @@ if [[ -s "$WORK/rptlocal/state/iter-01/codex-review.md" ]]; then
   ok
 else
   bad "the review artifact was consumed"
+fi
+
+# --- CI status -------------------------------------------------------------
+# The loop's own commits can turn the checks red, and neither agent sees that
+# from the diff. Each turn renders the head's checks and points its prompt at
+# the file; with no checks to report, the prompt says nothing about CI rather
+# than asserting green.
+
+t "codex: a failing check is rendered to iter-NN/ci-status.md"
+new_case codex-ci-fail
+run_turn codex STUB_CI=fail
+assert_eq "$TURN_RC" 0
+if grep -q 'FAILURE. wheels' "$CASE_DIR/state/iter-01/ci-status.md" 2>/dev/null; then
+  ok
+else
+  bad "ci-status.md missing the failing check"
+fi
+
+t "codex: the rendered report counts the failures"
+assert_eq "$(grep -c 'Failing: 1 of 2 check(s)' "$CASE_DIR/state/iter-01/ci-status.md")" 1
+
+t "codex: the prompt points at the CI file and calls a loop-caused failure a blocker"
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'ci-status.md'
+t "codex: the CI directive reaches the prompt"
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'is a BLOCKER finding'
+
+t "claude: the prompt makes a loop-caused failure this round's work"
+new_case claude-ci-fail
+run_turn claude STUB_CI=fail
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'yours to fix in THIS round'
+
+t "claude: a pre-existing failure is explicitly out of scope"
+assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'pre-existing'
+
+t "codex: a repo with no checks renders no CI file"
+new_case codex-ci-none
+run_turn codex
+if [[ -e "$CASE_DIR/state/iter-01/ci-status.md" ]]; then
+  bad "a CI file was written for a head with no checks"
+else
+  ok
+fi
+
+t "codex: with no checks the prompt says nothing about CI"
+if grep -q 'ci-status.md' "$CASE_DIR/state/iter-01/codex.prompt.md"; then
+  bad "the prompt claims a CI file that was never written"
+else
+  ok
+fi
+
+t "codex: an unsubstituted CI placeholder never reaches the prompt"
+if grep -q '{{CI_NOTE}}' "$CASE_DIR/state/iter-01/codex.prompt.md"; then
+  bad "{{CI_NOTE}} left unrendered"
+else
+  ok
+fi
+
+t "render_ci_status: a branch review has no target and reports nothing"
+BR=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  LOCAL_SCOPE=branch
+  . '$ROOT/lib/common.sh'
+  if render_ci_status '$WORK/ci-branch.md'; then echo rendered; else echo none; fi")
+assert_eq "$BR" "none"
+
+t "render_ci_status: a branch review writes no file"
+if [[ -e "$WORK/ci-branch.md" ]]; then
+  bad "a CI file was written for a review with no target"
+else
+  ok
 fi
 
 # --- gitlab forge plumbing -------------------------------------------------

@@ -1476,6 +1476,86 @@ verify_ai_summary() {
   ai_summary_posted "$who" "$iter"
 }
 
+# --- CI status ------------------------------------------------------------------
+#
+# The loop's own commits can turn a target's checks red, and neither agent
+# sees that from the diff. Each turn renders the head's check results to a
+# file and points its prompt at it: the reviewer reports a failure the loop
+# caused, the implementer fixes it in the round it appears.
+#
+# Read-only and never fatal. No checks configured, no permission, a branch
+# review with no target, or an API hiccup leaves no file — and the prompt
+# then says nothing about CI rather than asserting green.
+
+# GitHub: the head's check rollup, one line per check.
+render_ci_status_github() {
+  local out="$1" json rows head
+  json=$(gh pr view "$PR_NUMBER" --repo "${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}" \
+           --json statusCheckRollup,headRefOid 2>/dev/null) || return 1
+  rows=$(jq -r '
+      (.statusCheckRollup // [])[]
+      | "\((.conclusion // .state // .status // "PENDING") | ascii_upcase)\t\(.name // .context // "check")\t\(.detailsUrl // .targetUrl // "-")"
+    ' <<<"$json" 2>/dev/null) || return 1
+  [[ -n "$rows" ]] || return 1
+  head=$(jq -r '.headRefOid // ""' <<<"$json" 2>/dev/null)
+
+  {
+    printf 'CI checks on head %s\n\n' "${head:0:8}"
+    printf '%s\n' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
+    printf '\nFailing: %s of %s check(s)\n' \
+      "$(printf '%s\n' "$rows" | grep -cE '^(FAILURE|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED)' || true)" \
+      "$(printf '%s\n' "$rows" | grep -c '' || true)"
+    printf '\nTo read a failing GitHub Actions job:\n'
+    printf '  gh run view --repo %s --job JOB_ID --log-failed\n' \
+      "${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}"
+    printf 'JOB_ID is the trailing number of the job URL above.\n'
+  } > "$out"
+}
+
+# GitLab: the MR's head pipeline, one line per job.
+render_ci_status_gitlab() {
+  local out="$1" mr pid sha rows
+  mr=$(gl_api_get "projects/$PROJECT_ENC/merge_requests/$PR_NUMBER" 2>/dev/null) || return 1
+  pid=$(jq -r '.head_pipeline.id // empty' <<<"$mr" 2>/dev/null)
+  [[ -n "$pid" ]] || return 1
+  sha=$(jq -r '.head_pipeline.sha // ""' <<<"$mr" 2>/dev/null)
+  rows=$(gl_api_get "projects/$PROJECT_ENC/pipelines/$pid/jobs?per_page=100" 2>/dev/null \
+         | jq -r '.[] | "\((.status // "unknown") | ascii_upcase)\t\(.name)\t\(.web_url // "-")"' 2>/dev/null) || return 1
+  [[ -n "$rows" ]] || return 1
+
+  {
+    printf 'CI jobs in pipeline %s (head %s)\n\n' "$pid" "${sha:0:8}"
+    printf '%s\n' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
+    printf '\nFailing: %s of %s job(s)\n' \
+      "$(printf '%s\n' "$rows" | grep -cE '^FAILED' || true)" \
+      "$(printf '%s\n' "$rows" | grep -c '' || true)"
+    printf '\nTo read a failing job:\n'
+    printf '  curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" %s://%s/api/v4/projects/%s/jobs/JOB_ID/trace\n' \
+      "${FORGE_SCHEME:-https}" "${FORGE_HOST:-gitlab.com}" "$PROJECT_ENC"
+  } > "$out"
+}
+
+# Render the head's CI status to $1. Returns 0 when a report was written,
+# 1 when CI status is unavailable or there is nothing to report.
+render_ci_status() {
+  local out="$1" rc=0
+
+  # A --local --base review has no target and so no pipeline to read.
+  [[ "${LOCAL_SCOPE:-pr}" == "branch" ]] && return 1
+
+  if [[ "${FORGE:-github}" == "gitlab" ]]; then
+    render_ci_status_gitlab "$out" || rc=1
+  else
+    render_ci_status_github "$out" || rc=1
+  fi
+
+  if (( rc != 0 )) || [[ ! -s "$out" ]]; then
+    rm -f "$out"
+    return 1
+  fi
+  return 0
+}
+
 # --- Round reports --------------------------------------------------------------
 #
 # Each turn writes its summary for the PR thread, but the session driving the

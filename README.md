@@ -668,6 +668,37 @@ verdict, per-iter session captures) are kept under
 `state/<owner>__<name>/pr-<N>/iter-NN/` so you can replay any decision
 after the fact.
 
+## CI status
+
+A fix the loop lands can turn the target's checks red, and neither agent
+sees that from the diff. Each turn renders the head's check results to
+`iter-NN/ci-status.md` and points its prompt at the file:
+
+```
+CI checks on head 0660671b
+
+- [FAILURE] Real ovstage/ovrtx wheels (Linux CPU API)
+  https://github.com/owner/repo/actions/runs/31131061120/job/92719811650
+- [SUCCESS] linux-x86_64-py312
+  https://github.com/owner/repo/actions/runs/31131061070/job/92719811136
+
+Failing: 1 of 4 check(s)
+
+To read a failing GitHub Actions job:
+  gh run view --repo owner/repo --job JOB_ID --log-failed
+```
+
+A check failing because of a commit **the loop itself made** is a blocker:
+the reviewer reports it, and the implementer fixes it in the round it
+appears rather than deferring it. A check already failing on the base for
+reasons the change did not introduce is out of scope — the agents name it,
+say it is pre-existing, and leave it alone.
+
+GitLab reads the MR's head pipeline and its jobs instead. The read is
+never fatal: no checks configured, no permission, a `--base` branch review
+with no target, or an API hiccup leaves no file, and the prompt then says
+nothing about CI rather than asserting green.
+
 ## Round reports
 
 Each turn ends by printing its own summary — the reviewer's findings, the

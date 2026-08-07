@@ -360,8 +360,14 @@ When the background `run.sh` completes, summarize:
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
-stdout/stderr, fetched thread, codex verdict file, and each turn's
-`codex-report.md` / `claude-report.md`).
+stdout/stderr, fetched thread, codex verdict file, `ci-status.md`, and each
+turn's `codex-report.md` / `claude-report.md`).
+
+Both agents see the head's CI status each turn. A check the loop's own
+commits broke is a blocker the implementer fixes in the round it appears; a
+check already red on the base is named as pre-existing and left alone. So
+do not hand-fix CI for them mid-run, and do not treat a red check as a
+reason to stop the loop — report it and let the next round address it.
 
 ## Resumability
 

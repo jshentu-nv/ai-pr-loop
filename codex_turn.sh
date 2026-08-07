@@ -55,6 +55,17 @@ else
   CONTEXT_NOTE=''
 fi
 
+# The head's CI results, rendered fresh for this turn. Absent when the forge
+# reports no checks — the prompt then says nothing about CI.
+CI_FILE="$ID/ci-status.md"
+if render_ci_status "$CI_FILE"; then
+  CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it. A check failing because of a commit THIS LOOP made is a BLOCKER finding — report it with the failing job and the error from its log. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and move on."
+  log "codex: CI status rendered to $CI_FILE"
+else
+  CI_NOTE=''
+  log "codex: no CI status available for this head"
+fi
+
 # Render the prompt template. GitLab loops use the gitlab prompt variant —
 # same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
 # instead of gh.
@@ -96,6 +107,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
+  -e "s|{{CI_NOTE}}|${CI_NOTE}|g" \
   > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"

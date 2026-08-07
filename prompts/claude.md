@@ -53,6 +53,8 @@ written later from the review record and the final diff.
 
 {{CONTEXT_NOTE}}
 
+{{CI_NOTE}}
+
 {{#forge}}
 {{#github}}
 ## GitHub API access
