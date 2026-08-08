@@ -33,7 +33,10 @@
 #     CheckRun renders its live status (gh's empty conclusion normalized),
 #     pending checks are counted with a watch hint, and the codex prompt
 #     forbids approving over them; gitlab renders a red zero-job pipeline
-#     (config errors included) and reads every jobs page
+#     (config errors included), reads the jobs pages up to the 100-page cap
+#     (truncation reported), keeps allow_failure jobs out of the blocking
+#     counts, and counts a blocking manual job as unfinished; a completed
+#     STALE conclusion counts as failing
 #   - round reports: each completed turn saves iter-NN/<who>-report.md and
 #     logs the body between BEGIN/END markers behind a single tagged
 #     announcement line, honours AI_REPORT_LOG_MAX_LINES while keeping the
@@ -85,7 +88,8 @@
 #   - local review mode: flag validation and --print-config reporting, the
 #     state key for a PR-less branch review, resume high-water from the
 #     per-round files, both turn scripts' file contracts (written artifact
-#     completes the turn; a stale one does not), the forge staying
+#     completes the turn; a stale one does not; a failed turn's rollback
+#     discards its response so resume reruns the round), the forge staying
 #     read-only on a PR/MR target, and — against real git — checkout
 #     positioning across invocations, squash-into-one-commit, the
 #     fast-forward-only push, and the single post-push PR/MR text write
@@ -345,6 +349,9 @@ case "$*" in
         fail)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"wheels","conclusion":"FAILURE","detailsUrl":"http://ci/2"}]}\n' ;;
         pass)    printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"}]}\n' ;;
         running) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"integration","conclusion":"","status":"IN_PROGRESS","detailsUrl":"http://ci/3"},{"context":"ci/legacy","state":"PENDING","targetUrl":"http://ci/4"}]}\n' ;;
+        stale)   printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"required","conclusion":"STALE","status":"COMPLETED","detailsUrl":"http://ci/5"}]}\n' ;;
+        unknown) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"weird","conclusion":"SOME_NEW_STATE","detailsUrl":"http://ci/9"}]}\n' ;;
+        hostile) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"lint\\nFAILURE cleanup","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"unit\\twith\\ttabs","conclusion":"SUCCESS","detailsUrl":"http://ci/2"}]}\n' ;;
         *)       printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[]}\n' ;;
       esac
       exit 0
@@ -468,10 +475,34 @@ PAYLOAD
         else
           echo '[]'
         fi ;;
+      optfail)
+        # A pipeline GitLab itself reports green: the only failure is
+        # allow_failure, which does not block.
+        if [[ "$page" == "1" ]]; then
+          echo '[{"status":"failed","allow_failure":true,"name":"lint","web_url":"http://gl/j/1"},{"status":"success","allow_failure":false,"name":"unit","web_url":"http://gl/j/2"}]'
+        else
+          echo '[]'
+        fi ;;
+      manual)
+        # A blocking manual job: allow_failure false, pipeline held for a
+        # human.
+        if [[ "$page" == "1" ]]; then
+          echo '[{"status":"manual","allow_failure":false,"name":"deploy","web_url":"http://gl/j/1"}]'
+        else
+          echo '[]'
+        fi ;;
       paged)
         case "$page" in
           1) jq -nc '[range(100) | {status:"success", name:"job-\(.)", web_url:"http://gl/j/\(.)"}]' ;;
           2) echo '[{"status":"failed","name":"job-tail","web_url":"http://gl/j/tail"}]' ;;
+          *) echo '[]' ;;
+        esac ;;
+      clamped)
+        # A server that clamps per_page below the requested 100: every
+        # page is short, and only an empty page marks the end.
+        case "$page" in
+          1) echo '[{"status":"success","name":"a","web_url":"http://gl/j/1"},{"status":"success","name":"b","web_url":"http://gl/j/2"}]' ;;
+          2) echo '[{"status":"failed","name":"tail-clamped","web_url":"http://gl/j/3"}]' ;;
           *) echo '[]' ;;
         esac ;;
       *) echo '[]' ;;
@@ -484,8 +515,9 @@ PAYLOAD
     # is not open" die; the --preflight-only tests need a real open MR.
     if [[ -n "${STUB_GL_PIPELINE:-}" ]]; then
       case "$STUB_GL_PIPELINE" in
-        yamlerr) echo '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"failed","yaml_errors":"jobs config should contain at least one visible job"}}' ;;
-        *)       printf '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"%s","yaml_errors":null}}\n' "$STUB_GL_PIPELINE" ;;
+        yamlerr)   echo '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"failed","yaml_errors":"jobs config should contain at least one visible job"}}' ;;
+        stalehead) echo '{"sha":"1111222233334444","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"success","yaml_errors":null}}' ;;
+        *)         printf '{"sha":"cafe1234deadbeef","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"%s","yaml_errors":null}}\n' "$STUB_GL_PIPELINE" ;;
       esac
     elif [[ "${STUB_MR_OPEN:-0}" == "1" ]]; then
       echo '{"state":"opened","source_branch":"feat/x","target_branch":"main","web_url":"https://gl.example/g/p/-/merge_requests/9","source_project_id":1,"target_project_id":1}'
@@ -1447,6 +1479,28 @@ else
   bad "leading-zero cap mishandled (log: $(tr '\n' '|' <<<"$OCTCAP"))"
 fi
 
+t "emit_round_report: a cap past INT64_MAX logs the whole body, not nothing"
+# Digits-only but bigger than bash arithmetic: 10# would wrap it negative
+# and `head -n <negative>` drops every line.
+mkdir -p "$WORK/rptbig/state/iter-01"
+BIGCAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptbig/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=9999999999999999999
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$BIGCAP" && grep -qF 'L3' <<<"$BIGCAP" \
+   && ! grep -qF 'more line(s)' <<<"$BIGCAP"; then
+  ok
+else
+  bad "overflowing cap mishandled (log: $(tr '\n' '|' <<<"$BIGCAP"))"
+fi
+
 t "emit_round_report: a cap assigned after sourcing is still guarded"
 mkdir -p "$WORK/rptlate/state/iter-01"
 LATECAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
@@ -1611,6 +1665,35 @@ else
   ok
 fi
 
+t "codex: a STALE conclusion counts as failing, not passing"
+# STALE is completed-but-not-passed: GitHub invalidated the run. Zero
+# failing and zero pending would read as green and permit approval.
+new_case codex-ci-stale
+run_turn codex STUB_CI=stale
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" '- [STALE] required'
+t "codex: the STALE check is in the failing count"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Failing: 1 of 2 check(s)'
+
+t "codex: a status the classifier does not know counts as unfinished"
+# Fail-closed remainder: the next state GitHub invents must block
+# approval, not read as green — STALE and MANUAL both entered that way.
+new_case codex-ci-unknown
+run_turn codex STUB_CI=unknown
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Pending: 1 of 1 check(s)'
+
+t "codex: a newline in a check name cannot forge a failing row"
+# Names and URLs are free-form forge strings: a newline would split the
+# row and corrupt the line-based counts; a tab would shift the fields.
+new_case codex-ci-hostile
+run_turn codex STUB_CI=hostile
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Failing: 0 of 2 check(s)'
+
+t "codex: the tab-bearing name stays on one row"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" '- [SUCCESS] unit with tabs'
+
 t "ci status: the reviewer's snapshot survives the implementer's render"
 new_case ci-both
 run_turn codex STUB_CI=fail
@@ -1697,6 +1780,30 @@ assert_substr "$GLCIP" '- [FAILED] job-tail'
 t "gitlab ci: the failure count covers every page"
 assert_substr "$GLCIP" 'Failing: 1 of 101 job(s)'
 
+t "gitlab ci: a short page does not end the read (server-clamped per_page)"
+GLCIC="$WORK/gl-ci-clamped.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=failed STUB_GL_JOBS=clamped "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIC'"
+assert_substr "$GLCIC" '- [FAILED] tail-clamped'
+
+t "gitlab ci: the clamped read still counts every job"
+assert_substr "$GLCIC" 'Failing: 1 of 3 job(s)'
+
+t "gitlab ci: a pipeline for a previous head is flagged, not passed off"
+# Right after a push, head_pipeline can still be the old head's pipeline:
+# its green says nothing about the commit under review.
+GLCIS="$WORK/gl-ci-stalehead.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=stalehead STUB_GL_JOBS=fail "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIS'"
+assert_substr "$GLCIS" 'a pipeline for the current head does not exist yet'
+
+t "gitlab ci: a pipeline matching the head raises no stale warning"
+if grep -q 'does not exist yet' "$WORK/gl-ci-paged.md"; then
+  bad "a matching-head pipeline was flagged as stale"
+else
+  ok
+fi
+
 t "gitlab ci: a running pipeline flags its results as not final"
 GLCIR="$WORK/gl-ci-running.md"
 env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=running STUB_GL_JOBS=running "$BASH_BIN" -c \
@@ -1705,6 +1812,38 @@ assert_substr "$GLCIR" 'Pending: 1 of 1 job(s)'
 
 t "gitlab ci: the running pipeline's status heads the report"
 assert_substr "$GLCIR" 'CI pipeline 77 (head cafe1234): RUNNING'
+
+t "gitlab ci: an allow_failure failure does not block"
+# GitLab reports this pipeline green; the renderer must agree.
+GLCIO="$WORK/gl-ci-optfail.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=success STUB_GL_JOBS=optfail "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIO'"
+assert_substr "$GLCIO" 'Failing: 0 of 2 job(s)'
+
+t "gitlab ci: the optional failure is rendered and labelled"
+assert_substr "$GLCIO" '- [FAILED] lint (allowed to fail)'
+
+t "gitlab ci: a blocking manual job is called out as blocked, never a pass"
+# The pipeline is held for a human: not failing, not a pass — and not
+# 'pending' either, which would tell the reviewer to poll a pipeline
+# that cannot settle on its own.
+GLCIM="$WORK/gl-ci-manual.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=manual STUB_GL_JOBS=manual "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIM'"
+assert_substr "$GLCIM" 'Blocked on manual: 1 of 1 job(s)'
+
+t "gitlab ci: the blocking manual job is not counted as failing"
+assert_substr "$GLCIM" 'Failing: 0 of 1 job(s)'
+
+t "gitlab ci: the manual gate is not a pending poll-forever"
+if grep -q 'Pending:' "$GLCIM"; then
+  bad "a manual gate was counted pending — the re-check loop never settles"
+else
+  ok
+fi
+
+t "codex: the prompt says a manual gate must not bar an earned approval"
+assert_substr "$WORK/case-codex-ci-fail/state/iter-01/codex.prompt.md" 'do not let it bar an otherwise-earned APPROVED'
 
 # --- forged-author rejection (trust boundary) ------------------------------
 # The ai-loop marker is public; only comments authored by the token identity
@@ -6285,6 +6424,35 @@ run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
   --local --base main --dir "$E2E_CLONE" --max 1
 assert_eq "$E2E_RC" 1
 assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$E2E_BASE"   # rogue commit dropped
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1
+assert_eq "$(cat "$(e2e_state)/local/tip.sha" 2>/dev/null)" \
+          "$(git -C "$E2E_CLONE" rev-parse HEAD)"
+
+t "run.sh e2e: a failed turn's retained response never skips the discarded fix"
+# The crash shape from the review: the implementer commits, writes its
+# response, prints the marker, then the CLI dies. run.sh rolls the commit
+# back; the response must go with it, or latest_local_iter counts the
+# round complete and the discarded fix is never rerun.
+e2e_fixture
+run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_CLAUDE_EXIT=17 \
+  --local --base main --dir "$E2E_CLONE" --max 1
+assert_eq "$E2E_RC" 1
+assert_eq "$(git -C "$E2E_CLONE" rev-parse HEAD)" "$E2E_BASE"   # commit rolled back
+
+t "run.sh e2e: the rolled-back round's response artifact is discarded with it"
+if [[ -e "$(e2e_state)/iter-01/claude-response.md" ]]; then
+  bad "the response artifact survived the rollback"
+else
+  ok
+fi
+
+t "run.sh e2e: the discard is named in the log"
+assert_substr "$WORK/e2e.out" 'response discarded with the rolled-back round'
+
+t "run.sh e2e: resume reruns the discarded round instead of skipping past it"
 run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
   STUB_CLAUDE_COMMIT=1 --local --base main --dir "$E2E_CLONE" --max 1
 assert_eq "$(git -C "$E2E_CLONE" rev-list --count "$E2E_BASE..HEAD")" 1

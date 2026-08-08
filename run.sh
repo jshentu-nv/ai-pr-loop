@@ -1777,6 +1777,17 @@ while (( RUNS < MAX_ITER )); do
     # reads them as the branch moving outside the loop and fails closed.
     # (A turn that detached HEAD is left for that fail-closed check.)
     if (( LOCAL_MODE == 1 )); then
+      # The response artifact answers for the commits dropped below:
+      # keeping it would advance latest_local_iter past this round, and
+      # the discarded fix would never rerun. Removed BEFORE the pending
+      # receipt — a kill between the two must leave the receipt (whose
+      # reconcile path re-runs the round), never a bare response that
+      # resume would count as the round completing. The round report the
+      # turn already emitted stays — it is the operator's record.
+      if [[ -e "$(local_artifact_path claude "$ITER")" ]]; then
+        rm -f "$(local_artifact_path claude "$ITER")"
+        log "claude: iter $ITER response discarded with the rolled-back round — resume reruns this iteration"
+      fi
       rm -f "$(local_pending_turn_file)"    # the round is being re-run, not anchored
       if [[ -s "$(local_tip_file)" ]]; then
         if [[ "$LOCAL_SCOPE" != "branch" ]]; then

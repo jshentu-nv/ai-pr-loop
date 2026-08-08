@@ -705,7 +705,14 @@ loop and a failure after it goes unseen.
 GitLab reads the MR's head pipeline and its jobs instead. The pipeline's
 own status heads the report — a broken `.gitlab-ci.yml` fails the pipeline
 with zero jobs, and the report then carries the configuration errors — and
-the job list is read across every page of the paginated endpoint. The read
+the job list is read page by page until an empty page (a short page is not
+the end — a server may clamp the page size), up to 100 pages, with
+truncation reported past that cap. Jobs marked `allow_failure` render as
+such and never count as failing or pending. A blocking manual job is
+called out on its own line — a human must start it, so it neither passes
+nor bars an otherwise-earned approval, and it is never counted as pending,
+which would mean polling a pipeline that cannot settle.
+The read
 is never fatal: no checks configured, no permission, a `--base` branch
 review with no target, or an API hiccup leaves no file, and the prompt then
 says nothing about CI rather than asserting green. A `--local` review also
@@ -743,10 +750,12 @@ not a non-negative integer warns and uses the default.
 In local mode the report is the review/response file the turn wrote. A turn
 whose summary never landed fails on its own contract and reports nothing. A
 summary that landed just before the CLI died (or lost its stdout marker) is
-reported before the turn exits — resume advances past that iteration on the
-landed artifact, so the failing turn is the report's only chance. And a
-report that cannot be captured logs a warning without failing a turn whose
-review already landed.
+reported before the turn exits. In forge mode resume then advances past that
+iteration on the landed artifact, so the failing turn is the report's only
+chance; in local mode the failed round's commits are rolled back and its
+response is discarded with them, so resume reruns the round. And a report
+that cannot be captured logs a warning without failing a turn whose review
+already landed.
 
 ## Testing
 

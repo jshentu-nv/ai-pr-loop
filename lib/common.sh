@@ -1464,8 +1464,10 @@ ai_summary_posted() {
   local who="$1" iter="$2" snap="${3:-}" fields marker alert banner
   fields=$(ai_marker_fields "$who") || return 1
   IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  # Fetch stderr stays on the turn's stderr: an auth or API failure here
+  # must reach the log, or 'summary not found' hides the real cause.
   if [[ -n "$snap" ]]; then
-    fetch_ai_thread > "$snap" 2>/dev/null || { rm -f "$snap"; return 1; }
+    fetch_ai_thread > "$snap" || { rm -f "$snap"; return 1; }
   fi
   { if [[ -n "$snap" ]]; then cat "$snap"; else fetch_ai_thread; fi; } \
     | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
@@ -1484,19 +1486,24 @@ verify_ai_summary() {
   ai_summary_posted "$who" "$iter" "$snap"
 }
 
+# The thread snapshot the landed-probe verifies and emit_round_report
+# reads back. One builder keeps writer and reader on the same file.
+thread_snapshot_path() {  # <codex|claude> <iter>
+  printf '%s/thread.%s-post.ndjson\n' "$(iter_dir "$2")" "$1"
+}
+
 # True iff <who>'s iteration-$2 turn artifact is public: the written
 # review/response file in local mode, the verified summary comment in forge
 # mode. Both turn scripts probe through this so the completion contract
-# stays in one place. Forge mode saves the verified thread snapshot to
-# iter-NN/thread.<who>-post.ndjson for emit_round_report — the report must
-# not depend on a second network read succeeding after the verifying one
-# already did.
+# stays in one place. Forge mode saves the verified thread snapshot for
+# emit_round_report — the report must not depend on a second network read
+# succeeding after the verifying one already did.
 turn_artifact_landed() {  # <codex|claude> <iter>
   local who="$1" iter="$2"
   if [[ "$LOCAL_MODE" == "1" ]]; then
     local_artifact_written "$who" "$iter"
   else
-    verify_ai_summary "$who" "$iter" "$(iter_dir "$iter")/thread.$who-post.ndjson"
+    verify_ai_summary "$who" "$iter" "$(thread_snapshot_path "$who" "$iter")"
   fi
 }
 
@@ -1520,23 +1527,31 @@ turn_artifact_landed() {  # <codex|claude> <iter>
 # render blank. Checks not yet finished are counted separately: their results
 # are not final, and the reviewer must not approve on top of them.
 render_ci_status_github() {
-  local out="$1" json rows head total failing pending
+  local out="$1" json rows head total failing passing pending
   local repo="${REPO_SLUG:-${REPO_OWNER}/${REPO_NAME}}"
   json=$(gh pr view "$PR_NUMBER" --repo "$repo" \
            --json statusCheckRollup,headRefOid 2>/dev/null) || return 1
+  # clean: names and URLs are free-form forge strings; a newline would
+  # split the row (corrupting the line-based counts) and a tab would shift
+  # the awk fields.
   rows=$(jq -r '
       def pick($alts): [$alts[] | select(. != null and . != "")] | first;
+      def clean: tostring | gsub("[[:cntrl:]]"; " ");
       (.statusCheckRollup // [])[]
-      | "\((pick([.conclusion, .state, .status]) // "PENDING") | ascii_upcase)\t\(pick([.name, .context]) // "check")\t\(pick([.detailsUrl, .targetUrl]) // "-")"
+      | "\((pick([.conclusion, .state, .status]) // "PENDING") | ascii_upcase | clean)\t\(pick([.name, .context]) // "check" | clean)\t\(pick([.detailsUrl, .targetUrl]) // "-" | clean)"
     ' <<<"$json" 2>/dev/null) || return 1
   [[ -n "$rows" ]] || return 1
   head=$(jq -r '.headRefOid // ""' <<<"$json" 2>/dev/null)
 
   total=$(printf '%s\n' "$rows" | grep -c '' || true)
+  # Two explicit lists and a fail-closed remainder. STALE is a completed
+  # conclusion that did not pass — GitHub invalidated the run — so it
+  # blocks like a failure. NEUTRAL and SKIPPED pass. A status neither list
+  # knows counts as unfinished: it must block approval, not read as green.
   failing=$(printf '%s\n' "$rows" \
-    | grep -cE '^(FAILURE|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED|STARTUP_FAILURE)' || true)
-  pending=$(printf '%s\n' "$rows" \
-    | grep -cE '^(PENDING|QUEUED|IN_PROGRESS|WAITING|REQUESTED|EXPECTED)' || true)
+    | grep -cE '^(FAILURE|ERROR|TIMED_OUT|CANCELLED|ACTION_REQUIRED|STARTUP_FAILURE|STALE)' || true)
+  passing=$(printf '%s\n' "$rows" | grep -cE '^(SUCCESS|NEUTRAL|SKIPPED)' || true)
+  pending=$(( total - failing - passing ))
 
   {
     printf 'CI checks on head %s\n\n' "${head:0:8}"
@@ -1558,12 +1573,13 @@ render_ci_status_github() {
 # empty job list is not proof of health. The jobs endpoint returns at most
 # 100 items per page; every page is read.
 render_ci_status_gitlab() {
-  local out="$1" mr pid sha status yaml_errors rows page chunk chunk_rows n
-  local total failing pending truncated=0
+  local out="$1" mr pid sha mr_sha status yaml_errors rows page chunk chunk_rows n
+  local total failing pending manual truncated=0
   mr=$(gl_api_get "projects/$PROJECT_ENC/merge_requests/$PR_NUMBER" 2>/dev/null) || return 1
   pid=$(jq -r '.head_pipeline.id // empty' <<<"$mr" 2>/dev/null)
   [[ -n "$pid" ]] || return 1
   sha=$(jq -r '.head_pipeline.sha // ""' <<<"$mr" 2>/dev/null)
+  mr_sha=$(jq -r '.sha // ""' <<<"$mr" 2>/dev/null)
   status=$(jq -r '(.head_pipeline.status // "unknown") | ascii_upcase' <<<"$mr" 2>/dev/null)
   yaml_errors=$(jq -r '.head_pipeline.yaml_errors // empty' <<<"$mr" 2>/dev/null)
 
@@ -1577,29 +1593,58 @@ render_ci_status_gitlab() {
     n=$(jq -er 'if type == "array" then length else empty end' <<<"$chunk" 2>/dev/null) || return 1
     case "$n" in ''|*[!0-9]*) return 1 ;; esac
     if (( n > 0 )); then
-      chunk_rows=$(jq -r '.[] | "\((.status // "unknown") | ascii_upcase)\t\(.name)\t\(.web_url // "-")"' \
+      # allow_failure rides along: an optional job's outcome never blocks
+      # the pipeline, so the counts below must not read it as blocking.
+      # clean: names and URLs are free-form forge strings; a newline would
+      # split the row and a tab would shift the awk fields.
+      chunk_rows=$(jq -r '
+          def clean: tostring | gsub("[[:cntrl:]]"; " ");
+          .[] | "\((.status // "unknown") | ascii_upcase | clean)\t\(if .allow_failure == true then "yes" else "no" end)\t\(.name | clean)\t\(.web_url // "-" | clean)"' \
                      <<<"$chunk" 2>/dev/null) || return 1
       rows+="$chunk_rows"$'\n'
     fi
-    (( n == 100 )) || break
+    # Read until an EMPTY page: a page shorter than the requested 100 is
+    # not proof of the end — a self-hosted server can clamp per_page lower,
+    # and stopping there would silently drop the later pages.
+    (( n > 0 )) || break
     page=$(( page + 1 ))
-    if (( page > 100 )); then truncated=1; break; fi  # 10k jobs — never spin on a broken API
+    if (( page > 100 )); then truncated=1; break; fi  # never spin on a broken API
   done
 
   {
     printf 'CI pipeline %s (head %s): %s\n' "$pid" "${sha:0:8}" "$status"
+    # Right after a push, head_pipeline can still be the PREVIOUS head's
+    # pipeline (GitLab has not created the new one yet). Reporting it as
+    # this head's result would let a stale green pass for the commit that
+    # broke CI.
+    if [[ -n "$mr_sha" && -n "$sha" && "$mr_sha" != "$sha" ]]; then
+      printf '\nWARNING: this pipeline ran for commit %s, but the current head is %s — a pipeline for the current head does not exist yet. These results are NOT the current head'\''s; re-check before relying on them.\n' \
+        "${sha:0:8}" "${mr_sha:0:8}"
+    fi
     if [[ -n "$yaml_errors" ]]; then
       printf '\nPipeline configuration errors:\n%s\n' "$yaml_errors"
     fi
     if [[ -n "$rows" ]]; then
       total=$(printf '%s' "$rows" | grep -c '' || true)
-      # CANCELED counts as failing, as on GitHub: a canceled job never
-      # validated the head, and 'Failing: 0' must not read as green.
-      failing=$(printf '%s' "$rows" | grep -cE '^(FAILED|CANCELED)' || true)
-      pending=$(printf '%s' "$rows" \
-        | grep -cE '^(CREATED|PENDING|RUNNING|WAITING_FOR_RESOURCE|PREPARING|SCHEDULED)' || true)
+      # One pass, three explicit buckets, and a fail-closed remainder.
+      # Jobs marked allow_failure count as nothing — GitLab's own pipeline
+      # status ignores their outcome. CANCELED counts as failing, as on
+      # GitHub: a canceled job never validated the head. SUCCESS and
+      # SKIPPED pass. A blocking MANUAL job gets its own bucket: it is not
+      # a pass, but no amount of waiting settles it, so folding it into
+      # pending would tell the reviewer to poll forever. Everything else —
+      # active states, or a status these lists do not know — is unfinished
+      # and must block approval, not read green.
+      read -r failing pending manual <<<"$(printf '%s' "$rows" | awk -F'\t' '
+        $2 == "yes" { next }
+        $1 ~ /^(FAILED|CANCELED)$/ { f++; next }
+        $1 ~ /^(SUCCESS|SKIPPED)$/ { next }
+        $1 == "MANUAL" { m++; next }
+        { p++ }
+        END { printf "%d %d %d\n", f+0, p+0, m+0 }')"
       printf '\n'
-      printf '%s' "$rows" | awk -F'\t' '{printf "- [%s] %s\n  %s\n", $1, $2, $3}'
+      printf '%s' "$rows" | awk -F'\t' \
+        '{printf "- [%s] %s%s\n  %s\n", $1, $3, ($2=="yes" ? " (allowed to fail)" : ""), $4}'
       if (( truncated )); then
         printf '  [job list truncated at %s jobs — the pipeline has more]\n' "$total"
       fi
@@ -1607,6 +1652,10 @@ render_ci_status_gitlab() {
       if (( pending > 0 )); then
         printf 'Pending: %s of %s job(s) — these results are NOT final.\n' "$pending" "$total"
         printf 'Re-run the re-check command below until the pipeline settles.\n'
+      fi
+      if (( manual > 0 )); then
+        printf 'Blocked on manual: %s of %s job(s) — a human must start these; the pipeline will not settle on its own.\n' \
+          "$manual" "$total"
       fi
       printf '\nTo read a failing job:\n'
       printf '  curl -sS -H "PRIVATE-TOKEN: $GITLAB_TOKEN" %s://%s/api/v4/projects/%s/jobs/JOB_ID/trace\n' \
@@ -1673,19 +1722,33 @@ extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
 }
 
 # How many body lines reach the log. The rest stay in the report file.
-# Validated at source time, before any turn work: a malformed value would
-# otherwise blow up `head`/arithmetic inside emit_round_report — after the
-# round already landed publicly — and turn a reporting problem into a
-# failed turn. Anything but a non-negative integer warns and uses 200; the
+# One validation rule for every consumer: anything but a non-negative
+# integer warns and uses 200 (a malformed value would otherwise blow up
+# `head`/arithmetic inside emit_round_report — after the round already
+# landed publicly — and turn a reporting problem into a failed turn). The
 # 10# strips leading zeros, which bash arithmetic would read as octal.
-AI_REPORT_LOG_MAX_LINES="${AI_REPORT_LOG_MAX_LINES:-200}"
-case "$AI_REPORT_LOG_MAX_LINES" in
-  ''|*[!0-9]*)
-    log "WARNING: AI_REPORT_LOG_MAX_LINES='$AI_REPORT_LOG_MAX_LINES' is not a non-negative integer — using 200"
-    AI_REPORT_LOG_MAX_LINES=200
-    ;;
-  *) AI_REPORT_LOG_MAX_LINES=$(( 10#$AI_REPORT_LOG_MAX_LINES )) ;;
-esac
+normalize_report_cap() {  # <value>
+  local s
+  case "$1" in
+    ''|*[!0-9]*)
+      log "WARNING: AI_REPORT_LOG_MAX_LINES='$1' is not a non-negative integer — using 200"
+      printf '200\n'
+      ;;
+    *)
+      # Leading zeros are stripped by string, never by 10# arithmetic: a
+      # digits-only value past INT64_MAX would wrap negative there and
+      # `head -n <negative>` drops the whole body. A cap beyond 9 digits
+      # means "everything"; a million lines is that, and stays finite.
+      s="$1"
+      while [[ ${#s} -gt 1 && "$s" == 0* ]]; do s="${s#0}"; done
+      if (( ${#s} > 9 )); then s=1000000; fi
+      printf '%s\n' "$s"
+      ;;
+  esac
+}
+# Normalized at source time, before any turn work; emit_round_report
+# re-normalizes at use, covering a value assigned after this line ran.
+AI_REPORT_LOG_MAX_LINES=$(normalize_report_cap "${AI_REPORT_LOG_MAX_LINES:-200}")
 
 # Save and log <who>'s iteration-$2 report. Callers reach this only once the
 # summary is verified, so the body exists. Any failure here is a reporting
@@ -1697,17 +1760,9 @@ emit_round_report() {  # <codex|claude> <iter>
   report="$id/$who-report.md"
   rm -f "$report"
 
-  # A second guard on the cap, local to the function: the source-time
-  # validation above cannot see a value assigned after common.sh loaded,
-  # and this function must stay nonfatal.
-  cap="${AI_REPORT_LOG_MAX_LINES:-200}"
-  case "$cap" in
-    ''|*[!0-9]*)
-      log "WARNING: AI_REPORT_LOG_MAX_LINES='$cap' is not a non-negative integer — using 200"
-      cap=200
-      ;;
-    *) cap=$(( 10#$cap )) ;;
-  esac
+  # Re-normalized at use: the source-time pass cannot see a value assigned
+  # after common.sh loaded, and this function must stay nonfatal.
+  cap=$(normalize_report_cap "${AI_REPORT_LOG_MAX_LINES:-200}")
 
   if [[ "$LOCAL_MODE" == "1" ]]; then
     cp -f "$(local_artifact_path "$who" "$iter")" "$report" 2>/dev/null || true
@@ -1716,7 +1771,7 @@ emit_round_report() {  # <codex|claude> <iter>
     # from that first. Fetch only when the snapshot is missing or holds no
     # summary — a fresh network read can fail transiently right after the
     # verifying one succeeded, and this report has no later chance.
-    thread="$id/thread.$who-post.ndjson"
+    thread=$(thread_snapshot_path "$who" "$iter")
     if [[ -s "$thread" ]]; then
       extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
     fi

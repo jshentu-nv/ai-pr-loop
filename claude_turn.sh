@@ -157,7 +157,7 @@ if [[ $RC -ne 0 ]]; then
   log "claude stderr (tail):"
   tail -20 "$ID/claude.stderr" >&2 || true
   if (( RESPONSE_LANDED == 1 )); then
-    log "claude: the iter $ITER response landed before the CLI failure — report captured for resume"
+    log "claude: the iter $ITER response landed before the CLI failure — round report captured"
   fi
   exit 1
 fi
@@ -165,7 +165,7 @@ fi
 if ! grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
   log "claude: missing [CLAUDE_TURN: COMPLETE] marker — assuming partial"
   if (( RESPONSE_LANDED == 1 )); then
-    log "claude: the iter $ITER response landed despite the missing marker — report captured for resume"
+    log "claude: the iter $ITER response landed despite the missing marker — round report captured"
   fi
   exit 1
 fi
