@@ -352,6 +352,8 @@ case "$*" in
         stale)   printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"unit","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"required","conclusion":"STALE","status":"COMPLETED","detailsUrl":"http://ci/5"}]}\n' ;;
         unknown) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"weird","conclusion":"SOME_NEW_STATE","detailsUrl":"http://ci/9"}]}\n' ;;
         hostile) printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"lint\\nFAILURE cleanup","conclusion":"SUCCESS","detailsUrl":"http://ci/1"},{"name":"unit\\twith\\ttabs","conclusion":"SUCCESS","detailsUrl":"http://ci/2"}]}\n' ;;
+        prefix)  printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"soft","conclusion":"SUCCESS_WITH_WARNINGS","detailsUrl":"http://ci/6"}]}\n' ;;
+        gated)   printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[{"name":"deploy","conclusion":"ACTION_REQUIRED","detailsUrl":"http://ci/7"}]}\n' ;;
         *)       printf '{"headRefOid":"deadbeefcafe1234","statusCheckRollup":[]}\n' ;;
       esac
       exit 0
@@ -434,10 +436,17 @@ case "$method $url" in
     # their own summary landed), one inline DiffNote thread with a claude
     # reply, one system note, one human note without a marker. Every bot
     # note is authored by the trusted identity (author.username=testuser,
-    # matching the /user stub); the human note by someone else. The page is
-    # short (<100), so the pagination loop stops after one fetch.
+    # matching the /user stub); the human note by someone else. Only page 1
+    # has content — the reader paginates until an empty page.
     # STUB_FORGED_GL_SUMMARY appends an attacker-authored exact-wrapper
     # codex summary at a high iter, in its own thread.
+    pg=1
+    pg_re='[?&]page=([0-9]+)'
+    [[ "$url" =~ $pg_re ]] && pg="${BASH_REMATCH[1]}"
+    if [[ "$pg" != "1" ]]; then
+      echo '[]'
+      exit 0
+    fi
     FORGED=''
     if [[ "${STUB_FORGED_GL_SUMMARY:-0}" == "1" ]]; then
       FORGED=',
@@ -454,6 +463,15 @@ case "$method $url" in
  {"id":"disc-human","notes":[{"id":501,"type":null,"system":false,"author":{"username":"human"},"created_at":"2026-01-01T00:00:04Z","body":"human comment"}]}${FORGED}
 ]
 PAYLOAD
+    ;;
+  "GET "*"/repository/commits/"*)
+    # Parents of the synthetic merged-results commit: they contain the
+    # source head for a current pipeline, and do not for a stale one.
+    if [[ "${STUB_GL_PIPELINE:-}" == "mergedstale" ]]; then
+      echo '{"parent_ids":["9999000011112222","aaaabbbbccccdddd"]}'
+    else
+      echo '{"parent_ids":["1111222233334444","aaaabbbbccccdddd"]}'
+    fi
     ;;
   "GET "*"/pipelines/"*"/jobs"*)
     # Pipeline jobs, paginated like the real endpoint (100 per page).
@@ -516,7 +534,9 @@ PAYLOAD
     if [[ -n "${STUB_GL_PIPELINE:-}" ]]; then
       case "$STUB_GL_PIPELINE" in
         yamlerr)   echo '{"head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"failed","yaml_errors":"jobs config should contain at least one visible job"}}' ;;
-        stalehead) echo '{"sha":"1111222233334444","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"success","yaml_errors":null}}' ;;
+        stalehead) echo '{"sha":"1111222233334444","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","ref":"feat/x","status":"success","yaml_errors":null}}' ;;
+        mergedresults) echo '{"sha":"1111222233334444","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","ref":"refs/merge-requests/9/merge","status":"running","yaml_errors":null}}' ;;
+        mergedstale)   echo '{"sha":"1111222233334444","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","ref":"refs/merge-requests/9/merge","status":"success","yaml_errors":null}}' ;;
         *)         printf '{"sha":"cafe1234deadbeef","head_pipeline":{"id":77,"sha":"cafe1234deadbeef","status":"%s","yaml_errors":null}}\n' "$STUB_GL_PIPELINE" ;;
       esac
     elif [[ "${STUB_MR_OPEN:-0}" == "1" ]]; then
@@ -1694,6 +1714,33 @@ assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Failing: 0 of 2 chec
 t "codex: the tab-bearing name stays on one row"
 assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" '- [SUCCESS] unit with tabs'
 
+t "codex: a pass-prefixed state cannot slip past the fail-closed remainder"
+# Status matching is exact: SUCCESS_WITH_WARNINGS is not SUCCESS, and an
+# unrecognized state must block approval, not read as green.
+new_case codex-ci-prefix
+run_turn codex STUB_CI=prefix
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Pending: 1 of 1 check(s)'
+t "codex: the pass-prefixed state is not counted failing either"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Failing: 0 of 1 check(s)'
+
+t "codex: a workflow approval gate is blocked-on-human, not a failure"
+# ACTION_REQUIRED has no failing job log to read and no fix clears it; a
+# human approves the run. Counting it failing sends the implementer after
+# a log that does not exist.
+new_case codex-ci-gated
+run_turn codex STUB_CI=gated
+assert_eq "$TURN_RC" 0
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Blocked on human action: 1 of 1 check(s)'
+t "codex: the approval gate is not counted failing"
+assert_substr "$CASE_DIR/state/iter-01/ci-status.codex.md" 'Failing: 0 of 1 check(s)'
+t "codex: the approval gate is not a pending poll-forever"
+if grep -q 'Pending:' "$CASE_DIR/state/iter-01/ci-status.codex.md"; then
+  bad "an approval gate was counted pending — the watch never exits"
+else
+  ok
+fi
+
 t "ci status: the reviewer's snapshot survives the implementer's render"
 new_case ci-both
 run_turn codex STUB_CI=fail
@@ -1800,6 +1847,39 @@ assert_substr "$GLCIS" 'a pipeline for the current head does not exist yet'
 t "gitlab ci: a pipeline matching the head raises no stale warning"
 if grep -q 'does not exist yet' "$WORK/gl-ci-paged.md"; then
   bad "a matching-head pipeline was flagged as stale"
+else
+  ok
+fi
+
+t "gitlab ci: a merged-results pipeline whose parents include the head is current"
+# Its sha is a synthetic merge commit that never equals the source head;
+# staleness there means the source head is not among the merge commit's
+# parents.
+GLCIMR="$WORK/gl-ci-mergedresults.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=mergedresults STUB_GL_JOBS=running "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIMR'"
+if grep -q 'does not exist yet' "$GLCIMR"; then
+  bad "a merged-results pipeline was flagged as stale"
+else
+  ok
+fi
+
+t "gitlab ci: a merged-results pipeline for a previous head is stale"
+# Same ref shape, but the merge commit's parents lack the source head —
+# the just-pushed window where the old pipeline's green says nothing.
+GLCIMS="$WORK/gl-ci-mergedstale.md"
+env -i PATH="$STUBS:/usr/bin:/bin" STUB_GL_PIPELINE=mergedstale STUB_GL_JOBS=running "$BASH_BIN" -c \
+  "set -euo pipefail; $GL_ENV; . '$ROOT/lib/common.sh'; render_ci_status '$GLCIMS'"
+assert_substr "$GLCIMS" 'does not exist yet'
+
+t "gitlab ci: the re-check reads the MR's head_pipeline, not a pinned id"
+# A replacement pipeline gets a new id; polling the old one can never
+# discover it — only the MR read can.
+assert_substr "$GLCIS" 'merge_requests/9 | jq .head_pipeline'
+
+t "gitlab ci: no re-check command pins the old pipeline id"
+if grep -q 'pipelines/77$' "$GLCIS"; then
+  bad "the stale report still points the re-check at the old pipeline id"
 else
   ok
 fi
@@ -6431,10 +6511,10 @@ assert_eq "$(cat "$(e2e_state)/local/tip.sha" 2>/dev/null)" \
           "$(git -C "$E2E_CLONE" rev-parse HEAD)"
 
 t "run.sh e2e: a failed turn's retained response never skips the discarded fix"
-# The crash shape from the review: the implementer commits, writes its
-# response, prints the marker, then the CLI dies. run.sh rolls the commit
-# back; the response must go with it, or latest_local_iter counts the
-# round complete and the discarded fix is never rerun.
+# The crash shape: the implementer commits, writes its response, prints
+# the marker, then the CLI dies. run.sh rolls the commit back; the
+# response must go with it, or latest_local_iter counts the round
+# complete and the discarded fix is never rerun.
 e2e_fixture
 run_e2e STUB_CODEX_VERDICT=CHANGES_REQUESTED STUB_CODEX_BLOCKERS=1 \
   STUB_CLAUDE_COMMIT=1 STUB_CLAUDE_EXIT=17 \

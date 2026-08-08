@@ -703,15 +703,25 @@ verdict while a check on the head is unfinished, because approval ends the
 loop and a failure after it goes unseen.
 
 GitLab reads the MR's head pipeline and its jobs instead. The pipeline's
-own status heads the report — a broken `.gitlab-ci.yml` fails the pipeline
-with zero jobs, and the report then carries the configuration errors — and
-the job list is read page by page until an empty page (a short page is not
-the end — a server may clamp the page size), up to 100 pages, with
-truncation reported past that cap. Jobs marked `allow_failure` render as
-such and never count as failing or pending. A blocking manual job is
-called out on its own line — a human must start it, so it neither passes
-nor bars an otherwise-earned approval, and it is never counted as pending,
-which would mean polling a pipeline that cannot settle.
+own status heads the report; a broken `.gitlab-ci.yml` fails the pipeline
+with zero jobs, and the report then carries the configuration errors.
+
+The job list is read page by page until an empty page. A short page is not
+the end — a server may clamp the page size. The read stops at 100 pages
+and reports the truncation.
+
+Jobs marked `allow_failure` render as such and never count as failing or
+pending. A blocking manual job is called out on its own line: a human must
+start it, so it neither passes nor bars an otherwise-earned approval, and
+it is never counted as pending, which would mean polling a pipeline that
+cannot settle. GitHub's workflow-approval and deployment gates get the
+same treatment.
+
+A `head_pipeline` that does not test the source head is flagged as stale.
+Merged-results and merge-train pipelines test a synthetic merge commit, so
+for them staleness means the source head is not among the merge commit's
+parents. The re-check command reads the MR's current `head_pipeline`
+rather than polling a pipeline id that a replacement would abandon.
 The read
 is never fatal: no checks configured, no permission, a `--base` branch
 review with no target, or an API hiccup leaves no file, and the prompt then
