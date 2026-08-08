@@ -198,6 +198,21 @@ past a failed mutation as if it landed.
      both against what the {{PR_NOUN}} now does. If your change made either stale —
      a renamed flag, a dropped or added behaviour, a test count, a
      described approach you replaced — update it in the same turn.
+
+     **State only what the {{PR_NOUN}} does now.** The description is not a
+     record of how it got here. Never narrate intermediate states: no
+     approach you tried and replaced, no "an earlier revision did X", no
+     "this turned out to be the wrong trade so", no round-by-round account
+     of the review. When a finding makes you replace an approach, DELETE
+     the old one from the text — do not contrast the two, do not explain
+     why the first was dropped, do not leave a paragraph justifying the
+     switch. A reader wants the change as it stands; the path there is
+     noise, and on a {{PR_NOUN}} it reads as arguing with yourself.
+
+     Prior behaviour of already-shipped code is different, and fine when
+     that is what this change fixes ("this used to drop the last row").
+     The rule is about your own superseded attempts, not the codebase's
+     history.
 {{#github}}
      ```bash
      gh pr edit {{PR_NUMBER}} --repo {{REPO_OWNER}}/{{REPO_NAME}} \

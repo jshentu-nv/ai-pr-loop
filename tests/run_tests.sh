@@ -1700,6 +1700,19 @@ assert_substr "$WORK/case-codex-report/state/iter-01/codex.prompt.md" 'CI is par
 t "claude: a real forge turn renders the CI policy into its prompt"
 assert_substr "$WORK/case-claude-report/state/iter-01/claude.prompt.md" 'yours to fix in THIS round'
 
+t "claude: the description rule forbids narrating superseded approaches"
+# The description states the current change; an approach that was tried and
+# replaced must be deleted from it, not contrasted with the new one.
+assert_substr "$WORK/case-claude-report/state/iter-01/claude.prompt.md" \
+  'State only what the PR does now'
+t "claude: the description rule still allows shipped prior behaviour"
+assert_substr "$WORK/case-claude-report/state/iter-01/claude.prompt.md" \
+  'not the codebase'
+
+t "codex: a self-narrating description is reviewable"
+assert_substr "$WORK/case-codex-report/state/iter-01/codex.prompt.md" \
+  'A description that narrates its own history is a finding'
+
 t "gitlab thread: unpositioned DiscussionNote reply inherits the root's inline context"
 # GitLab diff-thread replies are DiscussionNote objects with no position of
 # their own; surface/path/line must come from the DiffNote root, or every

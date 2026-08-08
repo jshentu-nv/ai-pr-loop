@@ -195,6 +195,16 @@ never continue past a failed mutation as if it landed.
    {{PR_NOUN}}'s actual scope. Severity by consequence: MAJOR when it would mislead
    a reviewer about what they are approving or a user about behaviour, NIT
    for a stale number or wording with no such consequence.
+
+   **A description that narrates its own history is a finding.** It must
+   state what the {{PR_NOUN}} does now, not the path there. Flag any
+   sentence describing an approach that was tried and replaced, an
+   "earlier revision", why a first attempt was abandoned, or the review's
+   round-by-round progress — the fix is to delete it, not to reword it.
+   NIT on its own; MAJOR when the superseded approach is described in
+   enough detail that a reader could mistake it for what the code does.
+   Prior behaviour of already-shipped code that this change fixes is not
+   this — that belongs in the description.
 {{#gitlab}}
 
    Judge only the prose. A checkbox block the project's MR template
