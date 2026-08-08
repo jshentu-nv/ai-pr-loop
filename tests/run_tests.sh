@@ -30,8 +30,9 @@
 #     whole body on disk, reads the written review in local mode without
 #     consuming it, and writes nothing when the summary never landed; a
 #     response that landed before a CLI failure or lost stdout marker still
-#     reports; a malformed AI_REPORT_LOG_MAX_LINES warns and falls back
-#     instead of failing a landed turn
+#     reports; a malformed or zero-padded AI_REPORT_LOG_MAX_LINES warns
+#     and falls back instead of failing a landed turn; a clamped GitLab
+#     page size never truncates the thread read
 #   - auto-resume: the restart decision table, the backoff curve, and the
 #     context-flag stripper as helpers, plus real front-end/supervisor/
 #     worker runs — default budget, inline --no-auto-resume,
@@ -404,12 +405,24 @@ case "$method $url" in
     # reply, one system note, one human note without a marker. Every bot
     # note is authored by the trusted identity (author.username=testuser,
     # matching the /user stub); the human note by someone else. Only page 1
-    # has content — the reader paginates until an empty page.
+    # has content — the reader paginates until an empty page — except in
+    # clamped mode below, which serves one note per page across two pages.
     # STUB_FORGED_GL_SUMMARY appends an attacker-authored exact-wrapper
     # codex summary at a high iter, in its own thread.
     pg=1
     pg_re='[?&]page=([0-9]+)'
     [[ "$url" =~ $pg_re ]] && pg="${BASH_REMATCH[1]}"
+    # Clamped mode: a server serving SHORT pages, with a marked note only
+    # on page 2 — a reader that stops at a short page never sees it.
+    # Serves fixed iter-1 notes; the other STUB_GL_* knobs do not apply.
+    if [[ "${STUB_GL_CLAMPED_THREAD:-0}" == "1" ]]; then
+      case "$pg" in
+        1) echo '[{"id":"disc-sum","notes":[{"id":201,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:00Z","body":"<!-- ai-loop:codex-reviewer iter=1 -->\n\n> [!IMPORTANT]\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 1.**\nStub codex review.","position":null}]}]' ;;
+        2) echo '[{"id":"disc-claude-sum","notes":[{"id":202,"type":null,"system":false,"author":{"username":"testuser"},"created_at":"2026-01-01T00:00:05Z","body":"<!-- ai-loop:claude-implementer iter=1 -->\n\n> [!NOTE]\n> **AUTOMATED REPLY — AI agent (Claude Implementer), iteration 1.**\nStub claude reply.","position":null}]}]' ;;
+        *) echo '[]' ;;
+      esac
+      exit 0
+    fi
     if [[ "$pg" != "1" ]]; then
       echo '[]'
       exit 0
@@ -1416,6 +1429,63 @@ else
   bad "overflowing cap mishandled (log: $(tr '\n' '|' <<<"$BIGCAP"))"
 fi
 
+t "normalize_report_cap: value-level edges hold"
+# Direct asserts on the pure function; the harness sourced lib/common.sh.
+# 0000000009 is the one shape where octal reinterpretation would error.
+NC_OK=1
+[[ "$(normalize_report_cap 0000000000)" == 0 ]] || NC_OK=0
+[[ "$(normalize_report_cap 0000000009)" == 9 ]] || NC_OK=0
+[[ "$(normalize_report_cap 0000000010)" == 10 ]] || NC_OK=0
+[[ "$(normalize_report_cap 00000000000000000002 2>/dev/null)" == 2 ]] || NC_OK=0
+[[ "$(normalize_report_cap 9999999999999999999 2>/dev/null)" == 1000000 ]] || NC_OK=0
+if (( NC_OK )); then ok; else bad "normalize_report_cap edge values wrong"; fi
+
+t "emit_round_report: a zero-padded zero cap logs no body lines"
+# Zero-padding must not defeat the cap: 0000000000 is 0, not the
+# everything-cap the raw string length would suggest.
+mkdir -p "$WORK/rptzpad/state/iter-01"
+ZPAD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptzpad/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=0000000000
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+# ']   L1' anchors to the logged body indent — a bare 'L1' could match
+# the random mktemp path inside the report-path log lines.
+if grep -qF 'EMIT_OK' <<<"$ZPAD" && ! grep -qF ']   L1' <<<"$ZPAD" \
+   && grep -qF '7 more line(s)' <<<"$ZPAD"; then
+  ok
+else
+  bad "zero-padded zero cap mishandled (log: $(tr '\n' '|' <<<"$ZPAD"))"
+fi
+
+t "emit_round_report: a ten-character zero-padded cap keeps its decimal value"
+mkdir -p "$WORK/rptzpad2/state/iter-01"
+ZPAD2=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptzpad2/state'
+  LOCAL_MODE=0
+  AI_REPORT_LOG_MAX_LINES=0000000002
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '$RPT_SUMMARY_LINE'
+  }
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+# Lines 1-2 of the body (the marker line and a blank) are logged; L1 on
+# line 5 must not be — that pins head's count, not just the arithmetic.
+if grep -qF 'EMIT_OK' <<<"$ZPAD2" && grep -qF '5 more line(s)' <<<"$ZPAD2" \
+   && grep -qF ']   <!--' <<<"$ZPAD2" && ! grep -qF ']   L1' <<<"$ZPAD2"; then
+  ok
+else
+  bad "ten-character zero-padded 2 did not cap at 2 (log: $(tr '\n' '|' <<<"$ZPAD2"))"
+fi
+
 t "emit_round_report: a cap assigned after sourcing is still guarded"
 mkdir -p "$WORK/rptlate/state/iter-01"
 LATECAP=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
@@ -1501,6 +1571,21 @@ assert_eq "$(jq -r 'select(.id==301) | "\(.surface) \(.path) \(.line) \(.discuss
 t "gitlab thread: reply note chains to the thread root"
 assert_eq "$(jq -r 'select(.id==302) | "\(.in_reply_to_id) \(.tag)"' <<<"$GL_THREAD")" \
           "301 ai-loop:claude-implementer"
+
+t "gitlab thread: a marked note on page 2 survives a clamped page size"
+# The reader paginates until an EMPTY page: a short page 1 is not the
+# end, and stopping there would drop this note entirely. The rc is
+# asserted too — a reader that finds the notes but then walks to the
+# page cap and fails would otherwise pass this test.
+GLCT_RC=0
+GLCT=$(env -i PATH="$STUBS:/usr/bin:/bin" ITER=1 STUB_GL_CLAMPED_THREAD=1 "$BASH_BIN" -c \
+  "$GL_ENV; . '$ROOT/lib/common.sh'; fetch_ai_thread" 2>/dev/null) || GLCT_RC=$?
+GLCT_IDS=$(jq -r '.id' <<<"$GLCT" | tr '\n' ' ')
+if [[ "$GLCT_RC" == 0 && " $GLCT_IDS " == *" 201 "* && " $GLCT_IDS " == *" 202 "* ]]; then
+  ok
+else
+  bad "clamped thread read failed (rc=$GLCT_RC ids: $GLCT_IDS)"
+fi
 
 t "gitlab thread: unpositioned DiscussionNote reply inherits the root's inline context"
 # GitLab diff-thread replies are DiscussionNote objects with no position of

@@ -1356,7 +1356,7 @@ fetch_ai_thread_github() {
 # forged bot marker from another commenter can't steer resume state or the
 # implementer. The first note of a thread is its root; later notes map to
 # in_reply_to_id=<root id>. Pagination is manual (curl has no --paginate):
-# fetch 100-per-page until a short page. API failures (curl non-2xx,
+# fetch 100-per-page until an empty page. API failures (curl non-2xx,
 # non-array body) RETURN NON-ZERO rather than ending the loop quietly: a
 # swallowed failure here would make resume detection see an empty thread and
 # restart a live MR at iter 1 (double-posting), or silently truncate a
@@ -1387,14 +1387,16 @@ fetch_ai_thread_gitlab() {
           line: $line,
           in_reply_to_id: (if .id == $root then null else $root end),
           created_at, body }' <<<"$chunk"
-    # Read until an EMPTY page, the same termination rule as the CI jobs
-    # reader: a page shorter than the requested 100 is not proof of the
-    # end — a self-hosted server can clamp per_page lower, and stopping
-    # there would silently truncate the thread (resume would then restart
-    # a live MR at iter 1 and double-post).
+    # Read until an EMPTY page: a page shorter than the requested 100 is
+    # not proof of the end — a self-hosted server can clamp per_page
+    # lower, and stopping there would silently truncate the thread
+    # (resume would then restart a live MR at iter 1 and double-post).
     (( $(jq 'length' <<<"$chunk") > 0 )) || break
     page=$((page + 1))
-    (( page <= 200 )) || return 1  # never spin on a broken API; fail closed
+    if (( page > 200 )); then  # never spin on a broken API; fail closed
+      log "WARNING: /discussions pagination passed 200 pages — aborting the thread read"
+      return 1
+    fi
   done
 }
 
@@ -1543,21 +1545,30 @@ extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
 # already landed publicly — and turn a reporting problem into a failed
 # turn. Anything but a non-negative integer warns and uses 200.
 normalize_report_cap() {  # <value>
+  local z s
   case "$1" in
     ''|*[!0-9]*)
       log "WARNING: AI_REPORT_LOG_MAX_LINES='$1' is not a non-negative integer — using 200"
       printf '200\n'
       ;;
     *)
-      # 10# reads leading zeros as decimal, not octal; the length guard
-      # keeps it off values past INT64, which would wrap negative and make
-      # `head -n` drop the whole body. A cap beyond 9 digits means
-      # "everything"; a million lines is that, and stays finite.
-      if (( ${#1} > 9 )); then
-        printf '1000000\n'
+      # Leading zeros are stripped as a STRING, by regex, before the
+      # length guard: guarding on the raw length would turn a zero-padded
+      # small value (0000000010) into the 1000000 fallback, arithmetic on
+      # the raw value could wrap past INT64 and make `head -n` drop the
+      # whole body, and a character-at-a-time strip goes quadratic on a
+      # huge value. After the strip, a value beyond 9 digits caps at
+      # 1000000 — effectively "log everything", kept finite.
+      if [[ "$1" =~ ^0*([0-9]+)$ ]]; then
+        s="${BASH_REMATCH[1]}"
       else
-        printf '%s\n' "$(( 10#$1 ))"
+        s=0  # unreachable: the case arm above admits only digits
       fi
+      if (( ${#s} > 9 )); then
+        log "WARNING: AI_REPORT_LOG_MAX_LINES='$1' exceeds 9 digits — using 1000000"
+        s=1000000
+      fi
+      printf '%s\n' "$s"
       ;;
   esac
 }
@@ -1602,9 +1613,12 @@ emit_round_report() {  # <codex|claude> <iter>
   # `|| [[ -n "$line" ]]` keeps a final line that lacks a trailing newline —
   # local mode copies agent-written files verbatim, and those often end
   # without one.
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    log "  $line"
-  done < <(head -n "$cap" "$report")
+  # cap 0 logs no body at all; BSD head rejects `-n 0`, so skip the read.
+  if (( cap > 0 )); then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      log "  $line"
+    done < <(head -n "$cap" "$report")
+  fi
   if (( total > cap )); then
     log "  [$(( total - cap )) more line(s) — read $report]"
   fi

@@ -136,7 +136,8 @@ never continue past a failed mutation as if it landed.
      `curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}"`.
    - `curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/discussions?per_page=100"`
      for **all** comment threads (includes any human comments; page through
-     with `&page=2`, `&page=3`, … if a page comes back full).
+     with `&page=2`, `&page=3`, … until a page comes back EMPTY — a short
+     page is not the end, since a server may clamp the page size).
 {{/gitlab}}
 
    The {{PR_NOUN}} description states intent and constraints — design choices that

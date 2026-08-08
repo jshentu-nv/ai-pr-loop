@@ -694,7 +694,8 @@ The announcement line is the only one carrying the bot tag, so a log
 monitor keyed on `codex:`/`claude:` fires once per report rather than once
 per line. `AI_REPORT_LOG_MAX_LINES` (default 200) caps how much body
 reaches the log; the report file always holds all of it. A value that is
-not a non-negative integer warns and uses the default.
+not a non-negative integer warns and uses the default; a value past nine
+digits warns and uses 1,000,000, which logs any real report whole.
 
 In local mode the report is the review/response file the turn wrote. A turn
 whose summary never landed fails on its own contract and reports nothing. A
