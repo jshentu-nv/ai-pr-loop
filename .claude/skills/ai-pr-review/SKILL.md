@@ -283,6 +283,35 @@ Append any context the user supplied, e.g.
 shared by both agents). On a re-run to grant more iterations, omit them —
 stored context is reused automatically.
 
+**Always pass the CI directive**, unless the target has no CI or the user
+says not to. The orchestrator does not read checks; the agents do it
+themselves with the forge CLI they already use. Add this `--context` on the
+first launch for a PR (later re-runs reuse the stored copy):
+
+```
+--context "CI IS PART OF THE REVIEW. Check the target's CI yourself at the
+start of every turn — 'gh pr checks <N> --repo <SLUG>' on GitHub, the MR's
+head pipeline on GitLab — and read the log of anything failing
+('gh run view --repo <SLUG> --job <JOB_ID> --log-failed').
+
+A check failing because of a commit THIS LOOP made is a BLOCKER. The
+implementer fixes it in the round it is noticed, whether or not the reviewer
+raised it; the reviewer reports it. Do not defer it, and do not call a round
+done while CI is red from the loop's own work.
+
+A check already failing on the base for reasons this change did not
+introduce is out of scope: name it, say it is pre-existing, move on.
+
+A pending or running check is not a pass. Do not approve while a check on
+this head is unfinished — wait for it. A check blocked on a human (manual
+job, deployment gate, workflow approval) never settles on its own: name it
+in the summary and do not let it bar an otherwise-earned approval."
+```
+
+Substitute the real number and slug. Reword freely for the target's CI —
+the point is the policy, not the wording, and the agents work out the
+commands for themselves.
+
 Use the Bash tool with `run_in_background: true`. Note the returned task
 ID and output file path — you'll need both for the monitor.
 
@@ -361,14 +390,7 @@ Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
 stdout/stderr, fetched thread, codex verdict file, and each turn's
-`ci-status.codex.md` / `ci-status.claude.md` and
 `codex-report.md` / `claude-report.md`).
-
-Both agents see the head's CI status each turn. A check the loop's own
-commits broke is a blocker the implementer fixes in the round it appears; a
-check already red on the base is named as pre-existing and left alone. So
-do not hand-fix CI for them mid-run, and do not treat a red check as a
-reason to stop the loop — report it and let the next round address it.
 
 ## Resumability
 

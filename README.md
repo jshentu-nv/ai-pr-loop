@@ -668,67 +668,6 @@ verdict, per-iter session captures) are kept under
 `state/<owner>__<name>/pr-<N>/iter-NN/` so you can replay any decision
 after the fact.
 
-## CI status
-
-A fix the loop lands can turn the target's checks red, and neither agent
-sees that from the diff. Each turn renders the head's check results to
-its own `iter-NN/ci-status.<codex|claude>.md` — one file per turn, so the
-snapshot the reviewer's verdict was based on survives the implementer's
-render — and points its prompt at the file:
-
-```
-CI checks on head 1a2b3c4d
-
-- [FAILURE] integration (linux-x86_64)
-  https://github.com/owner/repo/actions/runs/1000000001/job/2000000001
-- [SUCCESS] unit (linux-x86_64)
-  https://github.com/owner/repo/actions/runs/1000000001/job/2000000002
-
-Failing: 1 of 4 check(s)
-
-To read a failing GitHub Actions job:
-  gh run view --repo owner/repo --job JOB_ID --log-failed
-```
-
-A check failing because of a commit **the loop itself made** is a blocker:
-the reviewer reports it, and the implementer fixes it in the round it
-appears rather than deferring it. A check already failing on the base for
-reasons the change did not introduce is out of scope — the agents name it,
-say it is pre-existing, and leave it alone.
-
-A check still running renders its live state (`[IN_PROGRESS]`,
-`[PENDING]`) with a `Pending:` count and the command that waits for it.
-Those results are not final: the reviewer's prompt forbids an APPROVED
-verdict while a check on the head is unfinished, because approval ends the
-loop and a failure after it goes unseen.
-
-GitLab reads the MR's head pipeline and its jobs instead. The pipeline's
-own status heads the report; a broken `.gitlab-ci.yml` fails the pipeline
-with zero jobs, and the report then carries the configuration errors.
-
-The job list is read page by page until an empty page. A short page is not
-the end — a server may clamp the page size. The read stops at 100 pages
-and reports the truncation.
-
-Jobs marked `allow_failure` render as such and never count as failing or
-pending. A blocking manual job is called out on its own line: a human must
-start it, so it neither passes nor bars an otherwise-earned approval, and
-it is never counted as pending, which would mean polling a pipeline that
-cannot settle. GitHub's workflow-approval and deployment gates get the
-same treatment.
-
-A `head_pipeline` that does not test the source head is flagged as stale.
-Merged-results and merge-train pipelines test a synthetic merge commit, so
-for them staleness means the source head is not among the merge commit's
-parents. The re-check command reads the MR's current `head_pipeline`
-rather than polling a pipeline id that a replacement would abandon.
-The read
-is never fatal: no checks configured, no permission, a `--base` branch
-review with no target, or an API hiccup leaves no file, and the prompt then
-says nothing about CI rather than asserting green. A `--local` review also
-renders no CI: its commits never reach the forge during the loop, so the
-forge's checks describe a head without them.
-
 ## Round reports
 
 Each turn ends by printing its own summary — the reviewer's findings, the

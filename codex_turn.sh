@@ -55,18 +55,6 @@ else
   CONTEXT_NOTE=''
 fi
 
-# The head's CI results, rendered fresh for this turn. Absent when the forge
-# reports no checks — the prompt then says nothing about CI. Per-bot
-# filename: the claude turn of this iteration renders its own view, and this
-# snapshot — the evidence behind the recorded verdict — must survive it.
-CI_FILE="$ID/ci-status.codex.md"
-if render_ci_status "$CI_FILE"; then
-  CI_NOTE="**CI status.** This head's check results were rendered to \`${CI_FILE}\` at the start of this turn. Read it. A check failing because of a commit THIS LOOP made is a BLOCKER finding — report it with the failing job and the error from its log. A check that was already failing on the base for reasons this change did not introduce is out of scope: name it, say it is pre-existing, and move on. A pending or running check is not a pass: an APPROVED verdict ends the loop, and a check that fails after it fails unseen. If the file reports pending checks, re-check them before you settle your verdict — wait for them with the command the file names — and never issue APPROVED while a check on this head is still unfinished. A check blocked on a human — a required manual job, a workflow approval, a deployment gate — is different: no amount of waiting settles it. Name it in your summary so humans see the gate, judge the rest of CI on its merits, and do not let it bar an otherwise-earned APPROVED. If the file warns that the results belong to a previous head, they say nothing about the current one: re-check for the current head's results before your verdict, and if none ever appear, say so in your summary rather than treating the stale ones as this head's."
-  log "codex: CI status rendered to $CI_FILE"
-else
-  CI_NOTE=''
-  log "codex: no CI status available for this head"
-fi
 
 # Render the prompt template. GitLab loops use the gitlab prompt variant —
 # same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -109,7 +97,6 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
-  -e "s|{{CI_NOTE}}|${CI_NOTE}|g" \
   > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"

@@ -11,8 +11,6 @@ of the loop (max {{MAX_ITER}}).
 
 {{CONTEXT_NOTE}}
 
-{{CI_NOTE}}
-
 {{#local}}
 ## Where this review goes — read this first
 
