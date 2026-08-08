@@ -35,7 +35,10 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   : > "$THREAD_FILE"
   : > "$LATEST_INLINE_FILE"
 else
-  fetch_ai_thread > "$THREAD_FILE" || true
+  # A failed fetch fails the turn here, not at the review-missing guard
+  # below: dying there would misread a forge outage as a broken review.
+  fetch_ai_thread > "$THREAD_FILE" \
+    || die "could not fetch the AI thread — not answering a partial or empty one"
 
   # Same structural summary predicate as latest_ai_comment_iter /
   # ai_summary_posted: a tagged general note without the summary wrapper —

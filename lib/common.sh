@@ -1300,11 +1300,18 @@ gl_api_get() {
 # thread's discussion id. `path` / `line` / `in_reply_to_id` are null for
 # issue comments.
 fetch_ai_thread() {
+  # Buffered end to end: a failure after earlier pages, endpoints, or
+  # mapped records already produced output must yield NOTHING. A truncated
+  # thread can still carry a valid summary while silently missing later
+  # inline findings — and the readers that pipe this function (the resume
+  # high-water scan, the summary verifier's snapshot) must never adopt a
+  # partial thread as the real one.
+  local raw mapped
   case "$FORGE" in
-    gitlab) fetch_ai_thread_gitlab ;;
-    *)      fetch_ai_thread_github ;;
-  esac \
-  | jq -c '
+    gitlab) raw=$(fetch_ai_thread_gitlab) || return 1 ;;
+    *)      raw=$(fetch_ai_thread_github) || return 1 ;;
+  esac
+  mapped=$(jq -c '
       . as $c
       | ($c.body | capture("<!-- (?<tag>ai-loop:[a-z-]+)\\s+iter=(?<iter>[0-9]+) -->") ) as $m
       | { tag: $m.tag, iter: ($m.iter|tonumber),
@@ -1312,7 +1319,8 @@ fetch_ai_thread() {
           discussion_id: ($c.discussion_id // null),
           path: $c.path, line: $c.line,
           in_reply_to_id: $c.in_reply_to_id,
-          created_at: $c.created_at, body: $c.body }'
+          created_at: $c.created_at, body: $c.body }' <<<"$raw") || return 1
+  if [[ -n "$mapped" ]]; then printf '%s\n' "$mapped"; fi
 }
 
 # The ai-loop marker is PUBLIC — anyone who can comment on the PR can post
@@ -1325,13 +1333,16 @@ fetch_ai_thread() {
 # author is `.user.login`. `env.GH_USER` reads the exported value; if it
 # were empty the comparison excludes everything — fail closed.
 fetch_ai_thread_github() {
+  # The guard makes the FIRST endpoint's failure fail the whole read —
+  # the function's status is otherwise the second call's alone, and a
+  # dead issue-comments endpoint would yield half a thread with rc 0.
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
     --jq '.[]
           | select(.user.login == env.GH_USER)
           | select(.body | test("<!-- ai-loop:"))
           | {surface:"issue", id:.id, path:null, line:null,
-             in_reply_to_id:null, created_at, body}'
+             in_reply_to_id:null, created_at, body}' || return 1
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments" \
     --jq '.[]
@@ -1363,7 +1374,7 @@ fetch_ai_thread_github() {
 # >100-note thread mid-pagination — the GitHub path aborts on the equivalent
 # gh failure, and this must too.
 fetch_ai_thread_gitlab() {
-  local page=1 chunk
+  local page=1 chunk n
   while :; do
     chunk=$(gl_api_get "projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/discussions?per_page=100&page=${page}") \
       || return 1
@@ -1386,12 +1397,17 @@ fetch_ai_thread_gitlab() {
           path: $path,
           line: $line,
           in_reply_to_id: (if .id == $root then null else $root end),
-          created_at, body }' <<<"$chunk"
+          created_at, body }' <<<"$chunk" || return 1
     # Read until an EMPTY page: a page shorter than the requested 100 is
     # not proof of the end — a self-hosted server can clamp per_page
     # lower, and stopping there would silently truncate the thread
     # (resume would then restart a live MR at iter 1 and double-post).
-    (( $(jq 'length' <<<"$chunk") > 0 )) || break
+    # The guards on the jq calls matter: the buffering caller runs this
+    # function with errexit suppressed, so an unguarded failure would
+    # skip a page and keep going instead of aborting the read.
+    n=$(jq 'length' <<<"$chunk" 2>/dev/null) || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    (( n > 0 )) || break
     page=$((page + 1))
     if (( page > 200 )); then  # never spin on a broken API; fail closed
       log "WARNING: /discussions pagination passed 200 pages — aborting the thread read"

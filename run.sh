@@ -1542,8 +1542,13 @@ if (( LOCAL_MODE == 1 )); then
   (( LAST_CODEX  > ITER_FLOOR )) || LAST_CODEX=$ITER_FLOOR
   (( LAST_CLAUDE > ITER_FLOOR )) || LAST_CLAUDE=$ITER_FLOOR
 else
-  LAST_CODEX=$(latest_ai_comment_iter codex)
-  LAST_CLAUDE=$(latest_ai_comment_iter claude)
+  # || die: a failed thread read must name itself — resuming at iter 1 on
+  # a partial answer would double-post, and a bare set -e abort leaves no
+  # ERROR line for the operator or the log monitor.
+  LAST_CODEX=$(latest_ai_comment_iter codex) \
+    || die "could not read the AI thread for resume detection"
+  LAST_CLAUDE=$(latest_ai_comment_iter claude) \
+    || die "could not read the AI thread for resume detection"
 fi
 LAST_CODEX="${LAST_CODEX:-0}"
 LAST_CLAUDE="${LAST_CLAUDE:-0}"

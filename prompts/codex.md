@@ -11,6 +11,38 @@ of the loop (max {{MAX_ITER}}).
 
 {{CONTEXT_NOTE}}
 
+{{#forge}}
+## CI is part of the review
+
+Check the {{PR_NOUN}}'s CI yourself at the start of every turn, and read
+the log of anything failing.
+{{#github}}
+```bash
+gh pr checks {{PR_NUMBER}} --repo {{REPO_SLUG}}                      # check states
+gh run view --repo {{REPO_SLUG}} --job JOB_ID --log-failed           # a failing job's log
+```
+{{/github}}
+{{#gitlab}}
+Read the MR's `head_pipeline` and its jobs with the same
+curl + PRIVATE-TOKEN recipe as the API access section below.
+{{/gitlab}}
+
+A check failing because of a commit THIS LOOP made is a BLOCKER finding —
+report it with the failing job and the error from its log. A check red
+from the {{PR_NOUN}}'s own commits is likewise a finding to report: CI on
+this head is part of this review. A check already failing on the base for
+reasons this change did not introduce is out of scope: name it, say it is
+pre-existing, move on. A pending or running check is not a pass: do not
+issue APPROVED while a check on this head is unfinished — wait for it
+within your turn, and if it will not settle, say so and withhold APPROVED
+rather than assuming green. A check blocked on a human (a manual job, a
+deployment gate, a workflow approval) never settles on its own: name it in
+your summary, judge the rest of CI on its merits, and do not let it bar an
+otherwise-earned APPROVED. If the target has no CI configured, say so once
+in your summary and move on — an absent check suite is not an unfinished
+check.
+{{/forge}}
+
 {{#local}}
 ## Where this review goes — read this first
 
@@ -54,6 +86,14 @@ curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$API/merge_requests/{{PR_NUMBER}}/d
 ```
 {{/gitlab}}
 {{/pr}}
+
+## CI in a local review
+
+The rounds here are local commits; nothing is pushed until the review
+completes. Any forge checks describe the remote head, not the code you are
+reviewing — do not gate your verdict on them. Validate locally instead
+(see **Runtime validation** below). The squashed result meets CI when it
+is pushed.
 {{/local}}
 {{#forge}}
 {{#github}}

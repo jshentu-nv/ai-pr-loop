@@ -53,7 +53,46 @@ written later from the review record and the final diff.
 
 {{CONTEXT_NOTE}}
 
+{{#local}}
+## CI in a local review
+
+The rounds here are local commits; nothing is pushed until the review
+completes. Any forge checks describe the remote head, not your working
+tree — do not treat them as feedback on this round. Validate locally
+instead (see **Runtime validation** below). The squashed result meets CI
+when it is pushed.
+{{/local}}
+
 {{#forge}}
+## CI is part of the review
+
+Check the {{PR_NOUN}}'s CI at the start of your turn.
+{{#github}}
+```bash
+gh pr checks {{PR_NUMBER}} --repo {{REPO_SLUG}}                      # check states
+gh run view --repo {{REPO_SLUG}} --job JOB_ID --log-failed           # a failing job's log
+```
+{{/github}}
+{{#gitlab}}
+Read the MR's `head_pipeline` and its jobs with the same
+curl + PRIVATE-TOKEN recipe as the API access section below.
+{{/gitlab}}
+
+A check failing because of a commit THIS LOOP made in an earlier round is
+yours to fix in THIS round, whether or not the reviewer raised it — read
+the failing job's log (the review may already quote it — start there), fix
+the cause, and say so in your summary. If you cannot fix it inside this
+round, still post your summary: say what is red, why, and what remains —
+withholding the summary fails the turn without recording any of that. A
+check red from the {{PR_NOUN}}'s own commits reaches you as a reviewer
+finding — fix it like any other. A check that was already failing on the
+base for reasons this change did not introduce is out of scope: name it,
+say it is pre-existing, and leave it alone. A check still running when you
+finish is not a pass — say so in your summary rather than calling CI
+green. A check blocked on a human (a manual job, a deployment gate, a
+workflow approval) is not yours to clear: name it and move on. If the
+target has no CI configured, say so once and move on.
+
 {{#github}}
 ## GitHub API access
 

@@ -25,7 +25,11 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   rm -f "$REVIEW_FILE"
   : > "$THREAD_FILE"
 else
-  fetch_ai_thread > "$THREAD_FILE" || true
+  # A failed fetch fails the turn: reviewing against an empty or partial
+  # thread would re-raise settled findings and invent pushback responses.
+  # (A thread with no comments yet is rc 0 with empty output — fine.)
+  fetch_ai_thread > "$THREAD_FILE" \
+    || die "could not fetch the AI thread — not reviewing against a partial or empty one"
 fi
 
 PREV_ITER=$(( ITER - 1 ))
