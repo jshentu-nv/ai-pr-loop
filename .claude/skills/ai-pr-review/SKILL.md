@@ -283,6 +283,26 @@ Append any context the user supplied, e.g.
 shared by both agents). On a re-run to grant more iterations, omit them —
 stored context is reused automatically.
 
+**The CI policy is built into both agents' prompts** (the "CI is part of
+the review" sections in `prompts/codex.md` / `prompts/claude.md`), so every
+entry point gets it — launches through this skill and direct `run.sh` runs
+alike. In forge mode the agents read the target's checks themselves with
+the forge CLI. In `--local` mode the prompts direct local validation
+instead: forge checks describe the remote head, not the unpushed local
+rounds, and the squashed result meets CI when it is pushed.
+
+Pass CI context only to tailor that policy to the target, e.g. on the
+first launch for a PR (later re-runs reuse the stored copy):
+
+```
+--context "CI notes: the 'wheels' check is known-flaky — retry once before
+treating a failure as real. 'docs-lint' is red on the base; pre-existing."
+```
+
+If the user asks to skip CI, say so the same way ("Ignore CI for this
+review: <the user's reason>") — the agents weigh operator context as
+authoritative background alongside their prompts.
+
 Use the Bash tool with `run_in_background: true`. Note the returned task
 ID and output file path — you'll need both for the monitor.
 
@@ -324,6 +344,24 @@ Set `persistent: true` and a `timeout_ms` covering the expected run (e.g.
 count / completion. Stop the monitor with TaskStop after the bg task
 finishes.
 
+**Relay each round's report as it lands.** Every turn ends by logging its
+own summary — the reviewer's findings, the implementer's responses — and
+saving it to `iter-NN/codex-report.md` / `iter-NN/claude-report.md`. The
+announcement line
+
+```
+codex: iter 1 report (27 lines) -> …/iter-01/codex-report.md
+```
+
+fires one monitor event; the body follows it in the log between
+`----- BEGIN … -----` / `----- END … -----`, deliberately untagged so it
+does not flood the monitor. On that event, read the report and give the
+user the substance of the round — findings and severities for a codex
+turn, what was fixed and what was pushed back on for a claude turn. Do not
+hand-fetch the PR comments for this; the loop already captured it. Say
+plainly that the findings are the agent's, and that you have not verified
+them yourself unless you actually did.
+
 ### 6. Report the final state
 
 When the background `run.sh` completes, summarize:
@@ -342,7 +380,8 @@ When the background `run.sh` completes, summarize:
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
-stdout/stderr, fetched thread, codex verdict file).
+stdout/stderr, fetched thread, codex verdict file, and each turn's
+`codex-report.md` / `claude-report.md`).
 
 ## Resumability
 

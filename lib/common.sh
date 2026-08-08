@@ -87,6 +87,9 @@ AI_SUMMARY_JQ_DEF='
     | ($l[0] == "<!-- " + $m + " iter=" + ($it|tostring) + " -->")
       and (([ $l[1:][] | select(. != "") ])[0:2] ==
            [$alert, "> " + $bpfx + ($it|tostring) + ".**"]);
+  def is_summary_root($m; $alert; $bpfx; $it):
+    .tag==$m and .iter==$it and .surface=="issue" and .in_reply_to_id==null
+    and is_summary($m; $alert; $bpfx; $it);
 '
 
 CODEX_LABEL="AI · Codex Reviewer"
@@ -1297,11 +1300,18 @@ gl_api_get() {
 # thread's discussion id. `path` / `line` / `in_reply_to_id` are null for
 # issue comments.
 fetch_ai_thread() {
+  # Buffered end to end: a failure after earlier pages, endpoints, or
+  # mapped records already produced output must yield NOTHING. A truncated
+  # thread can still carry a valid summary while silently missing later
+  # inline findings — and the readers that pipe this function (the resume
+  # high-water scan, the summary verifier's snapshot) must never adopt a
+  # partial thread as the real one.
+  local raw mapped
   case "$FORGE" in
-    gitlab) fetch_ai_thread_gitlab ;;
-    *)      fetch_ai_thread_github ;;
-  esac \
-  | jq -c '
+    gitlab) raw=$(fetch_ai_thread_gitlab) || return 1 ;;
+    *)      raw=$(fetch_ai_thread_github) || return 1 ;;
+  esac
+  mapped=$(jq -c '
       . as $c
       | ($c.body | capture("<!-- (?<tag>ai-loop:[a-z-]+)\\s+iter=(?<iter>[0-9]+) -->") ) as $m
       | { tag: $m.tag, iter: ($m.iter|tonumber),
@@ -1309,7 +1319,8 @@ fetch_ai_thread() {
           discussion_id: ($c.discussion_id // null),
           path: $c.path, line: $c.line,
           in_reply_to_id: $c.in_reply_to_id,
-          created_at: $c.created_at, body: $c.body }'
+          created_at: $c.created_at, body: $c.body }' <<<"$raw") || return 1
+  if [[ -n "$mapped" ]]; then printf '%s\n' "$mapped"; fi
 }
 
 # The ai-loop marker is PUBLIC — anyone who can comment on the PR can post
@@ -1322,13 +1333,16 @@ fetch_ai_thread() {
 # author is `.user.login`. `env.GH_USER` reads the exported value; if it
 # were empty the comparison excludes everything — fail closed.
 fetch_ai_thread_github() {
+  # The guard makes the FIRST endpoint's failure fail the whole read —
+  # the function's status is otherwise the second call's alone, and a
+  # dead issue-comments endpoint would yield half a thread with rc 0.
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/issues/${PR_NUMBER}/comments" \
     --jq '.[]
           | select(.user.login == env.GH_USER)
           | select(.body | test("<!-- ai-loop:"))
           | {surface:"issue", id:.id, path:null, line:null,
-             in_reply_to_id:null, created_at, body}'
+             in_reply_to_id:null, created_at, body}' || return 1
   gh api --paginate \
     "repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments" \
     --jq '.[]
@@ -1353,14 +1367,14 @@ fetch_ai_thread_github() {
 # forged bot marker from another commenter can't steer resume state or the
 # implementer. The first note of a thread is its root; later notes map to
 # in_reply_to_id=<root id>. Pagination is manual (curl has no --paginate):
-# fetch 100-per-page until a short page. API failures (curl non-2xx,
+# fetch 100-per-page until an empty page. API failures (curl non-2xx,
 # non-array body) RETURN NON-ZERO rather than ending the loop quietly: a
 # swallowed failure here would make resume detection see an empty thread and
 # restart a live MR at iter 1 (double-posting), or silently truncate a
 # >100-note thread mid-pagination — the GitHub path aborts on the equivalent
 # gh failure, and this must too.
 fetch_ai_thread_gitlab() {
-  local page=1 chunk
+  local page=1 chunk n
   while :; do
     chunk=$(gl_api_get "projects/${PROJECT_ENC}/merge_requests/${PR_NUMBER}/discussions?per_page=100&page=${page}") \
       || return 1
@@ -1383,9 +1397,22 @@ fetch_ai_thread_gitlab() {
           path: $path,
           line: $line,
           in_reply_to_id: (if .id == $root then null else $root end),
-          created_at, body }' <<<"$chunk"
-    (( $(jq 'length' <<<"$chunk") < 100 )) && break
+          created_at, body }' <<<"$chunk" || return 1
+    # Read until an EMPTY page: a page shorter than the requested 100 is
+    # not proof of the end — a self-hosted server can clamp per_page
+    # lower, and stopping there would silently truncate the thread
+    # (resume would then restart a live MR at iter 1 and double-post).
+    # The guards on the jq calls matter: the buffering caller runs this
+    # function with errexit suppressed, so an unguarded failure would
+    # skip a page and keep going instead of aborting the read.
+    n=$(jq 'length' <<<"$chunk" 2>/dev/null) || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    (( n > 0 )) || break
     page=$((page + 1))
+    if (( page > 200 )); then  # never spin on a broken API; fail closed
+      log "WARNING: /discussions pagination passed 200 pages — aborting the thread read"
+      return 1
+    fi
   done
 }
 
@@ -1415,6 +1442,19 @@ post_ai_comment() {
   esac
 }
 
+# A bot's marker and summary-wrapper strings: hidden marker tag, alert
+# opener, banner prefix. Every consumer of the is_summary predicate
+# resolves them here so the three stay in step. Separated by the unit
+# separator (0x1f), which unlike tab is not IFS whitespace — an empty
+# field survives the read instead of shifting its neighbours.
+ai_marker_fields() {  # <codex|claude>
+  case "$1" in
+    codex)  printf '%s\x1f%s\x1f%s\n' "$CODEX_MARKER_TAG"  "$CODEX_SUMMARY_ALERT"  "$CODEX_SUMMARY_BANNER_PFX"  ;;
+    claude) printf '%s\x1f%s\x1f%s\n' "$CLAUDE_MARKER_TAG" "$CLAUDE_SUMMARY_ALERT" "$CLAUDE_SUMMARY_BANNER_PFX" ;;
+    *) die "unknown bot tag: $1" ;;
+  esac
+}
+
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
 # A summary is an issue-surface thread ROOT whose body opens with the bot's
 # structural summary wrapper for its own iteration (is_summary above): the
@@ -1426,18 +1466,12 @@ post_ai_comment() {
 # incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local marker alert banner
-  case "$tag" in
-    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
-    *) die "unknown tag: $tag" ;;
-  esac
+  local fields marker alert banner
+  fields=$(ai_marker_fields "$tag") || return 1
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
   fetch_ai_thread \
     | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
-        "$AI_SUMMARY_JQ_DEF"'
-         select(.tag==$t and .surface=="issue" and .in_reply_to_id==null)
-         | select(is_summary($t; $a; $b; .iter))
-         | .iter' \
+        "$AI_SUMMARY_JQ_DEF"'select(is_summary_root($t; $a; $b; .iter)) | .iter' \
     | sort -n | tail -1
 }
 
@@ -1447,28 +1481,172 @@ latest_ai_comment_iter() {
 # alone: an agent can print its verdict/completion marker even though the
 # summary POST failed, or die after posting only inline notes. A failed
 # thread fetch (or an empty thread) returns non-zero — fail closed.
-ai_summary_posted() {
-  local who="$1" iter="$2" marker alert banner
-  case "$who" in
-    codex)  marker="$CODEX_MARKER_TAG";  alert="$CODEX_SUMMARY_ALERT";  banner="$CODEX_SUMMARY_BANNER_PFX"  ;;
-    claude) marker="$CLAUDE_MARKER_TAG"; alert="$CLAUDE_SUMMARY_ALERT"; banner="$CLAUDE_SUMMARY_BANNER_PFX" ;;
-    *) die "unknown bot tag: $who" ;;
-  esac
-  fetch_ai_thread \
-    | jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
-        "$AI_SUMMARY_JQ_DEF"'
-         any(.[]; .tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null
-                  and is_summary($t; $a; $b; $it))' \
-    >/dev/null
+# $3 names the snapshot file the fetched thread lands in, so the caller
+# that needs the verified data afterwards (emit_round_report) reads what
+# this check was made against instead of fetching again.
+ai_summary_posted() {  # <codex|claude> <iter> <snapshot-file>
+  local who="$1" iter="$2" snap="$3" fields marker alert banner
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  # Fetch stderr stays on the turn's stderr: an auth or API failure here
+  # must reach the log, or 'summary not found' hides the real cause.
+  fetch_ai_thread > "$snap" || { rm -f "$snap"; return 1; }
+  jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
+     "$AI_SUMMARY_JQ_DEF"'any(.[]; is_summary_root($t; $a; $b; $it))' \
+     "$snap" >/dev/null
 }
 
 # Post-turn completion check with one short retry, absorbing forge
 # read-after-write lag on the comment list endpoints just after the POST.
-verify_ai_summary() {
-  local who="$1" iter="$2"
-  ai_summary_posted "$who" "$iter" && return 0
+verify_ai_summary() {  # <codex|claude> <iter> <snapshot-file>
+  local who="$1" iter="$2" snap="$3"
+  ai_summary_posted "$who" "$iter" "$snap" && return 0
   sleep 5
-  ai_summary_posted "$who" "$iter"
+  ai_summary_posted "$who" "$iter" "$snap"
+}
+
+# The thread snapshot the landed-probe verifies and emit_round_report
+# reads back. One builder keeps writer and reader on the same file.
+thread_snapshot_path() {  # <codex|claude> <iter>
+  printf '%s/thread.%s-post.ndjson\n' "$(iter_dir "$2")" "$1"
+}
+
+# True iff <who>'s iteration-$2 turn artifact is public: the written
+# review/response file in local mode, the verified summary comment in forge
+# mode. Both turn scripts probe through this so the completion contract
+# stays in one place. Forge mode saves the verified thread snapshot for
+# emit_round_report — the report must not depend on a second network read
+# succeeding after the verifying one already did.
+turn_artifact_landed() {  # <codex|claude> <iter>
+  local who="$1" iter="$2"
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    local_artifact_written "$who" "$iter"
+  else
+    verify_ai_summary "$who" "$iter" "$(thread_snapshot_path "$who" "$iter")"
+  fi
+}
+
+# --- Round reports --------------------------------------------------------------
+#
+# Each turn writes its summary for the PR thread, but the session driving the
+# loop reads the orchestrator's log. So every turn ends by saving its own
+# summary to iter-NN/<who>-report.md and printing it: the reviewer's findings
+# and the implementer's responses reach the operator through the stream they
+# are already watching, with no second fetch of the thread.
+#
+# One announcement line carries the bot tag ("codex: iter N report ..."); the
+# body lines deliberately do not, so a log monitor keyed on the bot tags fires
+# once per report instead of once per line.
+
+# Print <who>'s iteration-$2 summary body out of the thread snapshot $3.
+# Same structural predicate as ai_summary_posted — a tagged general note
+# without the summary wrapper is not a summary.
+extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
+  local who="$1" iter="$2" thread="$3" fields marker alert banner
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  # The -n matters: without it jq binds the first input to `.` and
+  # `inputs` collects only the rest, silently skipping the first comment.
+  # `first` keeps a double-posted summary (a landed POST plus its
+  # instructed retry) from rendering the report body twice.
+  jq -rn --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
+     "$AI_SUMMARY_JQ_DEF"'[ inputs | select(is_summary_root($t; $a; $b; $it)) ] | first // empty | .body' \
+     "$thread"
+}
+
+# How many body lines of a round report reach the log
+# (AI_REPORT_LOG_MAX_LINES, default 200). The rest stay in the report
+# file. Normalized where it is consumed, in emit_round_report: a malformed
+# value would otherwise blow up `head`/arithmetic there — after the round
+# already landed publicly — and turn a reporting problem into a failed
+# turn. Anything but a non-negative integer warns and uses 200.
+normalize_report_cap() {  # <value>
+  local z s
+  case "$1" in
+    ''|*[!0-9]*)
+      log "WARNING: AI_REPORT_LOG_MAX_LINES='$1' is not a non-negative integer — using 200"
+      printf '200\n'
+      ;;
+    *)
+      # Leading zeros are stripped as a STRING, by regex, before the
+      # length guard: guarding on the raw length would turn a zero-padded
+      # small value (0000000010) into the 1000000 fallback, arithmetic on
+      # the raw value could wrap past INT64 and make `head -n` drop the
+      # whole body, and a character-at-a-time strip goes quadratic on a
+      # huge value. After the strip, a value beyond 9 digits caps at
+      # 1000000 — effectively "log everything", kept finite.
+      if [[ "$1" =~ ^0*([0-9]+)$ ]]; then
+        s="${BASH_REMATCH[1]}"
+      else
+        s=0  # unreachable: the case arm above admits only digits
+      fi
+      if (( ${#s} > 9 )); then
+        log "WARNING: AI_REPORT_LOG_MAX_LINES='$1' exceeds 9 digits — using 1000000"
+        s=1000000
+      fi
+      printf '%s\n' "$s"
+      ;;
+  esac
+}
+
+# Save and log <who>'s iteration-$2 report. Callers reach this only once the
+# summary is verified, so the body exists. Any failure here is a reporting
+# failure and returns 0 regardless: the review already landed publicly, and
+# failing the turn over a missing log line would repost the entire round.
+emit_round_report() {  # <codex|claude> <iter>
+  local who="$1" iter="$2" id report thread total line cap
+  id=$(iter_dir "$iter")
+  report="$id/$who-report.md"
+  # Cleanup failures are reporting failures too: an unremovable or
+  # colliding path (say, a directory squatting on the report name) warns
+  # and returns 0 — it must not abort a turn that already completed, and
+  # a path this function did not create is never deleted recursively.
+  if ! rm -f "$report" 2>/dev/null || [[ -e "$report" ]]; then
+    log "$who: WARNING — iter $iter report path $report is occupied or unremovable; report not captured for the log"
+    return 0
+  fi
+
+  cap=$(normalize_report_cap "${AI_REPORT_LOG_MAX_LINES:-200}")
+
+  if [[ "$LOCAL_MODE" == "1" ]]; then
+    cp -f "$(local_artifact_path "$who" "$iter")" "$report" 2>/dev/null || true
+  else
+    # turn_artifact_landed saved the thread snapshot it verified; extract
+    # from that first. Fetch only when the snapshot is missing or holds no
+    # summary — a fresh network read can fail transiently right after the
+    # verifying one succeeded, and this report has no later chance.
+    thread=$(thread_snapshot_path "$who" "$iter")
+    if [[ -s "$thread" ]]; then
+      extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
+    fi
+    if [[ ! -s "$report" ]] && fetch_ai_thread > "$thread" 2>/dev/null; then
+      extract_ai_summary_body "$who" "$iter" "$thread" > "$report" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ ! -s "$report" ]]; then
+    rm -f "$report" 2>/dev/null || true
+    log "$who: WARNING — iter $iter report could not be captured for the log"
+    return 0
+  fi
+
+  total=$(grep -c '' "$report" 2>/dev/null || echo 0)
+  log "$who: iter $iter report ($total lines) -> $report"
+  log "----- BEGIN $who report (iter $iter) -----"
+  # `|| [[ -n "$line" ]]` keeps a final line that lacks a trailing newline —
+  # local mode copies agent-written files verbatim, and those often end
+  # without one.
+  # cap 0 logs no body at all; BSD head rejects `-n 0`, so skip the read.
+  if (( cap > 0 )); then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      log "  $line"
+    done < <(head -n "$cap" "$report")
+  fi
+  if (( total > cap )); then
+    log "  [$(( total - cap )) more line(s) — read $report]"
+  fi
+  log "----- END $who report (iter $iter) -----"
+  return 0
 }
 
 # --- Portable watchdog ----------------------------------------------------------

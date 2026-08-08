@@ -35,19 +35,16 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   : > "$THREAD_FILE"
   : > "$LATEST_INLINE_FILE"
 else
-  fetch_ai_thread > "$THREAD_FILE" || true
+  # A failed fetch fails the turn here, not at the review-missing guard
+  # below: dying there would misread a forge outage as a broken review.
+  fetch_ai_thread > "$THREAD_FILE" \
+    || die "could not fetch the AI thread — not answering a partial or empty one"
 
   # Same structural summary predicate as latest_ai_comment_iter /
   # ai_summary_posted: a tagged general note without the summary wrapper —
   # even one quoting the banner in its prose, e.g. an inline finding that
   # lost its position — must not be mistaken for the review to answer.
-  jq -r --arg t "$CODEX_MARKER_TAG" --arg a "$CODEX_SUMMARY_ALERT" \
-     --arg b "$CODEX_SUMMARY_BANNER_PFX" --argjson it "$ITER" \
-     "$AI_SUMMARY_JQ_DEF"'
-      select(.tag==$t and .iter==$it and .surface=="issue" and .in_reply_to_id==null)
-      | select(is_summary($t; $a; $b; $it))
-      | .body' \
-      "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
+  extract_ai_summary_body codex "$ITER" "$THREAD_FILE" > "$LATEST_REVIEW_FILE"
 
   jq -c --arg t "$CODEX_MARKER_TAG" --argjson it "$ITER" '
       select(.tag==$t and .iter==$it and .surface=="inline")
@@ -74,6 +71,7 @@ if [[ "${HAS_CONTEXT:-0}" == "1" ]]; then
 else
   CONTEXT_NOTE=''
 fi
+
 
 # Render the prompt. GitLab loops use the gitlab prompt variant — same
 # implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -129,28 +127,44 @@ set -e
 
 log "claude: iter $ITER — exit $RC"
 
+# The turn's completion contract — the summary comment in forge mode, the
+# written response file in local mode. The prompt produces it LAST, after
+# every fix and reply, so the stdout marker alone isn't proof of completion:
+# a failed POST or a crash mid-reply would otherwise advance the loop past a
+# half-done response. Probed BEFORE the failure exits below, as in
+# codex_turn.sh: a response that LANDED is a real, public reply even when
+# the CLI then died or lost its stdout marker, and resume advances past this
+# iteration on that artifact — so its round report is emitted here or never.
+RESPONSE_LANDED=0
+turn_artifact_landed claude "$ITER" && RESPONSE_LANDED=1
+
+if (( RESPONSE_LANDED == 1 )); then
+  emit_round_report claude "$ITER"
+fi
+
 if [[ $RC -ne 0 ]]; then
   log "claude stderr (tail):"
   tail -20 "$ID/claude.stderr" >&2 || true
+  if (( RESPONSE_LANDED == 1 )); then
+    log "claude: the iter $ITER response landed before the CLI failure — round report captured"
+  fi
   exit 1
 fi
 
 if ! grep -q '\[CLAUDE_TURN: COMPLETE\]' "$ID/claude.stdout"; then
   log "claude: missing [CLAUDE_TURN: COMPLETE] marker — assuming partial"
+  if (( RESPONSE_LANDED == 1 )); then
+    log "claude: the iter $ITER response landed despite the missing marker — round report captured"
+  fi
   exit 1
 fi
 
-# The stdout marker alone isn't proof of completion: the written response is
-# the turn's contract (produced last, after every fix and reply), and a failed
-# POST or a crash mid-reply would otherwise advance the loop past a half-done
-# response. Require this iteration's response artifact.
-if [[ "$LOCAL_MODE" == "1" ]]; then
-  if ! local_artifact_written claude "$ITER"; then
+if (( RESPONSE_LANDED == 0 )); then
+  if [[ "$LOCAL_MODE" == "1" ]]; then
     log "claude: iter $ITER response file $RESPONSE_FILE is missing or empty — failing the turn (stdout marker ignored)"
-    exit 1
+  else
+    log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
   fi
-elif ! verify_ai_summary claude "$ITER"; then
-  log "claude: iter $ITER summary comment not found on the PR — failing the turn (stdout marker ignored)"
   exit 1
 fi
 
