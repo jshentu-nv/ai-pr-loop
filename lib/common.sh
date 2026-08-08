@@ -1597,7 +1597,14 @@ emit_round_report() {  # <codex|claude> <iter>
   local who="$1" iter="$2" id report thread total line cap
   id=$(iter_dir "$iter")
   report="$id/$who-report.md"
-  rm -f "$report"
+  # Cleanup failures are reporting failures too: an unremovable or
+  # colliding path (say, a directory squatting on the report name) warns
+  # and returns 0 — it must not abort a turn that already completed, and
+  # a path this function did not create is never deleted recursively.
+  if ! rm -f "$report" 2>/dev/null || [[ -e "$report" ]]; then
+    log "$who: WARNING — iter $iter report path $report is occupied or unremovable; report not captured for the log"
+    return 0
+  fi
 
   cap=$(normalize_report_cap "${AI_REPORT_LOG_MAX_LINES:-200}")
 
@@ -1618,7 +1625,7 @@ emit_round_report() {  # <codex|claude> <iter>
   fi
 
   if [[ ! -s "$report" ]]; then
-    rm -f "$report"
+    rm -f "$report" 2>/dev/null || true
     log "$who: WARNING — iter $iter report could not be captured for the log"
     return 0
   fi

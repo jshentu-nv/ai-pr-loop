@@ -1346,6 +1346,32 @@ else
   bad "local review body absent from the log"
 fi
 
+t "emit_round_report: a directory squatting on the report path warns, never fails"
+# The turn already completed when this runs; an unremovable report path
+# must warn and return 0 under the caller's set -e, not abort the turn.
+mkdir -p "$WORK/rptdir/state/iter-01/codex-report.md"
+printf 'local review body\n' > "$WORK/rptdir/state/iter-01/codex-review.md"
+RPTD=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  set -euo pipefail
+  STATE_DIR='$WORK/rptdir/state'
+  LOCAL_MODE=1
+  . '$ROOT/lib/common.sh'
+  emit_round_report codex 1
+  echo EMIT_OK" 2>&1)
+if grep -qF 'EMIT_OK' <<<"$RPTD" && grep -qF 'WARNING' <<<"$RPTD"; then
+  ok
+else
+  bad "unremovable report path aborted the turn (log: $(tr '\n' '|' <<<"$RPTD"))"
+fi
+
+t "emit_round_report: the squatting directory is not deleted"
+# A path this function did not create is never removed recursively.
+if [[ -d "$WORK/rptdir/state/iter-01/codex-report.md" ]]; then
+  ok
+else
+  bad "the colliding directory was deleted"
+fi
+
 t "emit_round_report: local mode leaves the review artifact in place"
 if [[ -s "$WORK/rptlocal/state/iter-01/codex-review.md" ]]; then
   ok
