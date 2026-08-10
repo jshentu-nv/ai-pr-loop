@@ -670,10 +670,32 @@ audit_branch_free() {  # <name>
   return 0
 }
 
+# The branch the operator had checked out is the one thing an audit
+# promises never to write. A turn runs with the operator's authority, so
+# this cannot be prevented — but it must never pass unnoticed. Snapshot it
+# around every turn and fail loudly if it moved, restoring it first: the
+# excursion stays in the reflog, the branch does not.
+AUDIT_TARGET_SHA=''
+audit_target_snapshot() {
+  (( AUDIT == 1 )) || return 0
+  AUDIT_TARGET_SHA=$(git -C "$REPO_DIR" rev-parse --verify --quiet "refs/heads/$AUDIT_PR_BASE" 2>/dev/null || true)
+}
+audit_target_verify() {  # <what ran>
+  (( AUDIT == 1 )) || return 0
+  local now
+  now=$(git -C "$REPO_DIR" rev-parse --verify --quiet "refs/heads/$AUDIT_PR_BASE" 2>/dev/null || true)
+  [[ "$now" == "$AUDIT_TARGET_SHA" ]] && return 0
+  if [[ -n "$AUDIT_TARGET_SHA" ]]; then
+    git_safe -C "$REPO_DIR" update-ref "refs/heads/$AUDIT_PR_BASE" "$AUDIT_TARGET_SHA" \
+      || log "audit: WARNING — could not restore '$AUDIT_PR_BASE' to $AUDIT_TARGET_SHA"
+  fi
+  die "$1 moved '$AUDIT_PR_BASE' (from ${AUDIT_TARGET_SHA:-absent} to ${now:-absent}) — an audit never writes the branch it targets; it has been put back, and the run stops so the turn's work can be inspected"
+}
+
 audit_setup_branch() {
   local leaf orig="$HEAD_REF" head stem cand i
   leaf=$(audit_leaf_dir "$HEAD_REF")
-  if [[ -s "$leaf/local/audit-pr-base" ]]; then
+  if AUDIT_PR_BASE=$(read_receipted "$leaf/local/audit-pr-base"); then
     # Resuming: the checkout is already on the review branch this audit
     # created. Its base is the one recorded when it started — never
     # recomputed, or a resume would redefine the squash range.
@@ -689,7 +711,6 @@ audit_setup_branch() {
       BASE_ARG=$(git -C "$REPO_DIR" rev-parse --verify --quiet 'HEAD^{commit}') \
         || die "could not read HEAD in $REPO_DIR"
     fi
-    AUDIT_PR_BASE=$(<"$leaf/local/audit-pr-base")
     [[ -z "$PR_BRANCH_ARG" || "$PR_BRANCH_ARG" == "$HEAD_REF" ]] \
       || die "--pr-branch '$PR_BRANCH_ARG' disagrees with the audit already running on '$HEAD_REF' — finish or --restart it before renaming"
     log "audit: resuming on '$HEAD_REF' (PR base '$AUDIT_PR_BASE')"
@@ -729,8 +750,19 @@ audit_setup_branch() {
   # branch review's own caller-clone check runs later, but a switch here
   # would already carry uncommitted work onto the new branch.
   verify_caller_clone_clean "$REPO_DIR"
+  # The marker is written BEFORE the branch is checked out, and against the
+  # branch about to be created. run.sh executes three times per invocation —
+  # front-end, supervisor, worker — and each one resolves the checkout. A
+  # marker written any later (at ensure_state_dir, past the role handoff)
+  # would be invisible to the roles that follow: each would find the
+  # checkout on the previous role's review branch, read no marker, conclude
+  # "fresh audit", and create another branch nested inside it.
+  mkdir -p "$(audit_leaf_dir "$cand")/local"
+  write_receipted "$(audit_leaf_dir "$cand")/local/audit-pr-base" "$orig" \
+    || die "could not record the audit's PR base for '$cand'"
   git_safe -C "$REPO_DIR" checkout --quiet -b "$cand" \
-    || die "could not create the review branch '$cand' in $REPO_DIR"
+    || { rm -f "$(audit_leaf_dir "$cand")/local/audit-pr-base"{,.receipt}
+         die "could not create the review branch '$cand' in $REPO_DIR"; }
   HEAD_REF="$cand"
   BASE_ARG="$head"
   AUDIT_PR_BASE="$orig"
@@ -1409,13 +1441,13 @@ fi
 
 ensure_state_dir
 export STATE_DIR
-# An audit's one piece of extra state: the branch its PR/MR targets. Written
-# on the invocation that creates the review branch, and from then on the
-# marker that tells finalize to open a PR/MR at all.
-if (( AUDIT == 1 )) && [[ -n "$AUDIT_PR_BASE" ]] && [[ ! -s "$STATE_DIR/local/audit-pr-base" ]]; then
-  mkdir -p "$STATE_DIR/local"
-  write_state_atomic "$STATE_DIR/local/audit-pr-base" "$AUDIT_PR_BASE" \
-    || die "could not record the audit's PR base at $STATE_DIR/local/audit-pr-base"
+# audit-pr-base is written by audit_setup_branch, before the branch is even
+# checked out — it has to survive the role handoff. Assert the dir it landed
+# in is the one this run resolved: they are derived from the same branch
+# name, so a mismatch means the two derivations disagree.
+if (( AUDIT == 1 )) && [[ -n "$AUDIT_PR_BASE" ]]; then
+  [[ "$(read_receipted "$STATE_DIR/local/audit-pr-base" 2>/dev/null)" == "$AUDIT_PR_BASE" ]] \
+    || die "internal: the audit's PR base is not recorded at $STATE_DIR/local/audit-pr-base"
 fi
 RUN_LOG="$STATE_DIR/run.log"
 : > "$RUN_LOG"
@@ -1909,9 +1941,11 @@ while (( RUNS < MAX_ITER )); do
   else
     # Codex review.
     set +e
+    audit_target_snapshot
     bash "$LOOP_HOME/codex_turn.sh"
     CODEX_RC=$?
     set -e
+    audit_target_verify "the codex review turn"
 
     case "$CODEX_RC" in
       0)  log "codex APPROVED on iter $ITER"
@@ -1956,9 +1990,11 @@ while (( RUNS < MAX_ITER )); do
     write_state_atomic "$(local_pending_turn_file)" "pending $ITER $_pretip"
   fi
   set +e
+  audit_target_snapshot
   bash "$LOOP_HOME/claude_turn.sh"
   CLAUDE_RC=$?
   set -e
+  audit_target_verify "the claude implementer turn"
 
   if [[ $CLAUDE_RC -ne 0 ]]; then
     log "claude turn failed on iter $ITER (rc=$CLAUDE_RC)"

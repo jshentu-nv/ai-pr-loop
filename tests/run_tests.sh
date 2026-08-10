@@ -6983,6 +6983,86 @@ assert_substr "$WORK/aud.out" 'Everything up-to-date'
 assert_eq "$(cat "$(audit_state)/local/completed.sha" 2>/dev/null)" \
           "$(git -C "$AR_CLONE" rev-parse "$(audit_branch)")"
 
+t "run.sh --audit: a SUPERVISED run creates exactly one review branch"
+# The default invocation. run.sh executes three times per invocation —
+# front-end, supervisor, worker — and each resolves the checkout. Before the
+# marker was made durable at branch-creation time, every role read no marker,
+# concluded "fresh audit", and created another branch nested in the last.
+audit_repo
+printf 'APPROVED\n' > "$WORK/aud-verdicts"
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/aud-argv" \
+  CODEX_HOME="$WORK/codex-home" GH_TOKEN=t \
+  STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" \
+  "$BASH_BIN" "$AR_HOME/run.sh" --local --audit --dir "$AR_CLONE" --max 1 \
+  > "$WORK/aud-sup.out" 2>&1
+assert_eq "$(git -C "$AR_CLONE" for-each-ref --format='%(refname)' 'refs/heads/ai-review/' | wc -l)" 1
+
+t "run.sh --audit: a supervised run leaves the target branch alone"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: the supervisor and the worker share one state dir"
+assert_eq "$(ls -d "$AR_HOME"/state/local__*/branch-ai-review* 2>/dev/null | wc -l)" 1
+
+t "audit receipts: a tampered PR base is refused rather than published"
+# The state dir is handed to every agent turn, so a bare file there proves
+# nothing about who wrote it.
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+# The sabotage lands during a ROUND, so the finalize that follows reads it —
+# finalize reads the file at startup, before its own closing turn runs.
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." \
+  STUB_CLAUDE_SH='printf "attacker/branch\n" > "$STATE_DIR/local/audit-pr-base"' --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" 'no valid orchestrator receipt'
+# The rounds themselves still ran (the tamper is only detected at finalize),
+# but nothing was published: no PR/MR, no terminal marker.
+if [[ -e "$(audit_state)/local/completed.sha" ]]; then
+  bad "a tampered PR base completed the review"; else ok; fi
+
+t "audit receipts: a forged PR URL does not complete the review"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." \
+  STUB_FINALIZE_SH='printf "https://evil.invalid/fake/1\n" > "$STATE_DIR/local/pr-url"' \
+  STUB_OPENPR_SILENT=1 --max 4
+assert_eq "$AUD_RC" 1
+if [[ -e "$(audit_state)/local/completed.sha" ]]; then
+  bad "a forged pr-url completed the review"; else ok; fi
+
+t "audit receipts: an honest PR URL round-trips and completes"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." --max 4
+assert_eq "$AUD_RC" 0
+assert_eq "$(cat "$(audit_state)/local/pr-url")" 'https://github.com/o/n/pull/123'
+if [[ -s "$(audit_state)/local/pr-url.receipt" ]]; then ok; else bad "no receipt beside pr-url"; fi
+
+t "run.sh --audit: a turn that moves the target branch is caught and undone"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 \
+  STUB_CLAUDE_SH='git update-ref refs/heads/feature/x HEAD' --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "never writes the branch it targets"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: a foreign branch appearing on origin refuses the push"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+_stem="ai-review/feature/x-$(git -C "$AR_CLONE" rev-parse HEAD | cut -c1-8)"
+git -C "$AR_REMOTE" update-ref "refs/heads/$_stem" \
+  "$(git -C "$AR_CLONE" rev-parse refs/heads/main)"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." --max 4
+# The name is taken on origin, so setup picks the next free one; either way
+# the foreign branch must be untouched.
+assert_eq "$(git -C "$AR_REMOTE" rev-parse "refs/heads/$_stem")" \
+          "$(git -C "$AR_CLONE" rev-parse refs/heads/main)"
+
 t "run.sh --audit: --stop resolves the audit's state dir and creates no branch"
 audit_repo
 run_audit --stop

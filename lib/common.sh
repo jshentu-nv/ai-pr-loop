@@ -120,6 +120,54 @@ write_state_atomic() {  # <path> <content>
     && mv -f "$1.tmp" "$1"
 }
 
+# --- Orchestrator receipts ----------------------------------------------
+#
+# Agent turns run with the operator's authority and get --add-dir on the
+# state dir, so any file there could have been written by a turn rather
+# than by this script. For state the orchestrator ACTS on — the branch an
+# audit's PR/MR targets, the URL that marks it complete — that matters: a
+# turn could write one and redirect or short-circuit publication.
+#
+# A receipt is a keyed digest of the value, written beside it under a key
+# that lives outside the state dir (in the loop's own private dir, which is
+# not handed to any turn). A turn can write the value; it cannot forge the
+# receipt without the key, so the orchestrator only honours values it
+# wrote itself. This is not a defence against an operator-authority
+# attacker — nothing here can be — it is what keeps an ordinary confused
+# or over-helpful turn from steering publication.
+
+# The per-loop receipt key, created on first use with owner-only permissions.
+receipt_key_file() { printf '%s/.receipt-key\n' "$LOOP_HOME"; }
+receipt_key() {
+  local f; f=$(receipt_key_file)
+  if [[ ! -s "$f" ]]; then
+    ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$f.tmp" \
+      && mv -f "$f.tmp" "$f" ) || return 1
+  fi
+  cat "$f"
+}
+# A value's receipt: a digest over the key, the file's identity, and the
+# value. git hash-object is already a dependency, so no extra hasher.
+receipt_of() {  # <path> <value>
+  printf '%s\0%s\0%s' "$(receipt_key)" "${1##*/}" "$2" | git hash-object --stdin
+}
+# Write a value AND its receipt. The receipt lands first: a torn write must
+# read as "no valid receipt" (rejected), never as a valid one for a value
+# that was not written.
+write_receipted() {  # <path> <value>
+  write_state_atomic "$1.receipt" "$(receipt_of "$1" "$2")" \
+    && write_state_atomic "$1" "$2"
+}
+# Print a value only when its receipt proves the orchestrator wrote it.
+# Anything else — no file, no receipt, a mismatch — prints nothing, rc 1.
+read_receipted() {  # <path>
+  local v
+  [[ -s "$1" && -s "$1.receipt" ]] || return 1
+  v=$(<"$1")
+  [[ "$(<"$1.receipt")" == "$(receipt_of "$1" "$v")" ]] || return 1
+  printf '%s\n' "$v"
+}
+
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {

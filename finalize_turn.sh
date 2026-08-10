@@ -40,9 +40,16 @@ BASELINE_FILE="$LOCAL_DIR/metadata-baseline.json"   # pr scope only
 # branch was created. Its presence is what makes this an audit.
 AUDIT_PR_BASE_FILE="$LOCAL_DIR/audit-pr-base"
 PR_URL_FILE="$LOCAL_DIR/pr-url"
+# Both of these are read through their receipts: the state dir is handed to
+# every agent turn, so a bare file there proves nothing about who wrote it.
+# A turn that wrote its own audit-pr-base would retarget the PR/MR; one that
+# wrote its own pr-url would mark the review complete with no PR/MR at all.
 AUDIT_PR_BASE=''
-[[ -s "$AUDIT_PR_BASE_FILE" ]] && AUDIT_PR_BASE=$(<"$AUDIT_PR_BASE_FILE")
+AUDIT_PR_BASE=$(read_receipted "$AUDIT_PR_BASE_FILE" 2>/dev/null) || AUDIT_PR_BASE=''
 IS_AUDIT=0; [[ -n "$AUDIT_PR_BASE" ]] && IS_AUDIT=1
+if (( IS_AUDIT == 0 )) && [[ -s "$AUDIT_PR_BASE_FILE" ]]; then
+  die "$AUDIT_PR_BASE_FILE carries no valid orchestrator receipt — refusing to publish against a target this run did not record. Remove $LOCAL_DIR to start a fresh review"
+fi
 
 # Record a finalize outcome that has not landed terminally yet — the tip it
 # covers and what it is — as one atomic journal write.
@@ -89,7 +96,7 @@ open_pr_turn() {
   local d="$LOCAL_DIR/open-pr" skill="$HERE/.claude/skills/open-pr" rc
   mkdir -p "$d"
   [[ -s "$skill/SKILL.md" ]] || { log "finalize: the open-pr skill is missing at $skill/SKILL.md"; return 1; }
-  rm -f "$PR_URL_FILE"
+  rm -f "$PR_URL_FILE" "$PR_URL_FILE.receipt"
   # Branch names go through the environment, never through sed: a branch
   # name can carry sed metacharacters, and --pr-branch is operator input.
   sed \
@@ -520,6 +527,19 @@ fi
 [[ "$(origin_dest)" == "$(<"$(local_origin_file)")" ]] \
   || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$(<"$(local_origin_file)")" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
 
+# The remote value the lease below pins. Empty means "must not exist yet",
+# which is what --force-with-lease encodes as the empty expected value.
+AUDIT_REMOTE_BEFORE=''
+if (( IS_AUDIT == 1 )) && git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
+  AUDIT_REMOTE_BEFORE=$(git -C "$REPO_DIR" ls-remote origin "refs/heads/$HEAD_REF" 2>/dev/null | awk '{print $1; exit}') \
+    || die "could not read origin's copy of '$HEAD_REF' — refusing to push blind"
+  if [[ -n "$AUDIT_REMOTE_BEFORE" && "$AUDIT_REMOTE_BEFORE" != "$HEAD_SHA" ]]; then
+    # Not this review's squash, and not a branch the loop may move.
+    git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_SHA" "$AUDIT_REMOTE_BEFORE" 2>/dev/null \
+      || die "origin already has a branch '$HEAD_REF' at $AUDIT_REMOTE_BEFORE, which this review never created — the loop never overwrites a branch it did not create. --restart the audit with --pr-branch NAME to publish under another name"
+  fi
+fi
+
 if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
   # A supported terminal state, not a held one: with nowhere to push, the
   # squashed commit on the branch IS the review's outcome.
@@ -536,7 +556,18 @@ fi
 # controls, running with the orchestrator's authority AFTER the destination
 # was validated — this push is mechanical, so no hook may run under it.
 log "finalize: pushing $HEAD_SHA to origin"
-if ! git_safe -C "$REPO_DIR" push origin "HEAD:refs/heads/$HEAD_REF" >&2; then
+# An audit's review branch is one the loop created, so on the remote it must
+# either not exist or already be this squash. A plain push would silently
+# fast-forward a same-named branch someone else created between the probe
+# and here; --force-with-lease pins the expected remote value instead, so
+# that race is refused rather than won. Never --force: the lease only
+# permits the state this run reasoned about.
+if (( IS_AUDIT == 1 )); then
+  if ! git_safe -C "$REPO_DIR" push --force-with-lease="refs/heads/$HEAD_REF:$AUDIT_REMOTE_BEFORE" \
+       origin "HEAD:refs/heads/$HEAD_REF" >&2; then
+    die "push of '$HEAD_REF' was refused — origin's copy is not what this review saw (a branch of that name appeared or moved while the review ran). The squashed commit is in $REPO_DIR at $HEAD_SHA; reconcile it there; the loop never force-pushes over another branch"
+  fi
+elif ! git_safe -C "$REPO_DIR" push origin "HEAD:refs/heads/$HEAD_REF" >&2; then
   die "push of $HEAD_SHA was rejected (the branch moved while the review ran?). The squashed commit is in $REPO_DIR at $HEAD_SHA — reconcile it there and push manually; the loop never force-pushes"
 fi
 # An audit is not finished by the push: its deliverable is the PR/MR that
@@ -545,15 +576,22 @@ fi
 # are the agent's to work out. It runs here, after the push, because a
 # PR/MR cannot target a branch the forge has not seen.
 if (( IS_AUDIT == 1 )); then
-  if [[ -s "$PR_URL_FILE" ]]; then
-    log "finalize: the PR/MR for '$HEAD_REF' is already recorded: $(<"$PR_URL_FILE")"
+  if PR_URL=$(read_receipted "$PR_URL_FILE"); then
+    log "finalize: the PR/MR for '$HEAD_REF' is already recorded: $PR_URL"
   else
     open_pr_turn \
       || die "could not open the PR/MR for '$HEAD_REF' -> '$AUDIT_PR_BASE'. The branch is pushed at $HEAD_SHA and the composed text is at $TITLE_FILE / $DESC_FILE — re-run to retry"
-    log "finalize: opened $(<"$PR_URL_FILE")"
+    PR_URL=$(<"$PR_URL_FILE")
+    # The turn's own output is not a receipt: bind it here, so a retry
+    # after a FAILED turn cannot adopt a URL the orchestrator never
+    # accepted. open_pr_turn removes the file before the turn runs, so what
+    # is bound is always this turn's result.
+    write_receipted "$PR_URL_FILE" "$PR_URL" \
+      || die "could not record the PR/MR URL at $PR_URL_FILE"
+    log "finalize: opened $PR_URL"
   fi
   mark_completed "$HEAD_SHA"
-  log "finalize: done — one commit ($HEAD_SHA) on '$HEAD_REF', $(<"$PR_URL_FILE")"
+  log "finalize: done — one commit ($HEAD_SHA) on '$HEAD_REF', $PR_URL"
   exit 0
 fi
 
