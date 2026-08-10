@@ -579,13 +579,18 @@ fi
 
 if [[ "$LOCAL_SCOPE" == "branch" ]]; then
   # The checkout is the target, so it must exist and be a work tree now (a
-  # forge-targeted run may still be about to clone one).
+  # forge-targeted run may still be about to clone one). Its branch is part
+  # of the identity every state path below is keyed by, so resolve it here —
+  # before the supervisor/--stop state path is computed, which reads it
+  # through repo_ident.
   [[ -d "$REPO_DIR" ]] || die "no such directory: $REPO_DIR (pass --dir, or run from inside the checkout)"
   REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P) \
     || die "could not resolve $REPO_DIR"
   REPO_DIR="$REPO_DIR_CANON"
   git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not a git work tree: $REPO_DIR"
+  HEAD_REF=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD) \
+    || die "HEAD in $REPO_DIR is detached — check out the branch you want reviewed"
 else
   [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -637,8 +642,9 @@ fi
 #
 # The state path is the one ensure_state_dir computes; the front-end and the
 # supervisor need it before the run is authenticated, so they derive it from
-# the resolved forge identity alone.
-PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
+# the resolved identity alone — through the same two helpers, so a scope
+# whose leaf is not pr-<N> gets the dir its worker will actually use.
+PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/$(state_leaf_name)"
 
 # TERM the supervisor and everything it started. A detached supervisor leads
 # its own process group, so the signal reaches its worker and the agents too;
@@ -1181,11 +1187,10 @@ fi
 
 case "$FORGE" in
   local)
-    # No PR/MR: the branch under review is the one the checkout has out (a
-    # detached HEAD has no branch to commit onto or push), and the base is
-    # whatever --base resolves to in this checkout.
-    HEAD_REF=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD) \
-      || die "HEAD in $REPO_DIR is detached — check out the branch you want reviewed"
+    # No PR/MR: the branch under review is the one the checkout had out when
+    # this run started (resolved with the checkout, above, because the state
+    # path is keyed by it), and the base is whatever --base resolves to in
+    # this checkout.
     BASE_REF="$BASE_ARG"
     LOCAL_BASE_SHA=$(git -C "$REPO_DIR" rev-parse --verify --quiet --end-of-options "${BASE_ARG}^{commit}") \
       || die "--base '$BASE_ARG' does not resolve to a commit in $REPO_DIR"

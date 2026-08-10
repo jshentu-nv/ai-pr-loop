@@ -6268,6 +6268,33 @@ run_e2e() {  # [VAR=VAL ...] [args ...]
 }
 e2e_state() { echo "$E2E_HOME"/state/local__*/branch-*; }
 e2e_iters() { ls -d "$(e2e_state)"/iter-* 2>/dev/null | wc -l; }
+run_e2e_raw() {  # run.sh from $E2E_HOME with no --no-auto-resume appended
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" CODEX_HOME="$WORK/codex-home" \
+    "$BASH_BIN" "$E2E_HOME/run.sh" "$@" > "$WORK/e2e.out" 2>&1
+  E2E_RC=$?
+}
+
+# --- the state path the front-end and the supervisor derive ----------------
+#
+# Every entry point that runs before the branch is discovered computes the
+# state dir from the resolved identity. A PR-less scope has no PR number, so
+# deriving the leaf as pr-<N> both crashed on the unset branch name and, past
+# that, pointed the supervisor at a different dir than its worker.
+
+t "run.sh: --stop on a PR-less local review resolves the branch's state dir"
+e2e_fixture
+run_e2e_raw --local --base main --dir "$E2E_CLONE" --stop
+assert_eq "$E2E_RC" 0
+if [[ -e "$(e2e_state)/stop" ]]; then ok; else bad "no stop sentinel at $(e2e_state)/stop"; fi
+
+t "run.sh: --stop on a PR-less local review writes no pr- state dir"
+if compgen -G "$E2E_HOME/state/local__*/pr-*" >/dev/null; then
+  bad "a pr- state dir was created for a PR-less review"; else ok; fi
+
+t "run.sh: --stop on a forge target still uses the pr-<N> state dir"
+run_e2e_raw --repo o/n 42 --stop
+assert_eq "$E2E_RC" 0
+if [[ -e "$E2E_HOME/state/o__n/pr-42/stop" ]]; then ok; else bad "no stop sentinel at o__n/pr-42"; fi
 
 t "run.sh e2e: a NIT-only convergence completes and terminates the review"
 e2e_fixture
