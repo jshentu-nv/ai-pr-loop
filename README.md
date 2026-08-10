@@ -6,8 +6,11 @@ Codex approves or the loop converges on NIT-only findings.
 
 By default the review happens **on the PR** — comments, replies, and one
 commit per round. With `--local` it happens **entirely on disk** and lands
-as a **single commit** carrying the review's findings and decisions; see
-[Local review mode](#local-review-mode).
+as a **single commit** carrying the review's findings and decisions. With
+`--local --audit` there is no PR/MR and no diff at all: the agents review
+the whole worktree at HEAD on a branch the loop creates for it, so the
+branch you have checked out is never written, and that single commit gets a
+PR/MR of its own. See [Local review mode](#local-review-mode).
 
 Works on **GitHub pull requests** and **GitLab merge requests** (gitlab.com
 or self-hosted) — see [GitLab support](#gitlab-support).
@@ -60,6 +63,8 @@ In Claude Code, just ask:
 
 > Kick off the review bots on this PR, max 4 iterations.
 
+> Audit this repo and open a PR with whatever needs fixing.
+
 The `ai-pr-review` skill kicks in, parses the PR, preflights auth,
 confirms before posting, launches the loop in the background, and streams
 per-iteration progress (verdicts, issue counts, errors) back into the
@@ -108,7 +113,8 @@ of the publicly auditable PR thread.
 Under `--local` the same two agents do the same work, but the review is
 written to files instead of comments, the implementer commits without
 pushing, and a final turn composes one commit message for the whole review
-— see [Local review mode](#local-review-mode).
+— plus, with `--audit`, the title and description of the PR/MR that commit
+gets. See [Local review mode](#local-review-mode).
 
 ## GitLab support
 
@@ -341,8 +347,9 @@ The loop exits when one of:
   `review_posted` for CHANGES_REQUESTED, `approved` for APPROVED) → exit 0.
 - The iteration cap (`--max`) is hit → exit 1.
 - Either agent's turn errors → exit 1.
-- In `--local` mode, the squash or the push fails (status `finalize_error`)
-  → exit 1. The local rounds are left in the checkout.
+- In `--local` mode, the squash or the push fails — with `--audit`, also
+  the review branch it creates or the PR/MR it opens (status
+  `finalize_error`) → exit 1. The local rounds are left in the checkout.
 
 ## Local review mode
 
@@ -350,7 +357,8 @@ The loop exits when one of:
 through files under the state dir, the implementer commits **without
 pushing**, and when they agree every round is squashed into **one commit**
 that carries the review's findings, fixes, and decisions in its message.
-That single commit is the only thing pushed.
+That single commit is the only thing pushed — with `--audit`, on a new
+branch that gets one PR/MR of its own.
 
 Use it when the review's back-and-forth would clutter the PR/MR: no bot
 comments, no chain of "address review" commits — just the change, plus a
@@ -364,6 +372,10 @@ message a future reader can act on.
 cd ~/src/myproject
 ~/ai-pr-loop/run.sh --local --base main
 
+# No PR/MR and no base: audit the whole worktree at HEAD, land the fixes on
+# a new branch, open one PR/MR against the branch you have checked out.
+~/ai-pr-loop/run.sh --local --audit
+
 # Create the squashed commit but hold it back for inspection.
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --local --no-push
 ```
@@ -372,7 +384,10 @@ cd ~/src/myproject
 
 One commit, authored by `claude-implementer (ai-bot)`, on top of the
 commits that were already on the branch — the human's own commits are never
-rewritten. Its message states what the change does, then a `Review notes:`
+rewritten. In `audit` scope that commit lands on a new branch instead, and
+the branch you had checked out is not moved at all.
+
+Its message states what the change does, then a `Review notes:`
 section: findings the final code addresses, decisions taken (including
 suggestions evaluated and rejected, and why), and anything deliberately
 deferred.
@@ -381,7 +396,8 @@ A review that ends in agreement without changing the tree — every finding
 answered by pushback, or rounds whose edits cancel out — lands no commit
 and pushes nothing. The exchange itself (findings, responses, decisions)
 stays in the state dir below, which is the review's only record in that
-case. On a PR/MR, the title and description are still checked and
+case. An audit that finds nothing to fix leaves its review branch sitting
+at the commit it started from, pushes nothing, and opens no PR/MR. On a PR/MR, the title and description are still checked and
 refreshed if the review agreed they were stale — that update is then the
 run's only external write. An update replaces the whole field, so it is
 delivered only when the PR/MR text is unchanged since the proposal was
@@ -403,50 +419,73 @@ state/<repo-ident>/<target>/
   local/base.sha               # the commit the run started from
   local/tip.sha                # where the last committed round left HEAD
   local/commit-message.txt     # the composed message for the squash
+  local/audit-pr-base          # --audit: the branch its PR/MR targets
+  local/pr-url                 # --audit: the PR/MR the review opened
   local/completed.sha          # terminal marker: the review's final commit
 ```
+
+`<target>` is `pr-<N>`, or — with no PR/MR — `branch-<branch>-<hash>`,
+naming the branch the checkout has out (sanitized for the filesystem, with
+a hash of the full name). An audit is a branch review of the branch it
+created, so its state lives under that branch's name. With `--audit`,
+`base.sha` is the squash base only: the review reads the whole tree, not
+`base..HEAD`.
 
 Each file is that turn's completion contract, exactly as the summary
 comment is in forge mode: a turn whose file is missing or empty fails and
 is re-run at the same iteration. There is no inline-comment surface —
 findings cite `path:line` in the review file.
 
-### Two scopes
+### Three scopes
 
 | Invocation | Scope | Forge use |
 |---|---|---|
 | `--local` with a PR/MR number or URL | `pr` | Read-only API/CLI use for metadata and human comments. At the end, at most two writes: the `git push` of the squashed commit, plus one title/description update when the review left them stale. |
 | `--local --base REF`, no positional | `branch` | No forge API, CLI, or token. Reviews the branch `--dir` has checked out (default: the current directory) against `REF`. The end-of-review push still happens: a plain fast-forward `git push` to `origin`, unless `--no-push` is given or the checkout has no `origin`. |
+| `--local --audit`, no positional | `branch` | Reviews the whole worktree at HEAD in `--dir` (default: the current directory) — every file, not a diff — on a branch the loop creates for it. Same forge use as any branch review, plus one PR/MR opened at the end by an agent turn, which needs a credential for the forge `origin` points at. Nothing is posted on any existing PR/MR. |
 
 In `branch` scope the loop commits onto that branch and pushes it at the
 end if the checkout has an `origin`; without one, the squashed commit on
 the branch is the review's result and the run is complete. `--base` takes
 any committish git resolves — `main`, `origin/main`, a tag, a SHA.
 
-### Pushing
+`--audit` is not a scope of its own. It sets a branch review up for
+itself: create a branch at HEAD, check it out, and review against HEAD as
+the base. Everything after that — the tip ref, the state identity, the
+resume checks, the squash, the push — is the branch review above,
+unchanged. The branch you had checked out is never written because the loop
+never works on it.
 
-- The push happens only when the review ends in agreement (`APPROVED`, or
-  the `--converge` streak). Hitting the iteration cap or erroring pushes
-  nothing: the rounds stay in the checkout and the next invocation
-  continues them.
-- It is always a fast-forward. If the branch moved on the remote while the
-  review ran, the push is refused and the squashed commit is left in the
-  checkout for you to reconcile — the loop never force-pushes.
-- `--no-push` stops after creating the squashed commit. Re-running without
-  the flag pushes it without composing the message again.
-- Once the commit is pushed — or landed locally with no `origin` to push
-  to — the review is complete and terminal: re-running the same command
-  exits without doing anything. Pass `--restart` to review the target as
-  it now stands, from a new base; commits made after completion (yours or
-  the bot's) are part of that new base and are never rewritten.
+The review branch is `ai-review/<branch>-<8 hex of the base>` unless
+`--pr-branch NAME` names another; either way the name must not already
+exist locally or on `origin`. Because the loop reviews the tree rather than
+a diff, `base..HEAD` is exactly what the loop itself changed, and it is
+empty on iteration 1.
+
+The one thing an audit adds at the end: once the review branch is pushed,
+an agent turn opens a PR/MR from it against the branch you started on,
+following `.claude/skills/open-pr/SKILL.md`. That skill is what knows how
+to talk to GitHub and GitLab, and it works the forge out from `origin`
+itself — the orchestrator makes no forge call. The turn requires adopting
+an existing PR/MR for the same branch pair rather than opening a second
+one, and writes the URL to `local/pr-url`, which is its contract: no URL
+means the step failed and the next run retries it.
+
+Re-running the same command continues the audit: the checkout is on the
+review branch, and the loop recognizes its own state there. `--no-push`
+stops before the push, so no PR/MR is opened either; re-run without it to
+finish, and the closing turn is not composed again. An audit that finds
+nothing to fix lands no commit and opens no PR/MR. Hitting `--max`
+publishes nothing — the rounds stay on the review branch and the next run
+continues them.
 
 ### Interruptions
 
 The rounds live only in the checkout, so the loop keeps them on a ref of
-its own (`refs/ai-pr-loop/local/pr-<N>`; in `branch` scope, the branch
-itself), records the expected tip in `local/tip.sha` after every committed
-round, and restores them on the next invocation. Three things fail closed
-rather than guess:
+its own (`refs/ai-pr-loop/local/pr-<N>`; in `branch` scope — an audit
+included — the branch itself), records the
+expected tip in `local/tip.sha` after every committed round, and restores
+them on the next invocation. Three things fail closed rather than guess:
 
 - The recorded rounds are missing from the checkout (it was recreated or
   pruned) — that work is unrecoverable, so the run stops and tells you to
@@ -458,6 +497,10 @@ rather than guess:
   it was reset or advanced outside the loop mid-review, so resuming would
   lose rounds or adopt commits no turn produced. The run stops and says
   how to reconcile.
+
+An audit is subject to the same three, on the branch it created. The branch
+you started on is not involved: the loop never checks it out, commits to
+it, or pushes it, so a crash leaves it exactly where it was.
 
 An errored turn and a killed run are both restarted by the auto-resume
 supervisor (below) until it reaches one of the exit-0 states or spends its
@@ -596,6 +639,10 @@ supervisor directly is ignored unless the stop sentinel exists — only
 ```bash
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --stop
 # GitLab: add --forge gitlab --host <host>
+
+# With no PR/MR, name the same checkout the run used:
+~/ai-pr-loop/run.sh --local --base main --dir ~/src/myproject --stop
+~/ai-pr-loop/run.sh --local --audit --dir ~/src/myproject --stop
 ```
 
 `--stop` runs no preflight and clones nothing. The next ordinary run
@@ -644,6 +691,12 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 
 # No PR/MR at all — review this checkout's branch against main:
 ~/ai-pr-loop/run.sh --local --base main --dir ~/src/some-checkout
+
+# Audit the whole worktree at HEAD; the fixes land on a new branch, which
+# gets a PR/MR against the branch the checkout has out:
+~/ai-pr-loop/run.sh --local --audit --dir ~/src/some-checkout
+~/ai-pr-loop/run.sh --local --audit --pr-branch cleanup/logging  # name that branch
+~/ai-pr-loop/run.sh --local --audit --no-push   # stop at the new local branch
 
 # Attach reference material (web links / notes / a local file) for both agents:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo \
@@ -734,7 +787,8 @@ fast-forward-only push, and the single post-push title/description write.
   bots to act on under those identities.
 - Claude never force-pushes, amends, or rebases — only adds new commits
   to the PR head ref. Under `--local` it does not push at all; the
-  orchestrator squashes the rounds and pushes that one commit.
+  orchestrator squashes the rounds and pushes that one commit — with
+  `--audit`, onto a new branch, never the one under review.
 - Managed checkouts live at `~/ai-pr-loop/checkouts/<owner>__<name>/`
   (one clone per repo, shared across PRs). For concurrent loops on the
   same repo, pass `--dir` to point each loop at its own clone.

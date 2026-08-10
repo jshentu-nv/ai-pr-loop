@@ -2243,6 +2243,11 @@ claude_prepare_cli() {
 
 # Run <prompt-file>, writing stdout to <out> and stderr to <err>. Sets
 # $CLAUDE_RUN_RC (and returns it).
+# Extra --add-dir arguments for a turn that must read outside the checkout
+# and the state dir — the closing PR step reaches the loop's own skill
+# directory this way, since it runs inside the repo under review.
+CLAUDE_EXTRA_DIR_ARGS=()
+
 claude_run_prompt() {
   _CLAUDE_PROMPT_FILE="$1"; _CLAUDE_OUT="$2"; _CLAUDE_ERR="$3"
   # A failing turn is a value this function RETURNS, not a script-ending
@@ -2265,6 +2270,7 @@ claude_run_prompt() {
         "${CLAUDE_SETTINGS_ARG[@]}" \
         --add-dir "$REPO_DIR" \
         --add-dir "$STATE_DIR" \
+        ${CLAUDE_EXTRA_DIR_ARGS[@]+"${CLAUDE_EXTRA_DIR_ARGS[@]}"} \
         --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
         "$(cat "$_CLAUDE_PROMPT_FILE")" \
         > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
@@ -2324,6 +2330,10 @@ claude_run_prompt() {
 #   {{#local}}  … {{/local}}    the review is exchanged as files on disk
 #   {{#pr}}     … {{/pr}}       a PR/MR exists, so its metadata is readable
 #   {{#branch}} … {{/branch}}   no PR/MR: a local branch against a base ref
+#   {{#audit}}  … {{/audit}}    the review scope is the whole worktree
+#   {{#diff}}   … {{/diff}}     the review scope is a diff — the complement
+#                               of {{#audit}}, so prose shared by the two
+#                               diff scopes is written once
 #
 # render_forge_blocks keeps the blocks whose tag is in the ACTIVE SET ($2, a
 # space-separated list built by prompt_tags) and drops the rest; text outside
@@ -2339,7 +2349,7 @@ claude_run_prompt() {
 # squash / nocommit select the finalize prompt's job: compose the squashed
 # commit's message, or — when the rounds land no net change on a PR/MR —
 # only assess the title/description.
-PROMPT_BLOCK_TAGS='github gitlab forge local pr branch squash nocommit'
+PROMPT_BLOCK_TAGS='github gitlab forge local pr branch audit diff squash nocommit'
 
 render_forge_blocks() {
   local template="$1" want="$2"
@@ -2375,10 +2385,15 @@ render_forge_blocks() {
 prompt_tags() {
   local tags
   if [[ "$LOCAL_MODE" == "1" ]]; then tags='local'; else tags='forge'; fi
-  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
-    tags="$tags branch"
+  if [[ "${AUDIT:-0}" == "1" ]]; then
+    # An audit runs on a branch the loop created, so it IS branch scope —
+    # but its review surface is the tree, not a diff, and it has no forge
+    # target during the review. 'audit' replaces both of those tags.
+    tags="$tags audit"
+  elif [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    tags="$tags branch diff"
   else
-    tags="$tags pr ${FORGE:-github}"
+    tags="$tags pr diff ${FORGE:-github}"
   fi
   printf '%s\n' "$tags"
 }
@@ -2389,6 +2404,20 @@ prompt_tags() {
 # gitlab) FORGE_HOST set.
 forge_vocab() {
   local slug="${REPO_SLUG:-${REPO_OWNER:-}/${REPO_NAME:-}}"
+  if [[ "${AUDIT:-0}" == "1" ]]; then
+    # No PR/MR exists yet, and which forge origin points at is the closing
+    # step's business, not this vocabulary's — so the nouns stay neutral.
+    FORGE_NAME='the forge'
+    PR_NOUN='PR/MR'
+    PR_NOUN_LONG='pull request / merge request'
+    PR_REF='against the branch `$AUDIT_PR_BASE`'
+    SUMMARY_NOUN='review file'
+    INLINE_NOUN='findings'
+    INLINE_NOUN_TITLE='Findings'
+    TOKEN_NOUN='credential'
+    AUTOLINK_SIGILS='`#N`'
+    return
+  fi
   if [[ "$LOCAL_SCOPE" == "branch" ]]; then
     # No forge at all. PR_REF names the branch through the exported shell
     # variable, never the literal name — the branch name is deliberately kept

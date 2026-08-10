@@ -38,6 +38,9 @@
 #
 #   run.sh --local --base REF [--dir REPO_DIR] [other flags...]
 #
+#   run.sh --local --audit [--dir REPO_DIR] [--pr-branch NAME] [--no-push]
+#                      [other flags...]
+#
 # The positional argument is either a PR/MR number (with --repo) or a full
 # PR/MR URL, from which the forge, host, repo, and number are all derived:
 #   https://github.com/OWNER/NAME/pull/42                     → GitHub
@@ -45,6 +48,8 @@
 #                                            (gitlab.com or self-hosted)
 # With --local --base REF and no positional, there is no PR/MR at all: the
 # loop reviews the branch checked out in --dir against REF.
+# With --local --audit there is no base either: the loop reviews the whole
+# worktree of --dir at HEAD, on a branch it creates for the purpose.
 #
 # Arguments:
 #   --repo        Repo slug (required unless a URL is given). GitHub:
@@ -90,13 +95,35 @@
 #                 change made them stale. Ending at the iteration cap or on
 #                 an error pushes nothing — the local rounds stay in the
 #                 checkout and the next invocation continues them.
+#   --audit       Review the whole worktree at HEAD — every file, not a
+#                 diff — in the checkout --dir names (default: the current
+#                 directory). Local mode only, and takes no PR/MR argument
+#                 and no --base.
+#                 This is a local BRANCH review the loop sets up for itself:
+#                 it creates a branch at HEAD (ai-review/<branch>-<shorthash>,
+#                 or --pr-branch NAME), checks it out, and reviews against
+#                 HEAD. The branch you had checked out is never written,
+#                 because the loop never works on it.
+#                 On agreement the rounds squash into ONE commit, that branch
+#                 is pushed, and one agent turn opens a PR/MR against the
+#                 branch you started on, following the loop's open-pr skill.
+#                 That turn works the forge out from origin itself, so
+#                 --repo/--forge/--host do not apply; it needs a credential
+#                 for whichever forge origin points at.
+#                 Re-run the same command to continue an audit in progress.
+#   --pr-branch NAME
+#                 --audit only: the branch the audit works on and opens its
+#                 PR/MR from, instead of ai-review/<branch>-<shorthash>. Must
+#                 not exist locally or on origin, and must not name the
+#                 branch you have checked out.
 #   --base REF    The base to review against when there is no PR/MR (local
 #                 mode with no positional argument). Any committish git can
 #                 resolve — `main`, `origin/main`, a tag, a SHA. The branch
 #                 under review is whatever --dir has checked out.
 #   --no-push     Local mode only: create the squashed commit but stop
-#                 before pushing it, so it can be inspected first. Re-run
-#                 without the flag to push it.
+#                 before pushing it, so it can be inspected first. With
+#                 --audit that also means no PR/MR is opened. Re-run without
+#                 the flag to finish; the closing turn is not composed again.
 #   --context-url URL
 #                 Web link to attach as reference material for BOTH agents
 #                 (design doc, RFC, related issue, API reference, ...). The
@@ -256,6 +283,12 @@ LOCAL_MODE=0
 LOCAL_SCOPE=pr
 BASE_ARG=""
 NO_PUSH=0
+# --audit is not a scope of its own: it sets a local BRANCH review up on a
+# branch the loop creates, and adds one step at the end. AUDIT_PR_BASE is
+# the branch that PR/MR targets — the one the operator had checked out.
+AUDIT=0
+PR_BRANCH_ARG=""
+AUDIT_PR_BASE=""
 CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
@@ -287,6 +320,9 @@ while [[ $# -gt 0 ]]; do
     --restart)       RESTART=1; shift ;;
     --review-only)   REVIEW_ONLY=1; shift ;;
     --local)         LOCAL_MODE=1; shift ;;
+    --audit)         AUDIT=1; shift ;;
+    --pr-branch)     [[ $# -ge 2 && "$2" != -* ]] || die "--pr-branch needs a branch name"
+                     PR_BRANCH_ARG="$2"; shift 2 ;;
     --base)          [[ $# -ge 2 && -n "$2" ]] || die "--base needs a git ref"; BASE_ARG="$2"; shift 2 ;;
     --no-push)       NO_PUSH=1; shift ;;
     --context-url)   [[ $# -ge 2 ]] || die "--context-url needs a URL";  CONTEXT_URLS+=("$2");  shift 2 ;;
@@ -341,6 +377,23 @@ if (( LOCAL_MODE == 0 )); then
 fi
 if (( LOCAL_MODE == 1 )) && [[ -z "$PR_NUMBER" && -z "$URL_ARG" ]]; then
   LOCAL_SCOPE=branch
+fi
+if (( AUDIT == 1 )); then
+  # Named before the generic --base rejection below, so an operator who
+  # passed --audit is told about --audit, not about a flag they did not pass.
+  (( LOCAL_MODE == 1 )) || die "--audit is a local review mode; pass --local --audit"
+  [[ -z "$PR_NUMBER" && -z "$URL_ARG" ]] \
+    || die "--audit reviews the checked-out worktree; it takes no PR/MR number or URL"
+  [[ -z "$BASE_ARG" ]] \
+    || die "--audit reviews the whole worktree at HEAD; there is no base to diff against (use --local --base REF for a branch review)"
+fi
+if [[ -n "$PR_BRANCH_ARG" ]]; then
+  (( AUDIT == 1 )) \
+    || die "--pr-branch applies only to --local --audit (it names the branch an audit works on)"
+  [[ "$PR_BRANCH_ARG" != refs/* ]] \
+    || die "--pr-branch takes a branch name, not a full ref (got: $PR_BRANCH_ARG)"
+  [[ "$PR_BRANCH_ARG" != +* ]] \
+    || die "--pr-branch must not start with '+' (it becomes a push refspec)"
 fi
 if [[ "$LOCAL_SCOPE" != "branch" && -n "$BASE_ARG" ]]; then
   die "--base is for a local review with no PR/MR; the base branch of $( ((LOCAL_MODE)) && echo 'this PR/MR' || echo 'a PR/MR' ) comes from the forge"
@@ -493,7 +546,9 @@ else
   [[ -z "$REPO_SLUG"   ]] || die "--repo is not used by a local review with no PR/MR (identity comes from the checkout)"
   [[ -z "$FORGE"       ]] || die "--forge is not used by a local review with no PR/MR"
   [[ -z "$FORGE_HOST"  ]] || die "--host is not used by a local review with no PR/MR"
-  [[ -n "$BASE_ARG"    ]] || die "--base REF is required for a local review with no PR/MR (there is no forge to take the base branch from)"
+  if (( AUDIT == 0 )); then
+    [[ -n "$BASE_ARG" ]] || die "--base REF is required for a local review with no PR/MR (there is no forge to take the base branch from)"
+  fi
   FORGE=local
   FORGE_HOST=""
   FORGE_SCHEME=""
@@ -572,10 +627,116 @@ if (( PRINT_CONFIG == 1 )); then
     "$( (( LOCAL_MODE == 1 )) && echo local || echo forge )" \
     "$LOCAL_SCOPE" "${BASE_ARG:--}" \
     "$( (( LOCAL_MODE == 1 && NO_PUSH == 1 )) && echo no || echo yes )"
+  (( AUDIT == 1 )) && printf 'audit: yes pr-branch=%s\n' "${PR_BRANCH_ARG:-(derived)}"
   printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
 fi
+
+# --- --audit: a branch review the loop sets up for itself ---------------------
+#
+# An audit reviews the tree as it stands, with no change in flight. Rather
+# than invent a scope for that, it makes one: create a branch at HEAD, check
+# it out, and run the ordinary local BRANCH review on it with HEAD as the
+# base. Everything after this point — the tip ref, the state identity, the
+# resume checks, the squash, the push — is that reviewed path, unchanged.
+# The operator's branch is never written because the loop never works on it.
+#
+# The only lasting addition is the closing step: finalize opens a PR/MR from
+# the review branch against the branch the operator had out, recorded here.
+
+# The state dir a local branch review of $1 would use. Needed before
+# ensure_state_dir, to tell a fresh audit from one being resumed.
+audit_leaf_dir() {  # <branch>
+  local h
+  h=$(printf '%s' "$1" | short_hash)
+  printf '%s/state/local__%s-%s/branch-%s-%s\n' \
+    "$LOOP_HOME" "$(ident_slug "$(basename -- "$REPO_DIR_CANON")")" \
+    "$(printf '%s' "$REPO_DIR_CANON" | short_hash)" "$(ident_slug "$1")" "$h"
+}
+
+# A name is free when no local or remote ref equals it, sits below it, or
+# holds it as a path prefix — git refuses both directions of that conflict,
+# and hitting it later would cost the whole review.
+audit_branch_free() {  # <name>
+  local n="$1" r
+  while IFS= read -r r; do
+    [[ -n "$r" ]] || continue
+    [[ "$r" == "refs/heads/$n"   ]] && return 1
+    [[ "$r" == "refs/heads/$n/"* ]] && return 1
+    [[ "refs/heads/$n" == "$r/"* ]] && return 1
+  done < <(git -C "$REPO_DIR" for-each-ref --format='%(refname)' refs/heads/
+           git -C "$REPO_DIR" ls-remote --heads origin 2>/dev/null | awk '{print $2}')
+  return 0
+}
+
+audit_setup_branch() {
+  local leaf orig="$HEAD_REF" head stem cand i
+  leaf=$(audit_leaf_dir "$HEAD_REF")
+  if [[ -s "$leaf/local/audit-pr-base" ]]; then
+    # Resuming: the checkout is already on the review branch this audit
+    # created. Its base is the one recorded when it started — never
+    # recomputed, or a resume would redefine the squash range.
+    # base.sha is the live review's squash base. A completed audit has none
+    # (it is purged terminally), so fall back to what it landed, and to HEAD
+    # for a --restart that will pick its own base anyway. Nothing here
+    # recomputes a LIVE review's base — that would redefine its squash range.
+    if [[ -s "$leaf/local/base.sha" ]]; then
+      BASE_ARG=$(<"$leaf/local/base.sha")
+    elif [[ -s "$leaf/local/completed.sha" ]]; then
+      BASE_ARG=$(<"$leaf/local/completed.sha")
+    else
+      BASE_ARG=$(git -C "$REPO_DIR" rev-parse --verify --quiet 'HEAD^{commit}') \
+        || die "could not read HEAD in $REPO_DIR"
+    fi
+    AUDIT_PR_BASE=$(<"$leaf/local/audit-pr-base")
+    [[ -z "$PR_BRANCH_ARG" || "$PR_BRANCH_ARG" == "$HEAD_REF" ]] \
+      || die "--pr-branch '$PR_BRANCH_ARG' disagrees with the audit already running on '$HEAD_REF' — finish or --restart it before renaming"
+    log "audit: resuming on '$HEAD_REF' (PR base '$AUDIT_PR_BASE')"
+    return
+  fi
+  # Entry points that only report or signal must not create anything. With
+  # no audit on record there is nothing for them to act on anyway.
+  if (( STOP_ONLY == 1 || PRINT_CONFIG == 1 || PREFLIGHT_ONLY == 1 )); then
+    BASE_ARG="$(git -C "$REPO_DIR" rev-parse --verify --quiet 'HEAD^{commit}' || true)"
+    return
+  fi
+  # Fresh audit. The branch is created at HEAD and checked out; the review
+  # then runs against HEAD as its base, so base..HEAD is exactly the loop's
+  # own work and is empty on iteration 1.
+  head=$(git -C "$REPO_DIR" rev-parse --verify --quiet 'HEAD^{commit}') \
+    || die "could not read HEAD in $REPO_DIR"
+  if [[ -n "$PR_BRANCH_ARG" ]]; then
+    git check-ref-format "refs/heads/$PR_BRANCH_ARG" >/dev/null 2>&1 \
+      || die "--pr-branch is not a valid branch name: $PR_BRANCH_ARG"
+    [[ "$PR_BRANCH_ARG" != "$orig" ]] \
+      || die "--pr-branch must not name the branch under review ($orig) — the audit works on a branch of its own"
+    audit_branch_free "$PR_BRANCH_ARG" \
+      || die "--pr-branch '$PR_BRANCH_ARG' already exists locally or on origin (or conflicts with an existing ref path)"
+    cand="$PR_BRANCH_ARG"
+  else
+    stem="ai-review/${orig}-$(printf '%s' "$head" | cut -c1-8)"
+    cand=''
+    for (( i = 1; i <= 20; i++ )); do
+      local try="$stem"; (( i > 1 )) && try="${stem}-${i}"
+      git check-ref-format "refs/heads/$try" >/dev/null 2>&1 || continue
+      if audit_branch_free "$try"; then cand="$try"; break; fi
+    done
+    [[ -n "$cand" ]] \
+      || die "could not derive a free review-branch name from '$orig' (tried $stem and 19 suffixes) — pass --pr-branch NAME"
+  fi
+  # The worktree must be clean before the loop takes the checkout over; the
+  # branch review's own caller-clone check runs later, but a switch here
+  # would already carry uncommitted work onto the new branch.
+  verify_caller_clone_clean "$REPO_DIR"
+  git_safe -C "$REPO_DIR" checkout --quiet -b "$cand" \
+    || die "could not create the review branch '$cand' in $REPO_DIR"
+  HEAD_REF="$cand"
+  BASE_ARG="$head"
+  AUDIT_PR_BASE="$orig"
+  log "audit: reviewing the worktree of $REPO_DIR on a new branch '$cand' (base $head)"
+  log "audit: '$orig' is not written by this run; its PR/MR is opened against it at the end"
+}
 
 if [[ "$LOCAL_SCOPE" == "branch" ]]; then
   # The checkout is the target, so it must exist and be a work tree now (a
@@ -591,6 +752,7 @@ if [[ "$LOCAL_SCOPE" == "branch" ]]; then
     || die "not a git work tree: $REPO_DIR"
   HEAD_REF=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD) \
     || die "HEAD in $REPO_DIR is detached — check out the branch you want reviewed"
+  (( AUDIT == 1 )) && audit_setup_branch
 else
   [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -892,9 +1054,15 @@ if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 
   # its own output and not the whole history.
   SUP_LOG_OFFSET=$(wc -c < "$SUP_LOG" | tr -d ' ')
 
-  STOP_HINT="$0 $PR_NUMBER --repo $REPO_SLUG"
-  [[ "$FORGE" == "github" ]] || STOP_HINT="$STOP_HINT --forge $FORGE --host ${FORGE_SCHEME}://${FORGE_HOST}"
-  STOP_HINT="$STOP_HINT --stop"
+  if (( AUDIT == 1 )); then
+    STOP_HINT="$0 --local --audit --dir $REPO_DIR --stop"
+  elif [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    STOP_HINT="$0 --local --base $BASE_ARG --dir $REPO_DIR --stop"
+  else
+    STOP_HINT="$0 $PR_NUMBER --repo $REPO_SLUG"
+    [[ "$FORGE" == "github" ]] || STOP_HINT="$STOP_HINT --forge $FORGE --host ${FORGE_SCHEME}://${FORGE_HOST}"
+    STOP_HINT="$STOP_HINT --stop"
+  fi
   SUP_PID=''
   TAIL_PID=''
 
@@ -1172,7 +1340,7 @@ REPO_NAME="${REPO_SLUG##*/}"
 
 export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
-       LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON \
+       LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON AUDIT \
        CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
@@ -1241,6 +1409,14 @@ fi
 
 ensure_state_dir
 export STATE_DIR
+# An audit's one piece of extra state: the branch its PR/MR targets. Written
+# on the invocation that creates the review branch, and from then on the
+# marker that tells finalize to open a PR/MR at all.
+if (( AUDIT == 1 )) && [[ -n "$AUDIT_PR_BASE" ]] && [[ ! -s "$STATE_DIR/local/audit-pr-base" ]]; then
+  mkdir -p "$STATE_DIR/local"
+  write_state_atomic "$STATE_DIR/local/audit-pr-base" "$AUDIT_PR_BASE" \
+    || die "could not record the audit's PR base at $STATE_DIR/local/audit-pr-base"
+fi
 RUN_LOG="$STATE_DIR/run.log"
 : > "$RUN_LOG"
 
@@ -1322,7 +1498,12 @@ fi
 log "------------------------------------------------------------"
 log "AI PR loop starting"
 log "  PR:    $PR_URL"
-if [[ "$LOCAL_SCOPE" == "branch" ]]; then
+if (( AUDIT == 1 )); then
+  log "  forge: none during the review; the closing step opens the PR/MR"
+  log "  scope: the whole worktree at HEAD"
+  log "  branch: $HEAD_REF (created by this run)"
+  log "  pr base: $AUDIT_PR_BASE (not written by this run)"
+elif [[ "$LOCAL_SCOPE" == "branch" ]]; then
   log "  forge: none (local branch review)"
 else
   log "  forge: $FORGE ($FORGE_SCHEME://$FORGE_HOST)"
