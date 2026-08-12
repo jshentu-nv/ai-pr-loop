@@ -1401,6 +1401,7 @@ if (( LOCAL_MODE == 1 )) && [[ -s "$(local_completed_file)" ]]; then
   # them would re-squash from the old base — rewriting the completed
   # commit. Drop them whenever the marker is present.
   rm -f "$(local_base_file)" "$(local_tip_file)" "$(local_origin_file)" \
+        "$(local_target_base_file)" \
         "$(local_finalized_file)" "$(local_finalize_inprogress_file)" \
         "$(local_pending_turn_file)"
   if (( EFFECTIVE_RESTART == 0 )); then

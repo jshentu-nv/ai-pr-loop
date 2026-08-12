@@ -59,6 +59,16 @@ else
   CONTEXT_NOTE=''
 fi
 
+# Local mode can show the author/loop split exactly because base.sha pins the
+# PR head from before the first review round. Give the reviewer that evidence
+# every iteration, especially before it approves a large fixup diff.
+SCOPE_NOTE=''
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  SCOPE_FILE="$ID/review-scope.md"
+  local_write_scope_report "$SCOPE_FILE"
+  SCOPE_NOTE="**Review-created diff.** Read \`${SCOPE_FILE}\` before filing findings. It separates the original change from paths changed by this review and flags paths newly brought into scope. Require a change-specific reason for every review-created path."
+fi
+
 
 # Render the prompt template. GitLab loops use the gitlab prompt variant —
 # same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -101,6 +111,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
+  -e "s|{{SCOPE_NOTE}}|${SCOPE_NOTE}|g" \
   > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"

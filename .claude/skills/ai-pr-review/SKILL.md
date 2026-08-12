@@ -113,11 +113,14 @@ Optional flags worth surfacing if the user mentions a constraint:
   pushing, for inspection ("let me look before it goes up"). Re-running
   without the flag pushes it without composing the message again.
 
-- **Additional context** (shared by both agents) — when the user wants the
-  bots to consider external reference material (a design doc, RFC, related
-  issue, API reference, style guide), pass it through. Phrases like "review
+- **Additional context and constraints** (shared by both agents) — when the
+  user wants the bots to consider reference material or a review constraint
+  (a design doc, RFC, related issue, API reference, style guide, scope limit,
+  or comment-writing rule), pass it through. Phrases like "review
   this against <link>", "here's the design doc: <url>", "keep <url> in mind",
-  "use this spec". All are repeatable and shared by both Codex and Claude:
+  "use this spec", "only change code needed for this ticket", or "write
+  comments in this style" all belong here. All are repeatable and shared by
+  both Codex and Claude:
   - `--context-url URL` — a web link. The agents fetch it themselves
     (Claude via WebFetch, Codex via curl).
   - `--context TEXT` — a free-text note.
@@ -133,6 +136,15 @@ Optional flags worth surfacing if the user mentions a constraint:
   they fetch the URLs under the user's `gh` identity. Only attach links/files
   the user actually asked for — don't infer context URLs from the surrounding
   conversation.
+
+  **Constraints added after launch.** A running agent turn cannot see a new
+  chat message. If the user adds a scope, style, compatibility, or behavior
+  constraint while the loop is active, do not let the old run continue under
+  stale instructions. Stop it with the same target plus `--stop`, then rerun
+  the prior command with the new constraint included. Context flags replace
+  the stored snapshot, so include all still-active earlier context in that
+  rerun as well. The loop's completion artifacts make the rerun resume the
+  unfinished iteration instead of silently skipping it.
 
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if

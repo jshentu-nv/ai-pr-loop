@@ -53,6 +53,8 @@ written later from the review record and the final diff.
 
 {{CONTEXT_NOTE}}
 
+{{SCOPE_NOTE}}
+
 {{#local}}
 ## CI in a local review
 
@@ -148,6 +150,24 @@ past a failed mutation as if it landed.
    that are obviously valid. The goal is the {{PR_NOUN}} converging to a state both
    you and Codex agree is mergeable.
 
+   **Prove the scope before you edit.** For each proposed fix, state which
+   behavior this {{PR_NOUN}} introduces or exposes and why the fix is needed
+   for that behavior. A touched file or nearby defect is not enough. If the
+   same defect exists on the base and this change does not affect it, push
+   back as out of scope. Read callers and consumers as widely as needed, but
+   edit only the smallest set of paths needed to make this change correct.
+
+   If a finding changes a stored type, wire format, public value type, or
+   producer/consumer boundary, map producer -> storage -> readers -> important
+   consumers before editing. Check old and new data. Prefer one compatibility
+   boundary over conversions spread across consumers when that boundary can
+   preserve the contract safely.
+
+   A cleanup needs the same proof. Do not combine similar-looking code until
+   you compare its failure behavior, validation strictness, accepted layouts,
+   ownership, and state carried across calls. Do not make drive-by cleanups in
+   files this {{PR_NOUN}} only touched incidentally.
+
 3. **If you make code changes:**
    - `cd {{REPO_DIR}}`
    - Make the edits.
@@ -166,6 +186,17 @@ past a failed mutation as if it landed.
      orchestration**, the same effort you implement at — so it's an
      exhaustive pass, not a quick skim. Skip this only when you made no code
      changes (pushback-only iterations have nothing to review).
+   - **Keep comments useful.** A source comment should record why an
+     invariant, compatibility choice, or non-obvious tradeoff exists. Do not
+     restate the code. Use short, direct sentences, and omit obvious or
+     unrelated detail.
+   - **Stage only the intended paths.** Before committing, run
+     `git status --short` and `git diff --check`. Stage each intended path
+     explicitly with `git add -- <path>...`; do not use `git add -A`. Then
+     run `git diff --cached --check` and inspect
+     `git diff --cached --name-status`. Every staged path must have a reason
+     tied to this review. After the commit, use `git status --short` to make
+     sure no intended source edit was left behind.
    - Stage and commit with a **distinct bot identity** so humans can tell
      these commits from the human author's:
      ```
@@ -399,7 +430,16 @@ past a failed mutation as if it landed.
 
    ### Deferred / out of scope
    - <item> — will track separately because ...
+
+   ### Scope check
+   - `path/to/file.ext` — <why changing this path is required for this PR>
+   - Inspected only: `consumer/file.ext` — <why no change is needed there>
    ```
+
+   The scope check lists every path you changed this iteration. “Touched by
+   the PR” is not a reason. The optional “Inspected only” entries are useful
+   when you checked an important consumer or compatibility boundary and
+   deliberately left it unchanged.
 
    Always cite commit SHAs for fixes. If you didn't commit anything,
    omit the "Commits this iteration" section and explain in the
@@ -436,6 +476,10 @@ past a failed mutation as if it landed.
 
    ### Deferred / out of scope
    - <item> — tracked separately because ...
+
+   ### Scope check
+   - `path/to/file.ext` — <why changing this path is required for this PR>
+   - Inspected only: `consumer/file.ext` — <why no change is needed there>
    ```
 {{#pr}}
 
@@ -452,6 +496,11 @@ past a failed mutation as if it landed.
    they let Codex check exactly what you changed. They stop existing when
    the rounds are squashed, so never write one into a source comment or a
    doc.
+
+   The scope check lists every path you changed this iteration. “Touched by
+   the branch” is not a reason. The optional “Inspected only” entries are
+   useful when you checked an important consumer or compatibility boundary
+   and deliberately left it unchanged.
 
 6. **At the very end of YOUR final stdout message**, print exactly one line
    on its own line:

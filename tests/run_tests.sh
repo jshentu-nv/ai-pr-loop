@@ -4902,6 +4902,29 @@ for _agent in claude codex; do
     t "prompts/$_agent.md [$_tags]: runtime-validation mandate survives"
     assert_render_has "$_out" 'A missing toolchain is not an excuse'
 
+    t "prompts/$_agent.md [$_tags]: scope is based on changed behavior, not touched files"
+    assert_render_has "$_out" 'touched file'
+
+    t "prompts/$_agent.md [$_tags]: contract changes require producer-to-consumer analysis"
+    assert_render_has "$_out" 'producer -> storage -> readers'
+
+    t "prompts/$_agent.md [$_tags]: cleanup requires behavior comparison"
+    if [[ "$_agent" == claude ]]; then
+      assert_render_has "$_out" 'validation strictness'
+    else
+      assert_render_has "$_out" 'strictness, accepted layouts'
+    fi
+
+    if [[ "$_agent" == claude ]]; then
+      t "prompts/claude.md [$_tags]: every changed path needs a scope reason"
+      assert_render_has "$_out" '### Scope check'
+      t "prompts/claude.md [$_tags]: staging is explicit and checked"
+      assert_render_has "$_out" 'git diff --cached --name-status'
+    else
+      t "prompts/codex.md [$_tags]: review comments lead with impact"
+      assert_render_has "$_out" 'a caller or user'
+    fi
+
     t "prompts/$_agent.md [$_tags]: the CI policy matches the mode"
     # Forge mode reads the head's checks; local mode validates locally —
     # forge checks describe the remote head, not the unpushed rounds.
@@ -4924,6 +4947,10 @@ for _agent in claude codex; do
       *)
         t "prompts/$_agent.md [$_tags]: names the file that is the turn's contract"
         assert_render_has "$_out" "$_artifact"
+        if [[ "$_agent" == codex ]]; then
+          t "prompts/$_agent.md [$_tags]: reads the separate review scope report"
+          assert_render_has "$_out" 'review-scope.md'
+        fi
         t "prompts/$_agent.md [$_tags]: no comment-posting recipe survives"
         assert_render_lacks "$_out" 'gh pr comment'
         assert_render_lacks "$_out" 'gh api --method POST'
@@ -4996,6 +5023,9 @@ for _tags in "local pr github squash" "local pr gitlab squash" "local branch squ
 
   t "prompts/finalize.md [$_tags]: demands the completion marker"
   assert_render_has "$_out" '[CLAUDE_FINALIZE: COMPLETE]'
+
+  t "prompts/finalize.md [$_tags]: audits the review-created path set"
+  assert_render_has "$_out" 'The scope report'
 
   case "$_tags" in
     *branch*)
@@ -5133,9 +5163,24 @@ assert_eq "$(STATE_DIR="$WORK/local-hw-empty" "$BASH_BIN" -c ". '$ROOT/lib/commo
 # The turn scripts must never touch the forge in local mode, and each turn's
 # written artifact — not its stdout marker — is what completes it.
 
+prepare_case_scope() {
+  if ! git -C "$CASE_DIR/repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git init -q -b feature/x "$CASE_DIR/repo"
+    git -C "$CASE_DIR/repo" config user.email t@t
+    git -C "$CASE_DIR/repo" config user.name t
+    printf 'base\n' > "$CASE_DIR/repo/f"
+    git -C "$CASE_DIR/repo" add f
+    git -C "$CASE_DIR/repo" commit -qm base
+  fi
+  mkdir -p "$CASE_DIR/state/local"
+  git -C "$CASE_DIR/repo" rev-parse HEAD > "$CASE_DIR/state/local/base.sha"
+  git -C "$CASE_DIR/repo" rev-parse HEAD > "$CASE_DIR/state/local/target-base.sha"
+}
+
 local_turn() {  # <claude|codex> [VAR=VALUE ...]
   local who="$1"; shift
   mkdir -p "$CASE_DIR/state/iter-01"
+  prepare_case_scope
   run_turn "$who" LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local \
     REPO_SLUG= REPO_OWNER= REPO_NAME= PR_NUMBER= GH_USER= "$@"
 }
@@ -5149,6 +5194,10 @@ assert_substr "$CASE_DIR/state/iter-01/codex-review.md" 'stub review'
 t "codex_turn [local]: renders the local prompt, not a posting recipe"
 assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'codex-review.md'
 assert_no_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'gh pr comment'
+
+t "codex_turn [local]: writes and injects the review-created diff report"
+assert_substr "$CASE_DIR/state/iter-01/review-scope.md" '## Paths changed by the review loop (0)'
+assert_substr "$CASE_DIR/state/iter-01/codex.prompt.md" 'review-scope.md'
 
 t "codex_turn [local]: the prompt directs local validation, not forge CI"
 # Forge checks describe the remote head, not the unpushed local rounds; a
@@ -5180,6 +5229,8 @@ assert_pair "$ARGV" --add-dir "$CASE_DIR/state"
 
 t "claude_turn [local]: the prompt directs local validation, not forge CI"
 assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'CI in a local review'
+t "claude_turn [local]: injects the same scope evidence before editing"
+assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'Review-created diff.'
 t "claude_turn [local]: the forge CI directive is absent from the prompt"
 assert_no_substr "$CASE_DIR/state/iter-01/claude.prompt.md" 'yours to fix in THIS round'
 
@@ -5205,6 +5256,7 @@ local_fixture() {  # -> $LF_REMOTE $LF_CLONE $LF_STATE $LF_BASE, branch feature/
   git -C "$LF_CLONE" config user.email t@t; git -C "$LF_CLONE" config user.name t
   git -C "$LF_CLONE" remote add origin "$LF_REMOTE"
   echo base > "$LF_CLONE/f"; git -C "$LF_CLONE" add f; git -C "$LF_CLONE" commit -qm base
+  LF_TARGET=$(git -C "$LF_CLONE" rev-parse HEAD)
   git -C "$LF_CLONE" push -q origin HEAD:refs/heads/main
   git -C "$LF_CLONE" checkout -qb feature/x
   echo head >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "human work"
@@ -5212,6 +5264,7 @@ local_fixture() {  # -> $LF_REMOTE $LF_CLONE $LF_STATE $LF_BASE, branch feature/
   LF_BASE=$(git -C "$LF_CLONE" rev-parse HEAD)
   LF_STATE="$WORK/$n-state"; mkdir -p "$LF_STATE/local"
   printf '%s\n' "$LF_BASE" > "$LF_STATE/local/base.sha"
+  printf '%s\n' "$LF_TARGET" > "$LF_STATE/local/target-base.sha"
   # What local_setup_repo pins when the review starts.
   printf '%s\n%s\n' "$LF_REMOTE" "$LF_REMOTE" > "$LF_STATE/local/origin.url"
 }
@@ -5234,6 +5287,22 @@ finalize_run() {  # [VAR=VALUE ...]
 remote_head() { git -C "$LF_REMOTE" rev-parse refs/heads/feature/x; }
 local_head()  { git -C "$LF_CLONE" rev-parse HEAD; }
 
+t "local scope report: separates original paths from review-added paths"
+local_fixture
+printf 'focused regression\n' > "$LF_CLONE/review-test.txt"
+git -C "$LF_CLONE" add review-test.txt
+git -C "$LF_CLONE" commit -qm 'review test'
+if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_write_scope_report '$LF_STATE/scope.md'" \
+     > "$WORK/scope.log" 2>&1; then
+  assert_substr "$LF_STATE/scope.md" '## Review-created paths outside the original change (1)'
+  assert_substr "$LF_STATE/scope.md" '`review-test.txt` — requires an explicit scope reason'
+  assert_substr "$LF_STATE/scope.md" '## Paths in the original change (1)'
+else
+  bad "scope report failed: $(tail -3 "$WORK/scope.log" | tr '\n' ' ')"
+fi
+
 t "finalize: three local rounds become one pushed commit"
 local_fixture; local_round 1; local_round 2; local_round 3
 finalize_run
@@ -5252,6 +5321,9 @@ assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s "$LF_BASE")" 'human work'
 
 t "finalize: the squashed tree is exactly what the rounds produced"
 assert_eq "$(cat "$LF_CLONE/f" | tr '\n' ' ')" 'base head round 1 round 2 round 3 '
+
+t "finalize: keeps the final review scope report for audit"
+assert_substr "$LF_STATE/local/review-scope.md" '## Paths changed by the review loop (1)'
 
 t "finalize: a fresh run after the push has nothing left to do"
 finalize_run
@@ -5695,6 +5767,7 @@ fi
 t "codex_turn [local, PR/MR]: does not read the forge comment thread"
 new_case codex-local-pr
 mkdir -p "$CASE_DIR/state/iter-01"
+prepare_case_scope
 run_turn codex LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github \
   STUB_FORGED_GH_SUMMARY=1     # would appear in a fetched thread
 assert_rc0
@@ -5710,6 +5783,7 @@ t "claude_turn [local, PR/MR]: answers the file, never the comment thread"
 new_case claude-local-pr
 mkdir -p "$CASE_DIR/state/iter-01"
 printf 'stub review\n' > "$CASE_DIR/state/iter-01/codex-review.md"
+prepare_case_scope
 run_turn claude LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github
 assert_rc0
 assert_substr "$CASE_DIR/state/iter-01/claude-response.md" 'stub response'

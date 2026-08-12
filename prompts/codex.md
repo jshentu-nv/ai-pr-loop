@@ -11,6 +11,8 @@ of the loop (max {{MAX_ITER}}).
 
 {{CONTEXT_NOTE}}
 
+{{SCOPE_NOTE}}
+
 {{#forge}}
 ## CI is part of the review
 
@@ -320,6 +322,14 @@ never continue past a failed mutation as if it landed.
    - When in doubt about whether something is a real issue vs. a stylistic
      preference, **read more code** before flagging it.
 
+   **Read broadly; file findings narrowly.** Reading a caller, consumer, or
+   whole touched file is how you learn the blast range. It is not evidence
+   that every problem you notice there belongs to this change. A line being
+   touched is also not enough. Leave a pre-existing defect alone unless this
+   change introduces it, makes it reachable, makes it worse, or cannot be
+   correct without fixing it. You may name a useful follow-up in the summary,
+   but do not turn it into a finding for this {{PR_NOUN}}.
+
 5. **Review the current diff** (`git diff "refs/ai-pr-loop/base...HEAD"`) with
    that context in mind. Evaluate correctness, design, perf, docs, and
    consistency with the project's conventions. Apply these focused passes
@@ -330,6 +340,13 @@ never continue past a failed mutation as if it landed.
      repo. A backward-incompatible change with live callers and no migration
      path is a BLOCKER unless the {{PR_NOUN}}'s stated intent documents it; for
      internal symbols, MAJOR.
+   - **Data and compatibility contracts.** If the diff changes a stored type,
+     wire format, public value type, or producer/consumer boundary, map the
+     complete path before judging the design: producer -> storage -> readers
+     -> important consumers. Check both old and new data. A simpler producer
+     is not simpler overall when it moves conversions or compatibility risk
+     into several consumers. Prefer a compatibility layer at one well-owned
+     boundary when the evidence shows that is safe.
    - **Tests.** If the diff changes behavior (not a pure refactor) on a path
      with no new or updated test, flag the gap (usually MAJOR). If tests
      exist but don't cover a new branch or parameter, say which. If you're
@@ -342,6 +359,27 @@ never continue past a failed mutation as if it landed.
    - **Security.** If the diff touches auth, crypto, input validation, SQL,
      deserialization, or file/path handling: check for injection, bypass, or
      missing validation against the established patterns nearby.
+   - **Cleanup and deduplication.** Do not request a cleanup only because two
+     blocks look alike. First compare their failure behavior, validation
+     strictness, accepted layouts, ownership, and state carried across calls.
+     Ask for cleanup only inside code this change adds or materially changes,
+     and only when the cleanup is needed for correctness or clearly reduces
+     the risk of maintaining this change.
+
+{{#local}}
+   Also read the loop-created diff separately. It shows what the review has
+   added on top of the original branch, which is the part most likely to grow
+   beyond the stated scope:
+
+   ```bash
+   git diff "$(cat {{HISTORY_DIR}}/local/base.sha)"..HEAD
+   ```
+
+   Read `{{HISTORY_DIR}}/iter-{{ITER}}/review-scope.md` too. It lists paths
+   changed by the loop and calls out paths that were not in the original
+   change. A new path can be valid, such as a focused regression test, but it
+   needs a clear reason tied to this {{PR_NOUN}}.
+{{/local}}
 
    **5a. Before you file it — pressure-test every finding.** A review that cries
    wolf gets ignored, and each false positive costs the implementer a wasted
@@ -352,10 +390,21 @@ never continue past a failed mutation as if it landed.
      test — or deliberate per the change's stated intent or a human comment.
    - State the concrete failure: the input or path that triggers it, or the
      invariant it breaks. If you can't, it's probably a NIT or not a finding.
+   - State why the failure is caused or exposed by this {{PR_NOUN}}. “This
+     file was touched” is not a reason. If the same failure exists on the
+     base and this change does not affect it, drop it as out of scope.
+   - Identify the smallest fix you would accept. Do not use a local finding
+     to justify a wider redesign unless the local fix cannot preserve the
+     required contract.
    Drop anything that doesn't survive this — raise only findings you'd defend.
    Then sanity-check the review's shape: a healthy round is roughly 0–2
    BLOCKERs, a handful of MAJORs, few NITs. Many NITs with no MAJOR/BLOCKER
    means you're likely nitpicking; a pile of BLOCKERs means re-verify each.
+
+   Write every finding in short, direct sentences. Say what can go wrong,
+   why that matters to a caller or user, and the smallest change that would
+   address it. Do not spend the finding paraphrasing the code or explaining
+   obvious syntax and unrelated background.
 
 {{#forge}}
 6. **Post your review across two surfaces:**
@@ -379,13 +428,13 @@ never continue past a failed mutation as if it landed.
          "path": "path/to/file.ext",
          "line": 42,
          "side": "RIGHT",
-         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**\n\n<concern>\n\n<suggested fix>"
+         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**\n\n<failure and trigger>\n\n<why it matters>\n\n<smallest acceptable fix>"
        },
        {
          "path": "other.ext",
          "line": 17,
          "side": "RIGHT",
-         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [NIT]**\n\n<concern>"
+         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [NIT]**\n\n<failure and why it belongs to this change>"
        }
      ]
    }
@@ -437,9 +486,11 @@ never continue past a failed mutation as if it landed.
    <!-- ai-loop:codex-reviewer iter={{ITER}} -->
    **[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**
 
-   <concern>
+   <failure and trigger>
 
-   <suggested fix>
+   <why it matters>
+
+   <smallest acceptable fix>
    BODY
    )" \
          '{body: $body,
@@ -656,7 +707,8 @@ never continue past a failed mutation as if it landed.
 
    ### Findings (this iteration)
    - **[BLOCKER]** `path/to/file.ext:42` — <the concern, the input or path
-     that triggers it, and the fix you'd accept>
+     that triggers it, why this change causes or exposes it, why it matters,
+     and the smallest fix you'd accept>
    - **[MAJOR]** `other.ext:17` — <...>
    - **[NIT]** `docs/x.md:3` — <...>
 

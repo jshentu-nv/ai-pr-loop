@@ -879,6 +879,102 @@ local_tip_ref() {
 # commit. Written once per run and read by finalize_turn.sh.
 local_base_file() { printf '%s/base.sha\n' "$(local_state_dir)"; }
 
+# The target-side base of the change when the local review started. Together
+# with base.sha (the original PR/branch head), it lets every later turn split
+# the author's change from the review-created diff. Keep it pinned even when
+# the target branch advances while a long review is running.
+local_target_base_file() { printf '%s/target-base.sha\n' "$(local_state_dir)"; }
+
+# The final copy is kept after completion so the operator can audit which
+# paths the review changed and which of those paths were new to the change.
+local_scope_report_file() { printf '%s/review-scope.md\n' "$(local_state_dir)"; }
+
+# Write a deterministic scope report for the current local tip. The report
+# is evidence, not an automatic rejection: a focused test can validly add a
+# new path, but the agents must explain why it belongs to this change.
+local_write_scope_report() {  # <destination>
+  local dest="$1" target base head tmp original_list review_list final_list
+  local original_stat review_stat final_stat
+  local path original_path in_original new_count=0
+  local -a original_paths=() review_paths=() final_paths=() new_paths=()
+
+  [[ -s "$(local_target_base_file)" ]] \
+    || die "local scope report has no target base ($(local_target_base_file) is missing)"
+  [[ -s "$(local_base_file)" ]] \
+    || die "local scope report has no review base ($(local_base_file) is missing)"
+  target=$(<"$(local_target_base_file)")
+  base=$(<"$(local_base_file)")
+  head=$(git -C "$REPO_DIR" rev-parse HEAD) \
+    || die "could not read HEAD for the local scope report"
+
+  mkdir -p "$(dirname "$dest")"
+  original_list="${dest}.original.tmp.$$"
+  review_list="${dest}.review.tmp.$$"
+  final_list="${dest}.final.tmp.$$"
+  if ! git -C "$REPO_DIR" diff --name-only -z "${target}...${base}" -- > "$original_list" \
+     || ! git -C "$REPO_DIR" diff --name-only -z "${base}..${head}" -- > "$review_list" \
+     || ! git -C "$REPO_DIR" diff --name-only -z "${target}...${head}" -- > "$final_list"; then
+    rm -f "$original_list" "$review_list" "$final_list"
+    die "could not list paths for the local scope report"
+  fi
+  while IFS= read -r -d '' path; do original_paths+=("$path"); done < "$original_list"
+  while IFS= read -r -d '' path; do review_paths+=("$path"); done < "$review_list"
+  while IFS= read -r -d '' path; do final_paths+=("$path"); done < "$final_list"
+  rm -f "$original_list" "$review_list" "$final_list"
+
+  for path in "${review_paths[@]}"; do
+    in_original=0
+    for original_path in "${original_paths[@]}"; do
+      if [[ "$path" == "$original_path" ]]; then
+        in_original=1
+        break
+      fi
+    done
+    if (( in_original == 0 )); then
+      new_paths+=("$path")
+      new_count=$((new_count + 1))
+    fi
+  done
+
+  original_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${base}" --) \
+    || die "could not summarize the original change for the local scope report"
+  review_stat=$(git -C "$REPO_DIR" diff --shortstat "${base}..${head}" --) \
+    || die "could not summarize the review-created diff for the local scope report"
+  final_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${head}" --) \
+    || die "could not summarize the final change for the local scope report"
+  [[ -n "$original_stat" ]] || original_stat='no changes'
+  [[ -n "$review_stat" ]] || review_stat='no changes'
+  [[ -n "$final_stat" ]] || final_stat='no changes'
+
+  tmp="${dest}.tmp.$$"
+  {
+    printf '# Review scope report\n\n'
+    printf 'This separates the original change from work added by the review loop.\n'
+    printf 'Reading a path is not permission to edit it. Every review-created path\n'
+    printf 'needs a reason tied to the change under review.\n\n'
+    printf -- '- Target base: `%s`\n' "$target"
+    printf -- '- Original change head: `%s`\n' "$base"
+    printf -- '- Current reviewed head: `%s`\n\n' "$head"
+    printf '## Size\n\n'
+    printf -- '- Original change: %s\n' "$original_stat"
+    printf -- '- Review-created diff: %s\n' "$review_stat"
+    printf -- '- Final change: %s\n\n' "$final_stat"
+    printf '## Paths in the original change (%d)\n\n' "${#original_paths[@]}"
+    if (( ${#original_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${original_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+    printf '\n## Paths changed by the review loop (%d)\n\n' "${#review_paths[@]}"
+    if (( ${#review_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${review_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+    printf '\n## Review-created paths outside the original change (%d)\n\n' "$new_count"
+    if (( new_count == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${new_paths[@]}"; do printf -- '- `%q` — requires an explicit scope reason\n' "$path"; done
+    printf '\n## Paths in the final change (%d)\n\n' "${#final_paths[@]}"
+    if (( ${#final_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${final_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+  } > "$tmp" || { rm -f "$tmp"; die "could not write local scope report $dest"; }
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; die "could not publish local scope report $dest"; }
+}
+
 # Where the last committed round left HEAD. The tip ref keeps pr-scope
 # rounds reachable; this file is the EXPECTED tip for both scopes, checked
 # on every resume and sync so a branch or ref that moved outside the loop's
@@ -1143,6 +1239,9 @@ local_setup_repo() {
       || die "could not clear stale ref refs/ai-pr-loop/base in $d"
     git_safe -C "$d" update-ref refs/ai-pr-loop/base "$LOCAL_BASE_SHA" \
       || die "could not point refs/ai-pr-loop/base at $LOCAL_BASE_SHA in $d"
+    if [[ ! -s "$(local_target_base_file)" ]]; then
+      write_state_atomic "$(local_target_base_file)" "$LOCAL_BASE_SHA"
+    fi
     force_clean_to_commit "$d" "$tip" attach
     if [[ ! -s "$(local_base_file)" ]]; then
       printf '%s\n' "$tip" > "$(local_base_file)"
@@ -1183,6 +1282,14 @@ local_setup_repo() {
       || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
     origin_head=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
       || die "could not resolve the PR head after fetch"
+    # Older in-progress state predates the scope report. Migrate it using the
+    # target ref fetched for this invocation. New runs pin this file before
+    # any review round, so later target-branch movement cannot rewrite scope.
+    if [[ ! -s "$(local_target_base_file)" ]]; then
+      write_state_atomic "$(local_target_base_file)" \
+        "$(git -C "$d" rev-parse "refs/ai-pr-loop/base^{commit}")"
+      log "local: recorded the target base for review scope reporting"
+    fi
     if [[ "$origin_head" != "$base" ]]; then
       # One remote position is not external movement: the exact squash this
       # run already validated and pushed, with the crash landing between
@@ -1205,6 +1312,8 @@ local_setup_repo() {
   else
     sync_repo_to_pr_head
     tip=$(git -C "$d" rev-parse HEAD) || die "could not read HEAD in $d"
+    write_state_atomic "$(local_target_base_file)" \
+      "$(git -C "$d" rev-parse "refs/ai-pr-loop/base^{commit}")"
     printf '%s\n' "$tip" > "$(local_base_file)"
     local_record_tip
     log "local: squash base recorded at $tip (PR head)"

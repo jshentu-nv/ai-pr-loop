@@ -72,6 +72,13 @@ else
   CONTEXT_NOTE=''
 fi
 
+SCOPE_NOTE=''
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  SCOPE_FILE="$ID/review-scope.md"
+  local_write_scope_report "$SCOPE_FILE"
+  SCOPE_NOTE="**Review-created diff.** Read \`${SCOPE_FILE}\` before editing. It separates the original change from paths changed by this review and flags paths newly brought into scope. Your response must justify every path you change."
+fi
+
 
 # Render the prompt. GitLab loops use the gitlab prompt variant — same
 # implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -112,6 +119,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{THREAD_FILE}}|${THREAD_FILE}|g" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
+  -e "s|{{SCOPE_NOTE}}|${SCOPE_NOTE}|g" \
   > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"

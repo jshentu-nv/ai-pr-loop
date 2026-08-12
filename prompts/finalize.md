@@ -35,7 +35,13 @@ true.** Do not edit code, do not commit, do not push, do not amend.
    ```
    Nothing outside this diff exists as far as the commit is concerned.
 
-2. **The review record**, in order — `{{HISTORY_DIR}}/iter-NN/`:
+2. **The scope report** — `{{SCOPE_FILE}}`:
+   - It separates the original change from paths added by the review loop.
+   - Check every review-created path, especially a path outside the original
+     change. It needs a clear reason tied to the change under review. A path
+     being touched or containing a nearby defect is not a reason.
+
+3. **The review record**, in order — `{{HISTORY_DIR}}/iter-NN/`:
    - `codex-review.md` — the reviewer's findings for that round.
    - `claude-response.md` — what you fixed, what you pushed back on, why.
 
@@ -43,7 +49,7 @@ true.** Do not edit code, do not commit, do not push, do not amend.
    ls -d {{HISTORY_DIR}}/iter-*
    ```
 
-3. **The rounds themselves**, if you need to place a change:
+4. **The rounds themselves**, if you need to place a change:
    ```bash
    git -C {{REPO_DIR}} log --reverse --format='%h %s' {{BASE_SHA}}..HEAD
    ```

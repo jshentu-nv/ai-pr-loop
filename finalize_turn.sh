@@ -36,6 +36,7 @@ DESC_FILE="$LOCAL_DIR/pr-description.md"
 FINALIZED_FILE=$(local_finalized_file)
 INPROGRESS_FILE=$(local_finalize_inprogress_file)
 BASELINE_FILE="$LOCAL_DIR/metadata-baseline.json"
+SCOPE_FILE=$(local_scope_report_file)
 
 # Record a finalize outcome that has not landed terminally yet — the tip it
 # covers and what it is — as one atomic journal write.
@@ -54,7 +55,8 @@ hold_outcome() {  # <sha> <squash|nocommit>
 mark_completed() {
   write_state_atomic "$(local_completed_file)" "$1"
   rm -f "$BASE_FILE" "$FINALIZED_FILE" "$INPROGRESS_FILE" \
-        "$(local_tip_file)" "$(local_origin_file)"
+        "$(local_tip_file)" "$(local_origin_file)" \
+        "$(local_target_base_file)"
 }
 
 # The PR/MR's current title and body, as one canonical string per forge —
@@ -86,6 +88,11 @@ sync_repo_to_local_head
 HEAD_SHA=$(git -C "$REPO_DIR" rev-parse HEAD)
 git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" \
   || die "HEAD ($HEAD_SHA) in $REPO_DIR no longer descends from the squash base ($BASE_SHA) — refusing to rewrite history the loop did not create"
+
+# Keep a human-readable split between the original change and everything the
+# review added. The closing agent must read it before composing the message;
+# the file remains in the state dir after the review completes.
+local_write_scope_report "$SCOPE_FILE"
 
 ROUNDS=$(git -C "$REPO_DIR" rev-list --count "${BASE_SHA}..${HEAD_SHA}")
 
@@ -176,6 +183,7 @@ else
     -e "s|{{BASE_SHA}}|${BASE_SHA}|g" \
     -e "s|{{ROUNDS}}|${ROUNDS}|g" \
     -e "s|{{HISTORY_DIR}}|${STATE_DIR}|g" \
+    -e "s|{{SCOPE_FILE}}|${SCOPE_FILE}|g" \
     -e "s|{{MESSAGE_FILE}}|${MSG_FILE}|g" \
     -e "s|{{TITLE_FILE}}|${TITLE_FILE}|g" \
     -e "s|{{DESC_FILE}}|${DESC_FILE}|g" \
@@ -473,6 +481,17 @@ fi
 # core.hooksPath=/dev/null: a repository pre-push hook is code the turn
 # controls, running with the orchestrator's authority AFTER the destination
 # was validated — this push is mechanical, so no hook may run under it.
+# Check the complete publication unit one last time. This catches a missed
+# stage/amend, an unexpected second parent, or a dirty tree before any remote
+# state changes.
+[[ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal --ignore-submodules=none)" ]] \
+  || die "the worktree is not clean immediately before push — refusing to publish a commit that may not contain the intended review changes"
+[[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$HEAD_SHA" ]] \
+  || die "HEAD moved after the squashed commit was verified — refusing to push"
+[[ "$(git -C "$REPO_DIR" rev-list --parents -n 1 "$HEAD_SHA")" == "$HEAD_SHA $BASE_SHA" ]] \
+  || die "the final commit is not one single-parent squash on the recorded review base $BASE_SHA — refusing to push"
+[[ "$(git -C "$REPO_DIR" rev-parse "${HEAD_SHA}^{tree}")" == "$APPROVED_TREE" ]] \
+  || die "the final commit no longer contains the tree Codex approved — refusing to push"
 log "finalize: pushing $HEAD_SHA to origin"
 if ! git_safe -C "$REPO_DIR" push origin "HEAD:refs/heads/$HEAD_REF" >&2; then
   die "push of $HEAD_SHA was rejected (the branch moved while the review ran?). The squashed commit is in $REPO_DIR at $HEAD_SHA — reconcile it there and push manually; the loop never force-pushes"
