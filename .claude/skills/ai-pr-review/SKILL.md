@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
-description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted), or locally on a branch. Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", "review this branch locally", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account. With --local it posts nothing and lands the whole review as one squashed commit.
-argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
+description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted), locally on a branch, or as an audit of a whole checkout. Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", "review this branch locally", "audit this repo and open a PR with whatever needs fixing", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account. With --local it posts nothing and lands the whole review as one squashed commit; with --local --audit that commit goes on a new branch and gets one PR/MR of its own.
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--audit] [--pr-branch NAME] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -30,6 +30,12 @@ without pushing, and when they agree a final `claude -p` turn composes one
 commit message for the whole review — the orchestrator then squashes every
 round into that single commit and pushes it.
 
+With `--local --audit` there is no PR/MR and no diff base: codex reviews the
+whole worktree at HEAD, the branch under review is never written, and the
+closing turn also composes a title and description. The orchestrator puts
+the squashed commit on a new branch, pushes it, and opens one PR/MR against
+the branch under review.
+
 ## Inputs
 
 Parse the user's request into:
@@ -51,6 +57,10 @@ If only a bare number, ask the user for the repo slug — don't guess from
 cwd. For a GitLab repo given as slug + number, also pass
 `--host <hostname>` (implies the gitlab forge) unless it's gitlab.com,
 where `--forge gitlab` alone suffices.
+
+A request with no PR/MR in it — "review this branch", "audit this repo" —
+needs none of the above: see `--base` and `--audit` below. Both work on the
+checkout `--dir` names (default: cwd).
 
 Optional flags worth surfacing if the user mentions a constraint:
 
@@ -109,9 +119,36 @@ Optional flags worth surfacing if the user mentions a constraint:
   (`main`, `origin/main`, a tag, a SHA). Only valid with `--local`. Use
   when the user asks to review a local branch or work-in-progress that has
   no PR yet. No forge credential is used.
+- `--audit` + no PR/MR and no `--base` — an **audit of the whole worktree**:
+  codex reviews every file in `--dir` (default: cwd) at HEAD, not a diff.
+  Only valid with `--local`. Use when there is no change in flight — "audit
+  this repo", "go through the codebase and fix what's wrong", "open a PR
+  with whatever needs fixing". Details:
+  - It is a local **branch** review that the loop sets up for itself: it
+    creates a branch at HEAD (`ai-review/<branch>-<hash>`, or
+    `--pr-branch NAME`), checks it out, and reviews against HEAD. The branch
+    you had checked out is never written, because the loop never works on it.
+  - The name must not already exist locally or on `origin`.
+  - On agreement the rounds squash into one commit, that branch is pushed,
+    and one agent turn opens a **PR/MR against the branch you started on**,
+    following `.claude/skills/open-pr/SKILL.md`. The orchestrator makes no
+    forge call itself; the skill works the forge out from `origin` and
+    adopts an existing PR/MR rather than opening a second one. That turn
+    needs a credential for whichever forge `origin` points at.
+  - Re-running the same command continues the audit — the checkout is on the
+    review branch and the loop recognizes its own state there.
+  - An audit that finds nothing to fix pushes nothing and opens no PR/MR;
+    the exchange files are its only record. Say so when reporting.
+  - Hitting `--max` publishes nothing: the rounds wait on the review branch
+    and the next invocation continues them.
+- `--pr-branch NAME` — `--audit` only: name the branch the squashed commit
+  lands on. Must not exist locally or on `origin`, and must not name the
+  branch under review.
 - `--no-push` — `--local` only: create the squashed commit but stop before
-  pushing, for inspection ("let me look before it goes up"). Re-running
-  without the flag pushes it without composing the message again.
+  pushing, for inspection ("let me look before it goes up"). With `--audit`
+  it stops once the new branch exists: nothing is pushed and no PR/MR is
+  opened. Re-running without the flag finishes without composing the
+  message again.
 
 - **Additional context** (shared by both agents) — when the user wants the
   bots to consider external reference material (a design doc, RFC, related
@@ -177,7 +214,9 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--stop` — write the stop sentinel for this PR and signal its supervisor,
   then exit. Use when the user says "stop the review", "cancel the bots" and
   the background task is gone or unresponsive. Runs no preflight and clones
-  nothing, so it is safe to call at any time.
+  nothing, so it is safe to call at any time. With no PR/MR, repeat the
+  flags that named the target: `--local --base REF --dir DIR --stop`, or
+  `--local --audit --dir DIR --stop`.
 
 ## Steps
 
@@ -259,6 +298,12 @@ and no PR/MR, no forge identity is involved at all — confirm the checkout,
 the branch, and the base instead. `--no-push` means nothing leaves the
 machine; say so.
 
+With `--local --audit`, confirm the checkout, the branch it has out (that
+is what the PR/MR will target), and that the loop creates a branch of its
+own to work on — so the branch they are on is never written. The PR/MR is
+opened at the end by an agent turn using whichever forge credential
+`origin` calls for.
+
 The loop writes to a live PR/MR: it posts comments under the user's forge
 API identity (gh PAT on GitHub, GitLab token on GitLab), and (via Claude)
 pushes commits through the checkout's git credential. Always tell the
@@ -276,6 +321,8 @@ previous run in this session). When in doubt, ask.
 "$RUN_SH" <PR_NUMBER> --repo <REPO_SLUG> --max <N> --converge <N>
 # or, when the user gave a URL (works for GitHub and GitLab):
 "$RUN_SH" <PR_OR_MR_URL> --max <N> --converge <N>
+# or, for an audit of a whole checkout (no PR/MR, no base):
+"$RUN_SH" --local --audit --dir <DIR> --max <N> --converge <N>
 ```
 
 Append any context the user supplied, e.g.
@@ -368,14 +415,18 @@ When the background `run.sh` completes, summarize:
 
 - Final status: `approved`, `converged_no_major`, `review_posted` (only
   with `--review-only`), `max_iterations_reached`, `codex_error`,
-  `claude_error`, or `finalize_error` (only with `--local`: the squash or
-  the push failed; the rounds are still in the checkout).
+  `claude_error`, or `finalize_error` (only with `--local`: the squash, the
+  push, or — with `--audit` — the review branch or its PR/MR failed; the
+  rounds are still in the checkout).
 - Iter count + last codex `BLOCKER=… MAJOR=… NIT=…` counts.
 - Wall time per iter (read from the timestamps in the log).
 - PR URL so the user can audit.
 - With `--local`: the pushed commit's sha and subject (the `finalize:`
   lines in the log), or — when nothing was pushed — where the rounds are
   and what to run next.
+- With `--local --audit`: the review branch and the URL of the PR/MR the
+  loop opened, both on the `finalize: done —` line. Give the user that URL.
+  An audit that found nothing to fix created neither; say so.
 
 Artifacts for each iteration live at
 `$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
@@ -422,3 +473,8 @@ they remember the prior discussion.
 - Force-push, rebase, or "fix up" a `--local` run's rounds by hand. If the
   push was refused because the branch moved, report it and let the user
   decide.
+- Switch branches in the checkout while an `--audit` run is live. The loop
+  works on the review branch it created; moving off it stops the run.
+- Create the review branch, push it, or open the audit's PR/MR yourself.
+  The loop does all three, the last through the `open-pr` skill; doing any
+  of it by hand makes the run refuse.

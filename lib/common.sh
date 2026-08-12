@@ -120,6 +120,54 @@ write_state_atomic() {  # <path> <content>
     && mv -f "$1.tmp" "$1"
 }
 
+# --- Orchestrator receipts ----------------------------------------------
+#
+# Agent turns run with the operator's authority and get --add-dir on the
+# state dir, so any file there could have been written by a turn rather
+# than by this script. For state the orchestrator ACTS on — the branch an
+# audit's PR/MR targets, the URL that marks it complete — that matters: a
+# turn could write one and redirect or short-circuit publication.
+#
+# A receipt is a keyed digest of the value, written beside it under a key
+# that lives outside the state dir (in the loop's own private dir, which is
+# not handed to any turn). A turn can write the value; it cannot forge the
+# receipt without the key, so the orchestrator only honours values it
+# wrote itself. This is not a defence against an operator-authority
+# attacker — nothing here can be — it is what keeps an ordinary confused
+# or over-helpful turn from steering publication.
+
+# The per-loop receipt key, created on first use with owner-only permissions.
+receipt_key_file() { printf '%s/.receipt-key\n' "$LOOP_HOME"; }
+receipt_key() {
+  local f; f=$(receipt_key_file)
+  if [[ ! -s "$f" ]]; then
+    ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$f.tmp" \
+      && mv -f "$f.tmp" "$f" ) || return 1
+  fi
+  cat "$f"
+}
+# A value's receipt: a digest over the key, the file's identity, and the
+# value. git hash-object is already a dependency, so no extra hasher.
+receipt_of() {  # <path> <value>
+  printf '%s\0%s\0%s' "$(receipt_key)" "${1##*/}" "$2" | git hash-object --stdin
+}
+# Write a value AND its receipt. The receipt lands first: a torn write must
+# read as "no valid receipt" (rejected), never as a valid one for a value
+# that was not written.
+write_receipted() {  # <path> <value>
+  write_state_atomic "$1.receipt" "$(receipt_of "$1" "$2")" \
+    && write_state_atomic "$1" "$2"
+}
+# Print a value only when its receipt proves the orchestrator wrote it.
+# Anything else — no file, no receipt, a mismatch — prints nothing, rc 1.
+read_receipted() {  # <path>
+  local v
+  [[ -s "$1" && -s "$1.receipt" ]] || return 1
+  v=$(<"$1")
+  [[ "$(<"$1.receipt")" == "$(receipt_of "$1" "$v")" ]] || return 1
+  printf '%s\n' "$v"
+}
+
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {
@@ -2243,6 +2291,11 @@ claude_prepare_cli() {
 
 # Run <prompt-file>, writing stdout to <out> and stderr to <err>. Sets
 # $CLAUDE_RUN_RC (and returns it).
+# Extra --add-dir arguments for a turn that must read outside the checkout
+# and the state dir — the closing PR step reaches the loop's own skill
+# directory this way, since it runs inside the repo under review.
+CLAUDE_EXTRA_DIR_ARGS=()
+
 claude_run_prompt() {
   _CLAUDE_PROMPT_FILE="$1"; _CLAUDE_OUT="$2"; _CLAUDE_ERR="$3"
   # A failing turn is a value this function RETURNS, not a script-ending
@@ -2253,6 +2306,46 @@ claude_run_prompt() {
   case $- in *e*) _saved_errexit=1 ;; esac
   # claude -p runs non-interactively; permission handling for unattended
   # operation (user authorized this) is selected above via --claude-perms.
+  # --- auto-mode classifier stall watchdog --------------------------------
+  #
+  # --permission-mode auto gates every tool call on a SEPARATE model call.
+  # When that classifier is unreachable the CLI returns neither allow nor
+  # deny but a third, non-terminal result whose text tells the agent to wait
+  # and retry — so the agent retries, forever: no tool call executes, the
+  # turn never finishes, and nothing above it ever sees a failure. (Observed:
+  # a turn that ran 23 hours past the outage, 3,399 blocked calls, zero
+  # progress.) The startup-rejection retry below deliberately excludes this
+  # string because it can fire AFTER side effects; that is right for a
+  # one-shot retry and leaves the indefinite case unhandled.
+  #
+  # Detect it while the turn RUNS: the CLI writes the diagnostic to stderr
+  # each time, so a stderr that keeps growing with that message while stdout
+  # stays empty is a turn making no progress. Kill it, and mark the cause so
+  # the next attempt does not re-enter the same deadlock.
+  CLAUDE_CLASSIFIER_STALL_FILE="${STATE_DIR:-/tmp}/.claude-classifier-stall"
+  CLAUDE_STALL_HITS="${CLAUDE_STALL_HITS:-8}"      # blocked results before giving up
+  CLAUDE_STALL_POLL="${CLAUDE_STALL_POLL:-20}"     # seconds between checks
+  _claude_stall_watch() {  # <pid of the turn>
+    local pid="$1" hits
+    rm -f "$CLAUDE_CLASSIFIER_STALL_FILE"
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep "$CLAUDE_STALL_POLL"
+      kill -0 "$pid" 2>/dev/null || return 0
+      # Only a turn that has produced NOTHING can be stalled: any stdout
+      # means the model is answering, and a completed tool call would have
+      # moved the work forward.
+      [[ -s "$_CLAUDE_OUT" ]] && continue
+      hits=$(grep -c 'cannot determine the safety' "$_CLAUDE_ERR" 2>/dev/null) || hits=0
+      if (( hits >= CLAUDE_STALL_HITS )); then
+        : > "$CLAUDE_CLASSIFIER_STALL_FILE"
+        log "claude: auto mode's permission classifier has been unavailable for $hits consecutive actions — the turn cannot make progress; stopping it"
+        kill "$pid" 2>/dev/null
+        sleep 2; kill -9 "$pid" 2>/dev/null
+        return 0
+      fi
+    done
+  }
+
   _claude_exec() {
     ( cd "$REPO_DIR" && \
       CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
@@ -2265,6 +2358,7 @@ claude_run_prompt() {
         "${CLAUDE_SETTINGS_ARG[@]}" \
         --add-dir "$REPO_DIR" \
         --add-dir "$STATE_DIR" \
+        ${CLAUDE_EXTRA_DIR_ARGS[@]+"${CLAUDE_EXTRA_DIR_ARGS[@]}"} \
         --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
         "$(cat "$_CLAUDE_PROMPT_FILE")" \
         > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
@@ -2272,9 +2366,38 @@ claude_run_prompt() {
 
   set +e
   TURN_START=$SECONDS
-  _claude_exec
+  # Run the turn in the background so the watchdog can reach it. Only auto
+  # mode can hit the classifier stall, so only auto mode is watched.
+  _claude_exec &
+  _CLAUDE_PID=$!
+  _CLAUDE_WATCHDOG=''
+  if [[ "$CLAUDE_PERMS_RESOLVED" == "auto" ]] && (( ${#CLAUDE_PERMS_ARG[@]} > 0 )); then
+    _claude_stall_watch "$_CLAUDE_PID" &
+    _CLAUDE_WATCHDOG=$!
+  fi
+  wait "$_CLAUDE_PID"
   CLAUDE_RUN_RC=$?
+  if [[ -n "$_CLAUDE_WATCHDOG" ]]; then
+    kill "$_CLAUDE_WATCHDOG" 2>/dev/null || true
+    wait "$_CLAUDE_WATCHDOG" 2>/dev/null || true
+  fi
   TURN_ELAPSED=$(( SECONDS - TURN_START ))
+
+  # A turn the watchdog stopped: retry it HERE, in this same invocation, with
+  # the classifier out of the loop. The turn produced no output, so nothing
+  # is duplicated by re-running it.
+  if [[ -e "$CLAUDE_CLASSIFIER_STALL_FILE" ]]; then
+    rm -f "$CLAUDE_CLASSIFIER_STALL_FILE"
+    log "claude: retrying this turn with the permission classifier bypassed (--claude-perms bypass); actions are no longer gated per call"
+    mv -f "$_CLAUDE_ERR" "${_CLAUDE_ERR}.classifier-stalled" 2>/dev/null || true
+    CLAUDE_PERMS_RESOLVED=bypass
+    CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
+    SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
+    _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+    CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+    _claude_exec
+    CLAUDE_RUN_RC=$?
+  fi
 
   # Auto mode is not available on every account/provider; the CLI refuses the
   # flag at startup there — before any turn work runs — so a retry cannot
@@ -2324,6 +2447,10 @@ claude_run_prompt() {
 #   {{#local}}  … {{/local}}    the review is exchanged as files on disk
 #   {{#pr}}     … {{/pr}}       a PR/MR exists, so its metadata is readable
 #   {{#branch}} … {{/branch}}   no PR/MR: a local branch against a base ref
+#   {{#audit}}  … {{/audit}}    the review scope is the whole worktree
+#   {{#diff}}   … {{/diff}}     the review scope is a diff — the complement
+#                               of {{#audit}}, so prose shared by the two
+#                               diff scopes is written once
 #
 # render_forge_blocks keeps the blocks whose tag is in the ACTIVE SET ($2, a
 # space-separated list built by prompt_tags) and drops the rest; text outside
@@ -2339,7 +2466,7 @@ claude_run_prompt() {
 # squash / nocommit select the finalize prompt's job: compose the squashed
 # commit's message, or — when the rounds land no net change on a PR/MR —
 # only assess the title/description.
-PROMPT_BLOCK_TAGS='github gitlab forge local pr branch squash nocommit'
+PROMPT_BLOCK_TAGS='github gitlab forge local pr branch audit diff squash nocommit'
 
 render_forge_blocks() {
   local template="$1" want="$2"
@@ -2375,10 +2502,15 @@ render_forge_blocks() {
 prompt_tags() {
   local tags
   if [[ "$LOCAL_MODE" == "1" ]]; then tags='local'; else tags='forge'; fi
-  if [[ "$LOCAL_SCOPE" == "branch" ]]; then
-    tags="$tags branch"
+  if [[ "${AUDIT:-0}" == "1" ]]; then
+    # An audit runs on a branch the loop created, so it IS branch scope —
+    # but its review surface is the tree, not a diff, and it has no forge
+    # target during the review. 'audit' replaces both of those tags.
+    tags="$tags audit"
+  elif [[ "$LOCAL_SCOPE" == "branch" ]]; then
+    tags="$tags branch diff"
   else
-    tags="$tags pr ${FORGE:-github}"
+    tags="$tags pr diff ${FORGE:-github}"
   fi
   printf '%s\n' "$tags"
 }
@@ -2389,6 +2521,20 @@ prompt_tags() {
 # gitlab) FORGE_HOST set.
 forge_vocab() {
   local slug="${REPO_SLUG:-${REPO_OWNER:-}/${REPO_NAME:-}}"
+  if [[ "${AUDIT:-0}" == "1" ]]; then
+    # No PR/MR exists yet, and which forge origin points at is the closing
+    # step's business, not this vocabulary's — so the nouns stay neutral.
+    FORGE_NAME='the forge'
+    PR_NOUN='PR/MR'
+    PR_NOUN_LONG='pull request / merge request'
+    PR_REF='against the branch `$AUDIT_PR_BASE`'
+    SUMMARY_NOUN='review file'
+    INLINE_NOUN='findings'
+    INLINE_NOUN_TITLE='Findings'
+    TOKEN_NOUN='credential'
+    AUTOLINK_SIGILS='`#N`'
+    return
+  fi
   if [[ "$LOCAL_SCOPE" == "branch" ]]; then
     # No forge at all. PR_REF names the branch through the exported shell
     # variable, never the literal name — the branch name is deliberately kept

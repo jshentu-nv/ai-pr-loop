@@ -186,6 +186,29 @@ fi
 # Simulate the documented runtime classifier abort: side effects happened,
 # stdout is EMPTY (text mode only prints the final response), and stderr
 # mentions auto mode — the fallback must never rerun this turn.
+# The permission classifier going down MID-TURN: the CLI keeps reporting
+# that it cannot decide, the agent keeps retrying, no tool call ever runs and
+# the process never exits. Emits to stderr only — stdout stays empty, which
+# is what proves no progress. Runs until killed.
+if [[ "${STUB_CLASSIFIER_STALL:-0}" == "1" ]]; then
+  for a in "$@"; do
+    if [[ "$a" == "--dangerously-skip-permissions" ]]; then
+      # The retry after the watchdog fired: the classifier is out of the
+      # loop, so this attempt behaves like a normal successful turn.
+      printf 'x' >> "${ARGV_FILE}.bypass.calls"
+      if [[ "${LOCAL_MODE:-0}" == "1" ]]; then
+        printf 'stub response\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/claude-response.md"
+      fi
+      echo "[CLAUDE_TURN: COMPLETE]"
+      exit 0
+    fi
+  done
+  printf 'x' >> "${ARGV_FILE}.stalled.calls"
+  while :; do
+    echo "claude-opus-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again." >&2
+    sleep 1
+  done
+fi
 if [[ "${STUB_RUNTIME_AUTO_ABORT:-0}" == "1" ]]; then
   touch "${ARGV_FILE}.side-effect"
   echo "Error: repeated permission blocks, so auto mode cannot determine the safety of this action" >&2
@@ -196,7 +219,31 @@ fi
 # without writing the file — the shape a crashed compose leaves behind.
 for a in "$@"; do
   case "$a" in
+    *"Open the audit's"*)
+      # The audit's closing forge step: the agent follows the open-pr skill
+      # and records the URL it ended up with. STUB_OPENPR_FAIL=1 fails the
+      # turn; STUB_OPENPR_SILENT=1 prints the marker without writing the URL
+      # (the shape a turn that never reached the forge leaves behind).
+      # STUB_OPENPR_SH is free-form repository sabotage, evaluated in the
+      # checkout — this turn's counterpart of STUB_FINALIZE_SH.
+      printf 'x' >> "${ARGV_FILE}.openpr.calls"   # 1 byte per turn
+      : > "${ARGV_FILE}.openpr"
+      for _b in "$@"; do printf '%s\n' "$_b" >> "${ARGV_FILE}.openpr"; done
+      if [[ -n "${STUB_OPENPR_SH:-}" ]]; then
+        ( cd "$REPO_DIR" && eval "$STUB_OPENPR_SH" )
+      fi
+      if [[ "${STUB_OPENPR_FAIL:-0}" == "1" ]]; then
+        echo "open-pr turn failed" >&2; exit 1
+      fi
+      if [[ "${STUB_OPENPR_SILENT:-0}" != "1" ]]; then
+        printf '%s\n' "${STUB_OPENPR_URL:-https://github.com/o/n/pull/123}" \
+          > "$OPEN_PR_URL_FILE"
+      fi
+      echo "[OPEN_PR: COMPLETE]"
+      exit 0
+      ;;
     *"Finalize the local review"*)
+      printf 'x' >> "${ARGV_FILE}.fin.calls"   # 1 byte per closing turn
       if [[ "${STUB_NO_FINALIZE_MSG:-0}" != "1" ]]; then
         mkdir -p "$STATE_DIR/local"
         printf '%s\n' "${STUB_FINALIZE_MSG:-Squashed subject line}" \
@@ -231,9 +278,14 @@ done
 # comment. STUB_NO_LOCAL_ARTIFACT=1 (both bots) and STUB_NO_CLAUDE_LOCAL_ARTIFACT=1
 # (this bot only) print the marker without writing it.
 # STUB_CLAUDE_COMMIT=1 emulates an implementer round that lands a commit.
+# STUB_CLAUDE_SH is free-form repository/state sabotage, evaluated in the
+# checkout — the round-turn counterpart of STUB_FINALIZE_SH.
 if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_CLAUDE_COMMIT:-0}" == "1" ]]; then
   printf 'round %s\n' "$ITER" >> "$REPO_DIR/f"
   git -C "$REPO_DIR" -c user.name=stub -c user.email=s@s commit -qam "round $ITER"
+fi
+if [[ "${LOCAL_MODE:-0}" == "1" && -n "${STUB_CLAUDE_SH:-}" ]]; then
+  ( cd "$REPO_DIR" && eval "$STUB_CLAUDE_SH" )
 fi
 if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" \
       && "${STUB_NO_CLAUDE_LOCAL_ARTIFACT:-0}" != "1" ]]; then
@@ -263,6 +315,11 @@ printf '{"payload":{"id":"stub-session-uuid","cwd":"%s"}}\n' "$(pwd -P)" \
   > "$CODEX_HOME/sessions/rollout-stub.jsonl"
 # Local review mode: the turn's contract is a written review file.
 # STUB_NO_LOCAL_ARTIFACT=1 prints a verdict without writing it.
+# STUB_CODEX_SH is free-form repository/state sabotage, evaluated in the
+# checkout — the reviewer-turn counterpart of STUB_CLAUDE_SH.
+if [[ "${LOCAL_MODE:-0}" == "1" && -n "${STUB_CODEX_SH:-}" ]]; then
+  ( cd "$REPO_DIR" && eval "$STUB_CODEX_SH" )
+fi
 if [[ "${LOCAL_MODE:-0}" == "1" && "${STUB_NO_LOCAL_ARTIFACT:-0}" != "1" ]]; then
   printf 'stub review\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/codex-review.md"
 fi
@@ -339,6 +396,22 @@ case "$*" in
     printf '{"title":"%s","body":"%s"}\n' \
       "${STUB_PR_TITLE:-Live title}" "${STUB_PR_BODY:-Live body}"
     exit 0 ;;
+  *"pr list"*)
+    # An audit queries the forge for an existing PR before creating one.
+    if [[ "${STUB_GH_PR_LIST_FAIL:-0}" == "1" ]]; then exit 1; fi
+    if [[ "${STUB_GH_PR_EXISTS:-0}" == "1" ]]; then
+      RAW='[{"url":"https://github.com/o/n/pull/123","number":123}]'
+    else
+      RAW='[]'
+    fi
+    ;;
+  *"pr create"*)
+    : > "${ARGV_FILE}.ghcreate"
+    for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.ghcreate"; done
+    printf 'x' >> "${ARGV_FILE}.ghcreate.calls"   # 1 byte per creation
+    if [[ "${STUB_GH_CREATE_FAIL:-0}" == "1" ]]; then exit 1; fi
+    echo 'https://github.com/o/n/pull/123'
+    exit 0 ;;
   *"pr edit"*)
     : > "${ARGV_FILE}.ghedit"
     for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.ghedit"; done
@@ -388,12 +461,14 @@ EOF
 # $CURL_LOG when set ("METHOD URL BODY", body read from --data @-).
 cat > "$STUBS/curl" <<'EOF'
 #!/usr/bin/env bash
-url=''; method=GET; body=''; prev=''; hdrs=()
+url=''; method=GET; body=''; prev=''; hdrs=(); outfile=''; writeout=''
 for a in "$@"; do
   case "$prev" in
     -X)     method="$a" ;;
     --data) body="$a" ;;
     -H)     hdrs+=("$a") ;;
+    -o)     outfile="$a" ;;
+    -w)     writeout="$a" ;;
   esac
   [[ "$a" == http://* || "$a" == https://* ]] && url="$a"
   prev="$a"
@@ -471,6 +546,27 @@ PAYLOAD
       echo '{}'
     fi
     ;;
+  "GET "*"/merge_requests"[?]*)
+    # An audit's find-before-create query.
+    if [[ "${STUB_CURL_MR_LIST_FAIL:-0}" == "1" ]]; then exit 22; fi
+    if [[ "${STUB_GL_MR_EXISTS:-0}" == "1" ]]; then
+      echo '[{"iid":77,"web_url":"https://gl.example/g/p/-/merge_requests/77","source_project_id":1,"target_project_id":1}]'
+    else
+      echo '[]'
+    fi
+    ;;
+  "POST "*"/merge_requests")
+    : > "${ARGV_FILE}.mrcreate"
+    printf '%s\n' "$body" >> "${ARGV_FILE}.mrcreate"
+    printf 'x' >> "${ARGV_FILE}.mrcreate.calls"
+    if [[ "${STUB_CURL_FAIL_POST:-0}" == "1" ]]; then exit 22; fi
+    # The real call passes -o FILE -w '%{http_code}': the body lands in the
+    # file and only the status reaches stdout.
+    _mrbody='{"iid":77,"web_url":"https://gl.example/g/p/-/merge_requests/77"}'
+    _code="${STUB_GL_MR_CREATE_CODE:-201}"
+    if [[ -n "$outfile" ]]; then printf '%s\n' "$_mrbody" > "$outfile"; else printf '%s\n' "$_mrbody"; fi
+    [[ -n "$writeout" ]] && printf '%s' "$_code"
+    exit 0 ;;
   "POST "*)
     echo '{"id":"stub-post"}'
     ;;
@@ -953,6 +1049,34 @@ if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
 else
   ok
 fi
+
+t "claude: a stalled permission classifier stops the turn instead of hanging"
+# The real failure this guards: --permission-mode auto gates every tool call
+# on a separate model, and when that model is unreachable the CLI returns a
+# non-terminal "try again" that the agent obeys forever. Observed once for 23
+# hours with zero progress.
+new_case claude-classifier-stall
+run_turn claude STUB_CLASSIFIER_STALL=1 CLAUDE_STALL_HITS=3 CLAUDE_STALL_POLL=1
+assert_eq "$TURN_RC" 0
+if [[ -s "$ARGV.stalled.calls" ]]; then ok; else bad "the stalling attempt never ran"; fi
+
+t "claude: the stalled turn is retried with the classifier bypassed"
+assert_eq "$(wc -c < "$ARGV.bypass.calls" 2>/dev/null | tr -d ' ')" 1
+assert_substr "$ARGV" '--dangerously-skip-permissions'
+assert_no_substr "$ARGV" '--permission-mode' 
+
+t "claude: the stall is reported, not silently swallowed"
+assert_substr "$CASE_DIR/turn.log" 'permission classifier has been unavailable'
+assert_substr "$CASE_DIR/turn.log" 'no longer gated per call'
+
+t "claude: the stalled attempt's stderr is kept for the operator"
+if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.classifier-stalled" ]]; then ok
+else bad "the stalled attempt's stderr was discarded"; fi
+
+t "claude: the bypass retry runs the turn to its completion marker"
+# The retry is a real turn, not a formality: it prints the marker the
+# orchestrator gates on, which the stalled attempt never reached.
+assert_substr "$CASE_DIR/state/iter-01/claude.stdout" '[CLAUDE_TURN: COMPLETE]' 
 
 t "claude: runtime auto abort after side effects never triggers the fallback"
 new_case claude-runtime-abort
@@ -4870,9 +4994,16 @@ _r=$(printf '%s\n' "$_frag" | render_fixture "local branch")
 assert_eq "$_r" "$(printf 'a\nbr\nz')"
 
 t "prompt_tags: forge/local and pr/branch axes"
-assert_eq "$(LOCAL_MODE=0 LOCAL_SCOPE=pr FORGE=gitlab prompt_tags)" 'forge pr gitlab'
-assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github prompt_tags)" 'local pr github'
-assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local prompt_tags)" 'local branch'
+assert_eq "$(LOCAL_MODE=0 LOCAL_SCOPE=pr FORGE=gitlab prompt_tags)" 'forge pr diff gitlab'
+assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=pr FORGE=github prompt_tags)" 'local pr diff github'
+assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local prompt_tags)" 'local branch diff'
+t "prompt_tags: an audit replaces the branch and diff tags"
+assert_eq "$(LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local AUDIT=1 prompt_tags)" 'local audit'
+
+t "forge_vocab: an audit keeps its nouns forge-neutral"
+# Which forge origin points at is the closing step's business, not the
+# review prompts'.
+assert_eq "$(AUDIT=1 LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; forge_vocab; printf '%s' \"\$PR_NOUN\"")" 'PR/MR'
 
 t "forge_vocab: github nouns"
 FORGE=github REPO_SLUG=o/n PR_NUMBER=7 FORGE_HOST=github.com forge_vocab
@@ -4885,86 +5016,9 @@ assert_eq "$PR_NOUN|$SUMMARY_NOUN|$TOKEN_NOUN" 'MR|MR note|GitLab token'
 t "forge_vocab: gitlab reference carries the host"
 assert_eq "$PR_REF" '`g/s/p!7` on `gl.example.com`'
 
-# Every combination the loop can run: exchange mode (forge | local) x scope
-# (pr | branch) x forge. A block that leaks — or silently vanishes — would
-# ship an agent the wrong contract, which no other test would catch.
-for _agent in claude codex; do
-  [[ "$_agent" == claude ]] && _tag=ai-loop:claude-implementer || _tag=ai-loop:codex-reviewer
-  [[ "$_agent" == claude ]] && _artifact=claude-response.md || _artifact=codex-review.md
-  for _tags in "forge pr github" "forge pr gitlab" \
-               "local pr github" "local pr gitlab" "local branch"; do
-    _out=$(render_forge_blocks "$ROOT/prompts/$_agent.md" "$_tags") || _out=''
-
-    t "prompts/$_agent.md [$_tags]: renders and leaves no block markers"
-    if [[ -n "$_out" ]] && ! grep -qE '\{\{[#/]' <<<"$_out"; then ok
-    else bad "empty render or leftover {{#…}} markers"; fi
-
-    t "prompts/$_agent.md [$_tags]: runtime-validation mandate survives"
-    assert_render_has "$_out" 'A missing toolchain is not an excuse'
-
-    t "prompts/$_agent.md [$_tags]: the CI policy matches the mode"
-    # Forge mode reads the head's checks; local mode validates locally —
-    # forge checks describe the remote head, not the unpushed rounds.
-    case "$_tags" in
-      forge*)
-        assert_render_has  "$_out" 'CI is part of the review'
-        assert_render_lacks "$_out" 'CI in a local review'
-        ;;
-      *)
-        assert_render_has  "$_out" 'CI in a local review'
-        assert_render_lacks "$_out" 'CI is part of the review'
-        ;;
-    esac
-
-    case "$_tags" in
-      forge*)
-        t "prompts/$_agent.md [$_tags]: orchestrator's comment marker survives"
-        assert_render_has "$_out" "$_tag"
-        ;;
-      *)
-        t "prompts/$_agent.md [$_tags]: names the file that is the turn's contract"
-        assert_render_has "$_out" "$_artifact"
-        t "prompts/$_agent.md [$_tags]: no comment-posting recipe survives"
-        assert_render_lacks "$_out" 'gh pr comment'
-        assert_render_lacks "$_out" 'gh api --method POST'
-        assert_render_lacks "$_out" '/notes"'
-        assert_render_lacks "$_out" 'in_reply_to'
-        ;;
-    esac
-
-    case "$_tags" in
-      forge*github)
-        t "prompts/$_agent.md [$_tags]: no GitLab mechanics leak"
-        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
-        t "prompts/$_agent.md [$_tags]: uses the gh CLI"
-        assert_render_has "$_out" 'gh pr'
-        ;;
-      forge*gitlab)
-        t "prompts/$_agent.md [$_tags]: no GitHub mechanics leak"
-        assert_render_lacks "$_out" 'gh api'
-        t "prompts/$_agent.md [$_tags]: uses curl with the token header"
-        assert_render_has "$_out" 'PRIVATE-TOKEN'
-        ;;
-      local*github)
-        t "prompts/$_agent.md [$_tags]: no GitLab mechanics leak"
-        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
-        ;;
-      local*gitlab)
-        t "prompts/$_agent.md [$_tags]: no GitHub mechanics leak"
-        assert_render_lacks "$_out" 'gh api'
-        assert_render_lacks "$_out" 'gh pr'
-        ;;
-      *branch)
-        t "prompts/$_agent.md [$_tags]: no forge mechanics at all"
-        assert_render_lacks "$_out" 'PRIVATE-TOKEN'
-        assert_render_lacks "$_out" 'gh pr'
-        assert_render_lacks "$_out" 'gh api'
-        assert_render_lacks "$_out" 'glab '
-        ;;
-    esac
-  done
-done
-
+t "forge_vocab: an audit names its PR base through the shell variable"
+# A branch name can carry sed metacharacters, so it is never substituted in.
+assert_eq "$(AUDIT=1 LOCAL_SCOPE=branch "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; forge_vocab; printf '%s' \"\$PR_REF\"")" 'against the branch `$AUDIT_PR_BASE`'
 t "prompts/codex.md [local pr github]: keeps read-only PR access"
 _out=$(render_forge_blocks "$ROOT/prompts/codex.md" "local pr github")
 assert_render_has "$_out" 'gh pr view'
@@ -5082,6 +5136,57 @@ t "run.sh: a PR-less local review needs a git work tree"
 mkdir -p "$WORK/plain-dir"
 run_run_sh --local --base main --dir "$WORK/plain-dir"
 assert_dies_with "not a git work tree"
+
+# --- --audit: flags --------------------------------------------------------
+
+AUD="$WORK/aud-repo"; git init -q -b main "$AUD"
+git -C "$AUD" config user.email t@t; git -C "$AUD" config user.name t
+echo a > "$AUD/f"; git -C "$AUD" add f; git -C "$AUD" commit -qm base
+git -C "$AUD" checkout -qb feature/x
+echo b >> "$AUD/f"; git -C "$AUD" commit -qam work
+
+t "run.sh: --audit rejects --base"
+run_run_sh --local --audit --dir "$AUD" --base main
+assert_dies_with "there is no base to diff against"
+
+t "run.sh: --audit requires --local"
+run_run_sh --audit --dir "$AUD"
+assert_dies_with "--audit is a local review mode"
+
+t "run.sh: --audit rejects a PR number"
+run_run_sh --local --audit --dir "$AUD" 42
+assert_dies_with "takes no PR/MR number or URL"
+
+t "run.sh: --audit rejects a PR URL"
+run_run_sh --local --audit --dir "$AUD" https://github.com/o/n/pull/42
+assert_dies_with "takes no PR/MR number or URL"
+
+t "run.sh: --pr-branch is rejected without --audit"
+run_run_sh --local --base main --dir "$AUD" --pr-branch x
+assert_dies_with "--pr-branch applies only to --local --audit"
+
+t "run.sh: --pr-branch needs a value and does not swallow the next flag"
+run_run_sh --local --audit --dir "$AUD" --pr-branch
+assert_dies_with "--pr-branch needs a branch name"
+run_run_sh --local --audit --dir "$AUD" --pr-branch --no-push
+assert_dies_with "--pr-branch needs a branch name"
+
+t "run.sh: --pr-branch rejects a full ref and a leading +"
+run_run_sh --local --audit --dir "$AUD" --pr-branch refs/heads/z
+assert_dies_with "not a full ref"
+run_run_sh --local --audit --dir "$AUD" --pr-branch +z
+assert_dies_with "must not start with '+'"
+
+t "run.sh: an audit is reported by --print-config as a branch review"
+run_run_sh --local --audit --dir "$AUD" --print-config
+assert_prints 'mode: local scope=branch base=- push=yes'
+run_run_sh --local --audit --dir "$AUD" --print-config
+assert_prints 'audit: yes pr-branch=(derived)'
+
+t "run.sh: --print-config creates no branch"
+run_run_sh --local --audit --dir "$AUD" --print-config
+assert_eq "$(git -C "$AUD" symbolic-ref --short HEAD)" 'feature/x'
+assert_eq "$(git -C "$AUD" for-each-ref --format='%(refname)' 'refs/heads/ai-review/' | wc -l)" 0
 
 # --- local review mode: state identity -------------------------------------
 
@@ -6234,8 +6339,8 @@ if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
 # -> --restart from a new base) only exist across invocations of run.sh
 # itself. Each fixture gets its own loop home so state dirs never collide.
 
-e2e_fixture() {  # -> $E2E_CLONE (no origin, branch feature/x), $E2E_BASE, $E2E_HOME
-  local n="e2e$RANDOM$RANDOM"
+e2e_fixture() {  # [name] -> $E2E_CLONE (no origin, branch feature/x), $E2E_BASE, $E2E_HOME
+  local n="${1:-e2e$RANDOM$RANDOM}"
   E2E_CLONE="$WORK/$n-clone"; git init -q -b main "$E2E_CLONE"
   git -C "$E2E_CLONE" config user.email t@t; git -C "$E2E_CLONE" config user.name t
   echo base > "$E2E_CLONE/f"; git -C "$E2E_CLONE" add f; git -C "$E2E_CLONE" commit -qm base
@@ -6268,6 +6373,58 @@ run_e2e() {  # [VAR=VAL ...] [args ...]
 }
 e2e_state() { echo "$E2E_HOME"/state/local__*/branch-*; }
 e2e_iters() { ls -d "$(e2e_state)"/iter-* 2>/dev/null | wc -l; }
+run_e2e_raw() {  # run.sh from $E2E_HOME with no --no-auto-resume appended
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" CODEX_HOME="$WORK/codex-home" \
+    "$BASH_BIN" "$E2E_HOME/run.sh" "$@" > "$WORK/e2e.out" 2>&1
+  E2E_RC=$?
+}
+
+# --- the state path the front-end and the supervisor derive ----------------
+#
+# Every entry point that runs before the branch is discovered computes the
+# state dir from the resolved identity. A PR-less scope has no PR number, so
+# deriving the leaf as pr-<N> both crashed on the unset branch name and, past
+# that, pointed the supervisor at a different dir than its worker.
+
+t "run.sh: --stop on a PR-less local review resolves the branch's state dir"
+e2e_fixture
+run_e2e_raw --local --base main --dir "$E2E_CLONE" --stop
+assert_eq "$E2E_RC" 0
+if [[ -e "$(e2e_state)/stop" ]]; then ok; else bad "no stop sentinel at $(e2e_state)/stop"; fi
+
+t "run.sh: --stop on a PR-less local review writes no pr- state dir"
+if compgen -G "$E2E_HOME/state/local__*/pr-*" >/dev/null; then
+  bad "a pr- state dir was created for a PR-less review"; else ok; fi
+
+t "run.sh: --stop on a forge target still uses the pr-<N> state dir"
+run_e2e_raw --repo o/n 42 --stop
+assert_eq "$E2E_RC" 0
+if [[ -e "$E2E_HOME/state/o__n/pr-42/stop" ]]; then ok; else bad "no stop sentinel at o__n/pr-42"; fi
+
+t "run.sh e2e: a supervised PR-less run keeps every role in one state dir"
+# The default path — front-end → supervisor → worker — on a branch review,
+# run to completion. The bug fixed by commit b34ff46 lived here: the
+# front-end derived a pr-<N> leaf a PR-less review has none of, crashed on
+# the unbound branch name, and pointed the supervisor away from its worker.
+e2e_fixture
+mkdir -p "$WORK/codex-home/sessions"
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/e2e-argv" \
+  CODEX_HOME="$WORK/codex-home" \
+  "$BASH_BIN" "$E2E_HOME/run.sh" --local --base main --dir "$E2E_CLONE" --max 2 \
+  > "$WORK/e2e.out" 2>&1
+_rc=$?
+assert_eq "$_rc" 0
+_st=$(e2e_state)
+if [[ -e "$_st/worker.started" ]]; then ok; else bad "no worker.started under $_st"; fi
+if [[ -s "$_st/supervisor.log" ]]; then ok; else bad "no supervisor.log under $_st"; fi
+assert_eq "$(head -1 "$_st/worker.status" 2>/dev/null)" 'approved'
+assert_eq "$(cat "$_st/local/completed.sha" 2>/dev/null)" "$E2E_BASE"
+
+t "run.sh e2e: the supervised PR-less run created exactly one state leaf"
+if compgen -G "$E2E_HOME/state/local__*/pr-*" >/dev/null; then
+  bad "a pr- state dir was created for a PR-less review"
+elif [[ "$(ls -d "$E2E_HOME"/state/*/* 2>/dev/null | wc -l | tr -d ' ')" == 1 ]]; then ok
+else bad "expected one state leaf, got: $(ls -d "$E2E_HOME"/state/*/* 2>/dev/null | tr '\n' ' ')"; fi
 
 t "run.sh e2e: a NIT-only convergence completes and terminates the review"
 e2e_fixture
@@ -6695,6 +6852,273 @@ assert_eq "$E2E_RC" 0
 if [[ -s "$(e2e_state)/iter-02/codex-review.md" ]]; then ok   # a REAL round reviewed the new head
 else bad "the retry completed without a codex round reviewing the new head"; fi
 assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" "$_human"
+
+# --- --audit: the branch it works on, and its closing PR/MR ------------------
+#
+# An audit is a local BRANCH review that the loop sets up for itself: it
+# creates a branch at HEAD, checks it out, and reviews against HEAD. So these
+# cases assert the setup and the one added closing step; everything between
+# is the branch-review path already covered above.
+
+audit_repo() {  # -> $AR_REMOTE $AR_CLONE, on branch feature/x
+  local n="aud$RANDOM$RANDOM"
+  AR_REMOTE="$WORK/$n-remote.git"; git init -q --bare -b main "$AR_REMOTE"
+  AR_CLONE="$WORK/$n-clone"; git init -q -b main "$AR_CLONE"
+  git -C "$AR_CLONE" config user.email t@t; git -C "$AR_CLONE" config user.name t
+  git -C "$AR_CLONE" remote add origin "$AR_REMOTE"
+  echo base > "$AR_CLONE/f"; git -C "$AR_CLONE" add f; git -C "$AR_CLONE" commit -qm base
+  git -C "$AR_CLONE" push -q origin HEAD:refs/heads/main
+  git -C "$AR_CLONE" checkout -qb feature/x
+  echo head >> "$AR_CLONE/f"; git -C "$AR_CLONE" commit -qam "human work"
+  git -C "$AR_CLONE" push -q origin HEAD:refs/heads/feature/x
+  AR_ORIG=$(git -C "$AR_CLONE" rev-parse HEAD)
+  AR_HOME="$WORK/$n-home"; mkdir -p "$AR_HOME"
+  ln -s "$ROOT/run.sh" "$ROOT/codex_turn.sh" "$ROOT/claude_turn.sh" \
+        "$ROOT/finalize_turn.sh" "$ROOT/lib" "$ROOT/prompts" "$ROOT/.claude" "$AR_HOME/"
+}
+run_audit() {  # [VAR=VAL ...] [args ...]
+  local envs=()
+  while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
+  mkdir -p "$WORK/codex-home/sessions"
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/aud-argv" \
+    CODEX_HOME="$WORK/codex-home" GH_TOKEN=t ${envs[@]+"${envs[@]}"} \
+    "$BASH_BIN" "$AR_HOME/run.sh" --local --audit --dir "$AR_CLONE" \
+    "$@" --no-auto-resume > "$WORK/aud.out" 2>&1
+  AUD_RC=$?
+}
+audit_branch()  { git -C "$AR_CLONE" for-each-ref --format='%(refname:short)' 'refs/heads/ai-review/' | head -1; }
+audit_state()   { echo "$AR_HOME"/state/local__*/branch-ai-review*; }
+openpr_turns()  { [[ -e "$WORK/aud-argv.openpr.calls" ]] && wc -c < "$WORK/aud-argv.openpr.calls" | tr -d ' ' || echo 0; }
+
+t "run.sh --audit: creates its own branch at HEAD and reviews against it"
+audit_repo
+_reflog=$(git -C "$AR_CLONE" reflog show refs/heads/feature/x | wc -l)
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="Audit fixes" \
+  STUB_FINALIZE_DESC="What the audit changed." --max 4
+assert_eq "$AUD_RC" 0
+_ab=$(audit_branch)
+if [[ -n "$_ab" ]]; then ok; else bad "no review branch was created"; fi
+assert_eq "$(git -C "$AR_CLONE" rev-list --count "$AR_ORIG..$_ab")" 1
+
+t "run.sh --audit: the branch the operator had out is untouched"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+assert_eq "$(git -C "$AR_CLONE" reflog show refs/heads/feature/x | wc -l)" "$_reflog"
+assert_eq "$(git -C "$AR_REMOTE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: the review branch is pushed and its PR/MR opened once"
+assert_eq "$(git -C "$AR_REMOTE" rev-parse "refs/heads/$_ab")" "$(git -C "$AR_CLONE" rev-parse "$_ab")"
+assert_eq "$(openpr_turns)" 1
+assert_eq "$(cat "$(audit_state)/local/pr-url" 2>/dev/null)" 'https://github.com/o/n/pull/123'
+assert_eq "$(cat "$(audit_state)/local/completed.sha" 2>/dev/null)" "$(git -C "$AR_CLONE" rev-parse "$_ab")"
+
+t "run.sh --audit: the open-pr turn gets the skill and the branch pair"
+assert_substr "$WORK/aud-argv.openpr" 'skills/open-pr/SKILL.md'
+if grep -Fq -- "--add-dir" "$WORK/aud-argv.openpr"; then ok; else bad "the skill dir was not granted"; fi
+
+t "run.sh --audit: the orchestrator never calls the forge itself"
+# Opening the PR/MR is the agent's job, following the skill.
+if [[ -e "$WORK/aud-argv.ghcreate" || -e "$WORK/aud-argv.mrcreate" ]]; then
+  bad "the orchestrator called the forge directly"; else ok; fi
+
+t "run.sh --audit: a plain rerun of a completed audit is a no-op"
+_before=$(git -C "$AR_CLONE" rev-parse "$_ab")
+run_audit --max 4
+assert_eq "$AUD_RC" 0
+assert_substr "$WORK/aud.out" 'already completed'
+assert_eq "$(git -C "$AR_CLONE" rev-parse "$_ab")" "$_before"
+assert_eq "$(audit_branch)" "$_ab"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: a rerun does not create a second review branch"
+assert_eq "$(git -C "$AR_CLONE" for-each-ref --format='%(refname)' 'refs/heads/ai-review/' | wc -l)" 1
+
+t "run.sh --audit: --pr-branch names the branch"
+audit_repo
+printf 'APPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" --pr-branch cleanup/logging --max 2
+assert_eq "$AUD_RC" 0
+if git -C "$AR_CLONE" rev-parse --verify --quiet refs/heads/cleanup/logging >/dev/null; then ok
+else bad "--pr-branch did not name the review branch"; fi
+
+t "run.sh --audit: --pr-branch must not name the branch under review"
+audit_repo
+run_audit --pr-branch feature/x --max 2
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "must not name the branch under review"
+
+t "run.sh --audit: --pr-branch already taken is refused"
+audit_repo
+git -C "$AR_CLONE" branch taken/name
+run_audit --pr-branch taken/name --max 2
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "already exists locally or on origin"
+
+t "run.sh --audit: a directory/file ref conflict is refused"
+audit_repo
+git -C "$AR_CLONE" branch conflict
+run_audit --pr-branch conflict/sub --max 2
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "already exists locally or on origin"
+
+t "run.sh --audit: a dirty checkout is refused before any branch is created"
+audit_repo
+echo dirty >> "$AR_CLONE/f"
+run_audit --max 2
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "uncommitted changes"
+assert_eq "$(git -C "$AR_CLONE" symbolic-ref --short HEAD)" 'feature/x'
+if [[ -z "$(audit_branch)" ]]; then ok; else bad "a review branch was created from a dirty checkout"; fi
+git -C "$AR_CLONE" checkout -q -- f
+
+t "run.sh --audit: an audit that finds nothing opens no PR/MR"
+audit_repo
+printf 'APPROVED\n' > "$WORK/aud-verdicts"
+rm -f "$WORK/aud-argv.openpr.calls"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" --max 2
+assert_eq "$AUD_RC" 0
+assert_eq "$(openpr_turns)" 0
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: --no-push stops before the push and the PR/MR"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+rm -f "$WORK/aud-argv.openpr.calls"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="Audit fixes" \
+  STUB_FINALIZE_DESC="Body." --no-push --max 4
+assert_eq "$AUD_RC" 0
+_ab=$(audit_branch)
+if [[ -n "$_ab" ]]; then ok; else bad "no review branch was created"; fi
+if git -C "$AR_REMOTE" rev-parse --verify --quiet "refs/heads/$_ab" >/dev/null; then
+  bad "--no-push pushed the review branch"; else ok; fi
+assert_eq "$(openpr_turns)" 0
+
+t "run.sh --audit: a later run without --no-push pushes and opens the PR/MR"
+rm -f "$WORK/aud-argv.fin.calls"
+run_audit STUB_FINALIZE_TITLE="Audit fixes" STUB_FINALIZE_DESC="Body." --max 4
+assert_eq "$AUD_RC" 0
+assert_eq "$(git -C "$AR_REMOTE" rev-parse "refs/heads/$_ab")" "$(git -C "$AR_CLONE" rev-parse "$_ab")"
+assert_eq "$(openpr_turns)" 1
+if [[ -e "$WORK/aud-argv.fin.calls" ]]; then bad "the closing turn was composed again"; else ok; fi
+
+t "run.sh --audit: a closing turn that writes no PR title fails before the push"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+rm -f "$WORK/aud-argv.openpr.calls"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_DESC="Body." --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" 'no PR/MR title written'
+assert_eq "$(openpr_turns)" 0
+_ab=$(audit_branch)
+if git -C "$AR_REMOTE" rev-parse --verify --quiet "refs/heads/$_ab" >/dev/null 2>&1; then
+  bad "the branch was pushed without a composed title"; else ok; fi
+
+t "run.sh --audit: an open-pr turn that writes no URL fails the run"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." \
+  STUB_OPENPR_SILENT=1 --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" 'wrote no URL'
+if [[ -e "$(audit_state)/local/completed.sha" ]]; then
+  bad "the review completed with no PR/MR"; else ok; fi
+
+t "run.sh --audit: retrying after a failed open-pr step does not re-push"
+run_audit STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." --max 4
+assert_eq "$AUD_RC" 0
+assert_substr "$WORK/aud.out" 'Everything up-to-date'
+assert_eq "$(cat "$(audit_state)/local/completed.sha" 2>/dev/null)" \
+          "$(git -C "$AR_CLONE" rev-parse "$(audit_branch)")"
+
+t "run.sh --audit: a SUPERVISED run creates exactly one review branch"
+# The default invocation. run.sh executes three times per invocation —
+# front-end, supervisor, worker — and each resolves the checkout. Before the
+# marker was made durable at branch-creation time, every role read no marker,
+# concluded "fresh audit", and created another branch nested in the last.
+audit_repo
+printf 'APPROVED\n' > "$WORK/aud-verdicts"
+env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/aud-argv" \
+  CODEX_HOME="$WORK/codex-home" GH_TOKEN=t \
+  STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" \
+  "$BASH_BIN" "$AR_HOME/run.sh" --local --audit --dir "$AR_CLONE" --max 1 \
+  > "$WORK/aud-sup.out" 2>&1
+assert_eq "$(git -C "$AR_CLONE" for-each-ref --format='%(refname)' 'refs/heads/ai-review/' | wc -l)" 1
+
+t "run.sh --audit: a supervised run leaves the target branch alone"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: the supervisor and the worker share one state dir"
+assert_eq "$(ls -d "$AR_HOME"/state/local__*/branch-ai-review* 2>/dev/null | wc -l)" 1
+
+t "audit receipts: a tampered PR base is refused rather than published"
+# The state dir is handed to every agent turn, so a bare file there proves
+# nothing about who wrote it.
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+# The sabotage lands during a ROUND, so the finalize that follows reads it —
+# finalize reads the file at startup, before its own closing turn runs.
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." \
+  STUB_CLAUDE_SH='printf "attacker/branch\n" > "$STATE_DIR/local/audit-pr-base"' --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" 'no valid orchestrator receipt'
+# The rounds themselves still ran (the tamper is only detected at finalize),
+# but nothing was published: no PR/MR, no terminal marker.
+if [[ -e "$(audit_state)/local/completed.sha" ]]; then
+  bad "a tampered PR base completed the review"; else ok; fi
+
+t "audit receipts: a forged PR URL does not complete the review"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." \
+  STUB_FINALIZE_SH='printf "https://evil.invalid/fake/1\n" > "$STATE_DIR/local/pr-url"' \
+  STUB_OPENPR_SILENT=1 --max 4
+assert_eq "$AUD_RC" 1
+if [[ -e "$(audit_state)/local/completed.sha" ]]; then
+  bad "a forged pr-url completed the review"; else ok; fi
+
+t "audit receipts: an honest PR URL round-trips and completes"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." --max 4
+assert_eq "$AUD_RC" 0
+assert_eq "$(cat "$(audit_state)/local/pr-url")" 'https://github.com/o/n/pull/123'
+if [[ -s "$(audit_state)/local/pr-url.receipt" ]]; then ok; else bad "no receipt beside pr-url"; fi
+
+t "run.sh --audit: a turn that moves the target branch is caught and undone"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 \
+  STUB_CLAUDE_SH='git update-ref refs/heads/feature/x HEAD' --max 4
+assert_eq "$AUD_RC" 1
+assert_substr "$WORK/aud.out" "never writes the branch it targets"
+assert_eq "$(git -C "$AR_CLONE" rev-parse refs/heads/feature/x)" "$AR_ORIG"
+
+t "run.sh --audit: a foreign branch appearing on origin refuses the push"
+audit_repo
+printf 'CHANGES_REQUESTED\nAPPROVED\n' > "$WORK/aud-verdicts"
+_stem="ai-review/feature/x-$(git -C "$AR_CLONE" rev-parse HEAD | cut -c1-8)"
+git -C "$AR_REMOTE" update-ref "refs/heads/$_stem" \
+  "$(git -C "$AR_CLONE" rev-parse refs/heads/main)"
+run_audit STUB_CODEX_VERDICT_SEQ="$WORK/aud-verdicts" STUB_CODEX_BLOCKERS=1 \
+  STUB_CLAUDE_COMMIT=1 STUB_FINALIZE_TITLE="T" STUB_FINALIZE_DESC="B." --max 4
+# The name is taken on origin, so setup picks the next free one; either way
+# the foreign branch must be untouched.
+assert_eq "$(git -C "$AR_REMOTE" rev-parse "refs/heads/$_stem")" \
+          "$(git -C "$AR_CLONE" rev-parse refs/heads/main)"
+
+t "run.sh --audit: --stop resolves the audit's state dir and creates no branch"
+audit_repo
+run_audit --stop
+assert_eq "$AUD_RC" 0
+if [[ -z "$(audit_branch)" ]]; then ok; else bad "--stop created a review branch"; fi
 
 # --- summary ---------------------------------------------------------------
 
