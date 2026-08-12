@@ -186,6 +186,29 @@ fi
 # Simulate the documented runtime classifier abort: side effects happened,
 # stdout is EMPTY (text mode only prints the final response), and stderr
 # mentions auto mode — the fallback must never rerun this turn.
+# The permission classifier going down MID-TURN: the CLI keeps reporting
+# that it cannot decide, the agent keeps retrying, no tool call ever runs and
+# the process never exits. Emits to stderr only — stdout stays empty, which
+# is what proves no progress. Runs until killed.
+if [[ "${STUB_CLASSIFIER_STALL:-0}" == "1" ]]; then
+  for a in "$@"; do
+    if [[ "$a" == "--dangerously-skip-permissions" ]]; then
+      # The retry after the watchdog fired: the classifier is out of the
+      # loop, so this attempt behaves like a normal successful turn.
+      printf 'x' >> "${ARGV_FILE}.bypass.calls"
+      if [[ "${LOCAL_MODE:-0}" == "1" ]]; then
+        printf 'stub response\n' > "$STATE_DIR/$(printf 'iter-%02d' "$ITER")/claude-response.md"
+      fi
+      echo "[CLAUDE_TURN: COMPLETE]"
+      exit 0
+    fi
+  done
+  printf 'x' >> "${ARGV_FILE}.stalled.calls"
+  while :; do
+    echo "claude-opus-5[1m] is temporarily unavailable, so auto mode cannot determine the safety of Bash right now. Wait briefly and then try this action again." >&2
+    sleep 1
+  done
+fi
 if [[ "${STUB_RUNTIME_AUTO_ABORT:-0}" == "1" ]]; then
   touch "${ARGV_FILE}.side-effect"
   echo "Error: repeated permission blocks, so auto mode cannot determine the safety of this action" >&2
@@ -1026,6 +1049,34 @@ if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.auto-rejected" ]]; then
 else
   ok
 fi
+
+t "claude: a stalled permission classifier stops the turn instead of hanging"
+# The real failure this guards: --permission-mode auto gates every tool call
+# on a separate model, and when that model is unreachable the CLI returns a
+# non-terminal "try again" that the agent obeys forever. Observed once for 23
+# hours with zero progress.
+new_case claude-classifier-stall
+run_turn claude STUB_CLASSIFIER_STALL=1 CLAUDE_STALL_HITS=3 CLAUDE_STALL_POLL=1
+assert_eq "$TURN_RC" 0
+if [[ -s "$ARGV.stalled.calls" ]]; then ok; else bad "the stalling attempt never ran"; fi
+
+t "claude: the stalled turn is retried with the classifier bypassed"
+assert_eq "$(wc -c < "$ARGV.bypass.calls" 2>/dev/null | tr -d ' ')" 1
+assert_substr "$ARGV" '--dangerously-skip-permissions'
+assert_no_substr "$ARGV" '--permission-mode' 
+
+t "claude: the stall is reported, not silently swallowed"
+assert_substr "$CASE_DIR/turn.log" 'permission classifier has been unavailable'
+assert_substr "$CASE_DIR/turn.log" 'no longer gated per call'
+
+t "claude: the stalled attempt's stderr is kept for the operator"
+if [[ -f "$CASE_DIR/state/iter-01/claude.stderr.classifier-stalled" ]]; then ok
+else bad "the stalled attempt's stderr was discarded"; fi
+
+t "claude: the bypass retry runs the turn to its completion marker"
+# The retry is a real turn, not a formality: it prints the marker the
+# orchestrator gates on, which the stalled attempt never reached.
+assert_substr "$CASE_DIR/state/iter-01/claude.stdout" '[CLAUDE_TURN: COMPLETE]' 
 
 t "claude: runtime auto abort after side effects never triggers the fallback"
 new_case claude-runtime-abort

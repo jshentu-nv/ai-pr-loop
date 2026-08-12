@@ -2306,6 +2306,46 @@ claude_run_prompt() {
   case $- in *e*) _saved_errexit=1 ;; esac
   # claude -p runs non-interactively; permission handling for unattended
   # operation (user authorized this) is selected above via --claude-perms.
+  # --- auto-mode classifier stall watchdog --------------------------------
+  #
+  # --permission-mode auto gates every tool call on a SEPARATE model call.
+  # When that classifier is unreachable the CLI returns neither allow nor
+  # deny but a third, non-terminal result whose text tells the agent to wait
+  # and retry — so the agent retries, forever: no tool call executes, the
+  # turn never finishes, and nothing above it ever sees a failure. (Observed:
+  # a turn that ran 23 hours past the outage, 3,399 blocked calls, zero
+  # progress.) The startup-rejection retry below deliberately excludes this
+  # string because it can fire AFTER side effects; that is right for a
+  # one-shot retry and leaves the indefinite case unhandled.
+  #
+  # Detect it while the turn RUNS: the CLI writes the diagnostic to stderr
+  # each time, so a stderr that keeps growing with that message while stdout
+  # stays empty is a turn making no progress. Kill it, and mark the cause so
+  # the next attempt does not re-enter the same deadlock.
+  CLAUDE_CLASSIFIER_STALL_FILE="${STATE_DIR:-/tmp}/.claude-classifier-stall"
+  CLAUDE_STALL_HITS="${CLAUDE_STALL_HITS:-8}"      # blocked results before giving up
+  CLAUDE_STALL_POLL="${CLAUDE_STALL_POLL:-20}"     # seconds between checks
+  _claude_stall_watch() {  # <pid of the turn>
+    local pid="$1" hits
+    rm -f "$CLAUDE_CLASSIFIER_STALL_FILE"
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep "$CLAUDE_STALL_POLL"
+      kill -0 "$pid" 2>/dev/null || return 0
+      # Only a turn that has produced NOTHING can be stalled: any stdout
+      # means the model is answering, and a completed tool call would have
+      # moved the work forward.
+      [[ -s "$_CLAUDE_OUT" ]] && continue
+      hits=$(grep -c 'cannot determine the safety' "$_CLAUDE_ERR" 2>/dev/null) || hits=0
+      if (( hits >= CLAUDE_STALL_HITS )); then
+        : > "$CLAUDE_CLASSIFIER_STALL_FILE"
+        log "claude: auto mode's permission classifier has been unavailable for $hits consecutive actions — the turn cannot make progress; stopping it"
+        kill "$pid" 2>/dev/null
+        sleep 2; kill -9 "$pid" 2>/dev/null
+        return 0
+      fi
+    done
+  }
+
   _claude_exec() {
     ( cd "$REPO_DIR" && \
       CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
@@ -2326,9 +2366,38 @@ claude_run_prompt() {
 
   set +e
   TURN_START=$SECONDS
-  _claude_exec
+  # Run the turn in the background so the watchdog can reach it. Only auto
+  # mode can hit the classifier stall, so only auto mode is watched.
+  _claude_exec &
+  _CLAUDE_PID=$!
+  _CLAUDE_WATCHDOG=''
+  if [[ "$CLAUDE_PERMS_RESOLVED" == "auto" ]] && (( ${#CLAUDE_PERMS_ARG[@]} > 0 )); then
+    _claude_stall_watch "$_CLAUDE_PID" &
+    _CLAUDE_WATCHDOG=$!
+  fi
+  wait "$_CLAUDE_PID"
   CLAUDE_RUN_RC=$?
+  if [[ -n "$_CLAUDE_WATCHDOG" ]]; then
+    kill "$_CLAUDE_WATCHDOG" 2>/dev/null || true
+    wait "$_CLAUDE_WATCHDOG" 2>/dev/null || true
+  fi
   TURN_ELAPSED=$(( SECONDS - TURN_START ))
+
+  # A turn the watchdog stopped: retry it HERE, in this same invocation, with
+  # the classifier out of the loop. The turn produced no output, so nothing
+  # is duplicated by re-running it.
+  if [[ -e "$CLAUDE_CLASSIFIER_STALL_FILE" ]]; then
+    rm -f "$CLAUDE_CLASSIFIER_STALL_FILE"
+    log "claude: retrying this turn with the permission classifier bypassed (--claude-perms bypass); actions are no longer gated per call"
+    mv -f "$_CLAUDE_ERR" "${_CLAUDE_ERR}.classifier-stalled" 2>/dev/null || true
+    CLAUDE_PERMS_RESOLVED=bypass
+    CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
+    SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
+    _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+    CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+    _claude_exec
+    CLAUDE_RUN_RC=$?
+  fi
 
   # Auto mode is not available on every account/provider; the CLI refuses the
   # flag at startup there — before any turn work runs — so a retry cannot
