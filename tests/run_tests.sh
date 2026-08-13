@@ -5761,6 +5761,54 @@ if git -C "$_evil" show-ref -q 2>/dev/null; then
 t "finalize: the dual-rewrite attempt left the pinned remote untouched"
 assert_eq "$(remote_head)" "$LF_BASE"
 
+t "finalize: a poisoned pin from a blocked run is not adopted by the retry"
+# A marker-gated clean filter rewrites origin and its pin only once the
+# post-squash 'finalized' marker exists, so it fires at the pre-push probe.
+# The first finalize blocks, restores the pin, and exits; an unchanged
+# retry must snapshot the restored pin and refuse again — never adopting
+# the poisoned value and pushing to the hostile remote.
+local_fixture; local_round 1
+_evil="$WORK/evil-retry-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/info"
+printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.evil.clean \
+  "touch -d 2099-01-01 '$LF_CLONE/f'; if [ -f '$LF_STATE/local/finalized' ]; then git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; fi; cat"
+touch -d 2099-01-01 "$LF_CLONE/f"
+finalize_run                       # first invocation: blocks and restores the pin
+assert_eq "$FIN_RC" 1
+finalize_run                       # unchanged retry: must still refuse
+assert_eq "$FIN_RC" 1
+git -C "$LF_CLONE" config --unset filter.evil.clean
+rm -f "$LF_CLONE/.git/info/attributes"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "a retry adopted the poisoned pin and pushed to the hostile remote"; else ok; fi
+t "finalize: the poisoned-pin retry left the pinned remote untouched"
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: a pin poisoned before a non-destination die is still restored"
+# The filter makes the tree look dirty on its first post-squash fire, so the
+# first finalize exits through the 'not clean' die — not the destination
+# check. The trusted pin must still be restored on that exit, or the retry
+# (where the filter now reports clean) adopts the poisoned pin and pushes.
+local_fixture; local_round 1
+_evil="$WORK/evil-notclean-$RANDOM.git"; git init -q --bare "$_evil"
+_seen="$WORK/notclean-seen-$RANDOM"; rm -f "$_seen"
+mkdir -p "$LF_CLONE/.git/info"
+printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.evil.clean \
+  "touch -d 2099-01-01 '$LF_CLONE/f'; if [ -f '$LF_STATE/local/finalized' ]; then git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; if [ ! -f '$_seen' ]; then touch '$_seen'; cat; echo EXTRA; exit 0; fi; fi; cat"
+touch -d 2099-01-01 "$LF_CLONE/f"
+finalize_run                       # first invocation: dirty tree -> 'not clean' die
+assert_eq "$FIN_RC" 1
+finalize_run                       # retry: filter now clean, but pin was restored
+assert_eq "$FIN_RC" 1
+git -C "$LF_CLONE" config --unset filter.evil.clean
+rm -f "$LF_CLONE/.git/info/attributes"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "a retry after a non-destination die pushed to the hostile remote"; else ok; fi
+t "finalize: the non-destination-die retry left the pinned remote untouched"
+assert_eq "$(remote_head)" "$LF_BASE"
+
 t "worktree_publishable_dirt: a failed probe dies instead of reading clean"
 # The probe's error prints nothing. Without the explicit capture-and-die,
 # empty output reads as a clean tree and the caller publishes on it.

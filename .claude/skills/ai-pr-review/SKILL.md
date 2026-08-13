@@ -142,17 +142,19 @@ Optional flags worth surfacing if the user mentions a constraint:
   constraint mid-run, do not let the loop continue under stale instructions.
   Stop it with the same target plus `--stop` and wait for that run to exit.
   A rerun that starts too soon fails loudly — wait and retry it. Then rerun
-  the prior command with the new constraint, plus `--restart --converge 0`.
-  Context flags replace the stored snapshot, so include all still-active
-  earlier context in that rerun as well.
+  the prior command with the new constraint, plus `--restart --converge 0`
+  and `--max` set to at least 2. Context flags replace the stored snapshot,
+  so include all still-active earlier context in that rerun as well.
 
   `--restart` gets past a prior APPROVED verdict, which a plain rerun would
   exit on before any agent reads the constraint. If the stopped run left a
   Codex review awaiting a Claude reply, the rerun answers that reply first,
   then runs a fresh Codex round — so both agents still see the constraint.
-  `--converge 0` on the rerun is required: without it, a prior review that
-  already met the convergence threshold can end the loop before that fresh
-  round runs.
+  Two flags make that fresh round reachable: `--converge 0`, so a prior
+  review that already met the convergence threshold cannot end the loop
+  first, and `--max` at least 2, so the pending Claude reply does not
+  consume a one-iteration budget before the fresh Codex round. If the prior
+  command capped `--max` lower, raise it on the rerun.
 
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if

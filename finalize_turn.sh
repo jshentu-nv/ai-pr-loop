@@ -44,6 +44,21 @@ hold_outcome() {  # <sha> <squash|nocommit>
   local_write_finalized "$1" "$2"
 }
 
+# Keep the trusted push destination durable across a blocked finalize. Any
+# git probe in this script can run a repo-config clean filter that rewrites
+# the on-disk pin ($(local_origin_file)) and the origin config to a hostile
+# value; $PINNED_DEST, snapshotted before the first probe, is the value the
+# review pinned. Restore it on every exit that leaves the pin in place, so a
+# blocked invocation never leaves a poisoned pin for an unchanged retry to
+# adopt as its own snapshot. A completed run deletes the pin, so only a pin
+# that still exists is restored.
+restore_pin_on_exit() {
+  if [[ -n "$PINNED_DEST" && -f "$(local_origin_file)" ]]; then
+    write_state_atomic "$(local_origin_file)" "$PINNED_DEST" || true
+  fi
+  return 0
+}
+
 # The review's outcome is in its final resting place: record that
 # terminally and clear the in-progress markers, so the next invocation
 # starts a NEW review (via --restart) instead of resuming this one.
@@ -91,6 +106,9 @@ BASE_SHA=$(<"$BASE_FILE")
 # this in-memory snapshot instead, which no filter can reach.
 PINNED_DEST=''
 [[ -s "$(local_origin_file)" ]] && PINNED_DEST=$(<"$(local_origin_file)")
+# Registered now, after the snapshot and before the first probe, so every
+# later exit repairs a pin a filter may have poisoned.
+trap restore_pin_on_exit EXIT
 
 # The review turn that approved may have left build output in the worktree;
 # drop it, keeping every local round.
