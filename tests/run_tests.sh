@@ -5287,20 +5287,110 @@ finalize_run() {  # [VAR=VALUE ...]
 remote_head() { git -C "$LF_REMOTE" rev-parse refs/heads/feature/x; }
 local_head()  { git -C "$LF_CLONE" rev-parse HEAD; }
 
+scope_run() {  # <dest> [VAR=VALUE ...] — write the scope report, isolated
+  local dest="$1"; shift
+  # set -euo pipefail: the same shell flags the turn scripts run the
+  # function under. Later VAR=VALUE words override the defaults.
+  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+    LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" "$@" \
+    "$BASH_BIN" -c "set -euo pipefail; . '$ROOT/lib/common.sh'; local_write_scope_report '$dest'"
+}
+
 t "local scope report: separates original paths from review-added paths"
 local_fixture
 printf 'focused regression\n' > "$LF_CLONE/review-test.txt"
 git -C "$LF_CLONE" add review-test.txt
 git -C "$LF_CLONE" commit -qm 'review test'
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
-     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
-     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_write_scope_report '$LF_STATE/scope.md'" \
-     > "$WORK/scope.log" 2>&1; then
+if scope_run "$LF_STATE/scope.md" > "$WORK/scope.log" 2>&1; then
   assert_substr "$LF_STATE/scope.md" '## Review-created paths outside the original change (1)'
   assert_substr "$LF_STATE/scope.md" '`review-test.txt` — requires an explicit scope reason'
   assert_substr "$LF_STATE/scope.md" '## Paths in the original change (1)'
 else
   bad "scope report failed: $(tail -3 "$WORK/scope.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: every list empty renders as (none)"
+# The first turn of a review with no drift has every path list empty.
+local_fixture
+git -C "$LF_CLONE" rev-parse HEAD > "$LF_STATE/local/target-base.sha"
+if scope_run "$LF_STATE/scope-empty.md" > "$WORK/scope-empty.log" 2>&1; then
+  assert_substr "$LF_STATE/scope-empty.md" '## Paths changed by the review loop (0)'
+  assert_substr "$LF_STATE/scope-empty.md" '- (none)'
+else
+  bad "empty scope report failed: $(tail -3 "$WORK/scope-empty.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: the linear classification survives odd path names"
+local_fixture
+mkdir -p "$LF_CLONE/dir with space"
+printf 'x\n' > "$LF_CLONE/dir with space/a b.txt"
+printf 'y\n' > "$LF_CLONE/-dash[glob].txt"
+printf 'review edit\n' >> "$LF_CLONE/f"
+git -C "$LF_CLONE" add -- "dir with space/a b.txt" "-dash[glob].txt" f
+git -C "$LF_CLONE" commit -qm 'review round'
+if scope_run "$LF_STATE/scope-odd.md" > "$WORK/scope-odd.log" 2>&1; then
+  # f is in the original change, so only the two new paths are out of scope
+  assert_substr "$LF_STATE/scope-odd.md" '## Paths changed by the review loop (3)'
+  assert_substr "$LF_STATE/scope-odd.md" '## Review-created paths outside the original change (2)'
+  assert_substr "$LF_STATE/scope-odd.md" 'dir\ with\ space/a\ b.txt'
+else
+  bad "odd-name scope report failed: $(tail -3 "$WORK/scope-odd.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: a shallow --dir clone deepens until the merge base exists"
+# A depth-1 clone plus the setup's explicit tip fetches has no local merge
+# base for the three-dot diffs. The report deepens the clone until the
+# merge base exists.
+local_fixture
+SHW="$WORK/shallow-scope"; rm -rf "$SHW"; mkdir -p "$SHW/state/local"
+git clone -q --depth 1 --branch feature/x "file://$LF_REMOTE" "$SHW/clone"
+git -C "$SHW/clone" fetch -q origin \
+  "+refs/heads/main:refs/ai-pr-loop/base" "+refs/heads/feature/x:refs/ai-pr-loop/head"
+printf '%s\n' "$LF_TARGET" > "$SHW/state/local/target-base.sha"
+git -C "$SHW/clone" rev-parse HEAD > "$SHW/state/local/base.sha"
+# The deepen fetch requires the origin pinned at review start.
+printf '%s\n%s\n' "file://$LF_REMOTE" "file://$LF_REMOTE" > "$SHW/state/local/origin.url"
+if scope_run "$SHW/state/scope.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=feature/x \
+     REPO_DIR="$SHW/clone" STATE_DIR="$SHW/state" > "$WORK/scope-shallow.log" 2>&1; then
+  assert_substr "$SHW/state/scope.md" '## Paths in the original change (1)'
+  assert_substr "$SHW/state/scope.md" '## Paths changed by the review loop (0)'
+else
+  bad "shallow scope report failed: $(tail -3 "$WORK/scope-shallow.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: a shallow clone with a redirected origin never fetches"
+# The deepen fetch may only reach the origin pinned at review start. A
+# FRESH shallow clone: the merge base must still be absent, or the guard
+# under test never runs.
+rm -rf "$SHW/clone2"
+git clone -q --depth 1 --branch feature/x "file://$LF_REMOTE" "$SHW/clone2"
+git -C "$SHW/clone2" fetch -q origin \
+  "+refs/heads/main:refs/ai-pr-loop/base" "+refs/heads/feature/x:refs/ai-pr-loop/head"
+git -C "$SHW/clone2" remote set-url origin "$WORK/scope-evil.git"
+if scope_run "$SHW/state/scope2.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=feature/x \
+     REPO_DIR="$SHW/clone2" STATE_DIR="$SHW/state" > "$WORK/scope-evil.log" 2>&1; then
+  bad "the scope report ran against a redirected origin"
+else
+  assert_substr "$WORK/scope-evil.log" 'does not match the one recorded'
+fi
+
+t "local scope report: a planted fetch refspec cannot move local refs"
+# A turn can write remote.origin.fetch to map a remote branch onto a local
+# one. The deepen fetch must update no local ref (--refmap= plus a
+# colon-free refspec), so the planted mapping stays inert.
+rm -rf "$SHW/clone3"
+git clone -q --depth 1 --branch feature/x "file://$LF_REMOTE" "$SHW/clone3"
+git -C "$SHW/clone3" fetch -q origin \
+  "+refs/heads/main:refs/ai-pr-loop/base" "+refs/heads/feature/x:refs/ai-pr-loop/head"
+git -C "$SHW/clone3" branch victim HEAD
+git -C "$SHW/clone3" config remote.origin.fetch '+refs/heads/main:refs/heads/victim'
+_victim=$(git -C "$SHW/clone3" rev-parse victim)
+git -C "$SHW/clone3" rev-parse HEAD > "$SHW/state/local/base.sha"
+if scope_run "$SHW/state/scope3.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=feature/x \
+     REPO_DIR="$SHW/clone3" STATE_DIR="$SHW/state" > "$WORK/scope-refspec.log" 2>&1; then
+  assert_eq "$(git -C "$SHW/clone3" rev-parse victim)" "$_victim"
+else
+  bad "shallow scope report failed: $(tail -3 "$WORK/scope-refspec.log" | tr '\n' ' ')"
 fi
 
 t "finalize: three local rounds become one pushed commit"
@@ -5471,6 +5561,112 @@ assert_substr "$WORK/fin.log" 'no pinned origin destination'
 if [[ -e "$WORK/fin-argv.calls" ]]; then
   bad "an agent turn was spent with no pinned destination"; else ok; fi
 assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: the pre-push probe runs no config-planted fsmonitor program"
+# A round can plant core.fsmonitor in the repo config. The probe must not
+# run the code it names (it could redirect origin under the push).
+local_fixture; local_round 1
+cat > "$WORK/fsmon-hook.sh" <<EOF
+#!/bin/sh
+touch "$WORK/fsmon-ran"
+git -C "$LF_CLONE" remote set-url origin "$WORK/fsmon-nowhere.git"
+echo /
+EOF
+chmod +x "$WORK/fsmon-hook.sh"
+git -C "$LF_CLONE" config core.fsmonitor "$WORK/fsmon-hook.sh"
+rm -f "$WORK/fsmon-ran"
+finalize_run
+git -C "$LF_CLONE" config --unset core.fsmonitor
+assert_eq "$FIN_RC" 0
+if [[ -e "$WORK/fsmon-ran" ]]; then
+  bad "a config-planted fsmonitor program ran during finalize"; else ok; fi
+t "finalize: the push reached the origin pinned at review start"
+assert_eq "$(remote_head)" "$(local_head)"
+
+t "finalize: a repo where git status fails never pushes"
+# A status error prints nothing. Empty output must never read as a clean
+# tree anywhere between the entry cleanup and the pre-push probe. An index
+# that cannot be opened breaks every worktree probe of the invocation.
+local_fixture; local_round 1
+finalize_run NO_PUSH=1               # hold the squash — only the push remains
+assert_eq "$FIN_RC" 0
+mv "$LF_CLONE/.git/index" "$WORK/fin-index.bak"
+mkdir "$LF_CLONE/.git/index"
+finalize_run
+rmdir "$LF_CLONE/.git/index"
+mv "$WORK/fin-index.bak" "$LF_CLONE/.git/index"
+if (( FIN_RC == 0 )); then
+  bad "finalize pushed although its worktree probes failed"; else ok; fi
+t "finalize: the failed probe left the remote untouched"
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: tolerated submodule eol noise does not block the push"
+# Non-idempotent eol/filter state inside an initialized submodule survives
+# every cleanup (each checkout re-dirties it) and force_clean_to_commit
+# deliberately tolerates it — it cannot be published through a superproject
+# commit. The pre-push probe must tolerate exactly the same set, or every
+# review of such a repo stops just before its push.
+local_fixture
+git init -q -b main "$WORK/fin-subsrc"
+git -C "$WORK/fin-subsrc" config user.email t@t
+git -C "$WORK/fin-subsrc" config user.name t
+printf 'line1\r\nline2\r\n' > "$WORK/fin-subsrc/s.txt"
+git -C "$WORK/fin-subsrc" -c core.autocrlf=false add s.txt
+git -C "$WORK/fin-subsrc" commit -qm crlf
+printf 's.txt text eol=lf\n' > "$WORK/fin-subsrc/.gitattributes"
+git -C "$WORK/fin-subsrc" add .gitattributes
+git -C "$WORK/fin-subsrc" commit -qm attrs   # CRLF blob + LF worktree rule
+git -C "$LF_CLONE" -c protocol.file.allow=always submodule --quiet add "$WORK/fin-subsrc" sub
+git -C "$LF_CLONE" commit -qm 'round 1: vendor a submodule'
+finalize_run
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
+
+t "finalize: a clean filter planted in repo config cannot redirect the push"
+# git_safe does not block content filters, so any worktree probe can run
+# repo-config-planted code. Every destination check runs after a probe, so
+# a redirect the filter makes is always caught, never obeyed. The touch
+# forces a content re-check: the filter then runs on the first probe.
+local_fixture; local_round 1
+_evil="$WORK/evil-filter-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/info"
+printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.evil.clean \
+  "git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; cat"
+touch "$LF_CLONE/f"
+finalize_run
+git -C "$LF_CLONE" config --unset filter.evil.clean
+rm -f "$LF_CLONE/.git/info/attributes"
+assert_eq "$FIN_RC" 1
+assert_substr "$WORK/fin.log" 'does not match the one recorded'
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the filter-redirected remote received a push"; else ok; fi
+t "finalize: the filter-planted round left the pinned remote untouched"
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "worktree_publishable_dirt: a failed probe dies instead of reading clean"
+# The probe's error prints nothing. Without the explicit capture-and-die,
+# empty output reads as a clean tree and the caller publishes on it.
+BRKP="$WORK/dirt-probe"; rm -rf "$BRKP"
+git init -q -b main "$BRKP"
+git -C "$BRKP" config user.email t@t; git -C "$BRKP" config user.name t
+printf 'x\n' > "$BRKP/f"; git -C "$BRKP" add f; git -C "$BRKP" commit -qm x
+mv "$BRKP/.git/index" "$BRKP/.git/index.bak"
+mkdir "$BRKP/.git/index"
+# No set -e here: the guard itself, not the caller's shell flags, must fail.
+if _dirt=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; worktree_publishable_dirt '$BRKP'" \
+     2>"$WORK/dirt-probe.log"); then
+  bad "a failed status probe was read as a clean tree"
+else
+  ok
+fi
+rmdir "$BRKP/.git/index"; mv "$BRKP/.git/index.bak" "$BRKP/.git/index"
+t "worktree_publishable_dirt: a healthy repo reports its dirt"
+printf 'dirty\n' >> "$BRKP/f"
+_dirt=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; worktree_publishable_dirt '$BRKP'")
+assert_eq "$_dirt" ' M f'
 
 t "finalize: a held squash is not pushed to a remote redirected in between"
 local_fixture; local_round 1

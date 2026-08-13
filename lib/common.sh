@@ -889,13 +889,76 @@ local_target_base_file() { printf '%s/target-base.sha\n' "$(local_state_dir)"; }
 # paths the review changed and which of those paths were new to the change.
 local_scope_report_file() { printf '%s/review-scope.md\n' "$(local_state_dir)"; }
 
+# The scope report's three-dot diffs need the merge base of the pinned
+# commits. A shallow --dir clone can lack it: setup fetches only the base
+# and head tips there, so no common ancestor is present locally. Deepen the
+# history until the merge base exists. Managed clones are full clones, so
+# this normally runs no fetch at all.
+local_ensure_scope_merge_base() {  # <commit-a> <commit-b>
+  local d="$REPO_DIR" step=64 shallow_file boundary ref fetched
+  # A pinned commit can be absent outright (a stale or hand-edited state
+  # file). Report that as what it is — deepening cannot ever recover it.
+  git -C "$d" rev-parse --verify --quiet "$1^{commit}" >/dev/null \
+    || die "commit $1 is not present in $d — the recorded review state does not match this checkout"
+  git -C "$d" rev-parse --verify --quiet "$2^{commit}" >/dev/null \
+    || die "commit $2 is not present in $d — the recorded review state does not match this checkout"
+  until git -C "$d" merge-base "$1" "$2" >/dev/null 2>&1; do
+    [[ "$(git -C "$d" rev-parse --is-shallow-repository)" == "true" ]] \
+      || die "no merge base exists between $1 and $2 in $d — the scope report cannot split the original change from the review's work"
+    # Only PR scope pins two remote branch names to deepen. Branch scope
+    # would have to fetch the clone's configured refspec, which a turn can
+    # rewrite to force-update local refs — refuse instead. run.sh proves
+    # the merge base exists when a branch-scope review starts, so this die
+    # is reachable only through state the loop did not create.
+    [[ "$LOCAL_SCOPE" == "pr" && -n "${BASE_REF:-}" && -n "${HEAD_REF:-}" ]] \
+      || die "the shallow clone $d lacks the merge base of $1 and $2 — deepen it by hand (git -C $d fetch --unshallow origin) and re-run"
+    # This fetch may only reach the destination pinned when the review
+    # started. A turn could have redirected origin since then.
+    [[ -s "$(local_origin_file)" ]] \
+      || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing) — refusing to fetch"
+    [[ "$(origin_dest)" == "$(<"$(local_origin_file)")" ]] \
+      || die "the effective destination of origin in $d does not match the one recorded for this review — refusing to fetch from it"
+    shallow_file=$(git -C "$d" rev-parse --git-path shallow) \
+      || die "could not locate the shallow marker file of $d"
+    # --git-path answers relative to the repository, not to this process.
+    [[ "$shallow_file" == /* ]] || shallow_file="$d/$shallow_file"
+    boundary=$(cat "$shallow_file" 2>/dev/null || true)
+    # Deepen the pinned branches one ref at a time — one branch may be
+    # gone (a head deleted mid-review), and that must not stop the other
+    # from deepening. --refmap= with a colon-free refspec: the fetch must
+    # update no local ref, even when a turn planted a remote.origin.fetch
+    # refspec that maps fetched branches onto local ones.
+    fetched=0
+    for ref in "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"; do
+      git_safe -C "$d" fetch --quiet --refmap= --deepen="$step" origin "$ref" \
+        && fetched=1
+    done
+    (( fetched == 1 )) \
+      || die "could not deepen the shallow clone $d to reach the merge base of $1 and $2"
+    [[ "$(cat "$shallow_file" 2>/dev/null || true)" != "$boundary" ]] \
+      || die "deepening $d did not extend its shallow history — the merge base may no longer be reachable from any branch on origin; unshallow or re-clone $d by hand and re-run"
+    step=$((step * 2))
+  done
+}
+
+# Publishable dirt in a loop-owned checkout: everything except
+# submodule-internal worktree state, which cannot enter a superproject
+# commit — the same set force_clean_to_commit tolerates. Dies when the
+# probe itself fails: a failed status prints nothing, and empty output
+# must never read as a clean tree.
+worktree_publishable_dirt() {  # <dir>
+  local dirt
+  dirt=$(git_safe -C "$1" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
+    || die "could not probe $1 for uncommitted state before publication"
+  printf '%s\n' "$dirt"
+}
+
 # Write a deterministic scope report for the current local tip. The report
 # is evidence, not an automatic rejection: a focused test can validly add a
 # new path, but the agents must explain why it belongs to this change.
 local_write_scope_report() {  # <destination>
   local dest="$1" target base head tmp original_list review_list final_list
-  local original_stat review_stat final_stat
-  local path original_path in_original new_count=0
+  local new_list original_stat review_stat final_stat path
   local -a original_paths=() review_paths=() final_paths=() new_paths=()
 
   [[ -s "$(local_target_base_file)" ]] \
@@ -906,6 +969,8 @@ local_write_scope_report() {  # <destination>
   base=$(<"$(local_base_file)")
   head=$(git -C "$REPO_DIR" rev-parse HEAD) \
     || die "could not read HEAD for the local scope report"
+  local_ensure_scope_merge_base "$target" "$base"
+  local_ensure_scope_merge_base "$target" "$head"
 
   mkdir -p "$(dirname "$dest")"
   original_list="${dest}.original.tmp.$$"
@@ -917,24 +982,21 @@ local_write_scope_report() {  # <destination>
     rm -f "$original_list" "$review_list" "$final_list"
     die "could not list paths for the local scope report"
   fi
+  # Sort the original and review lists so `comm` can difference them. Sort
+  # the final list only so every report section renders in the same order.
+  # C collation everywhere: `comm` requires the byte order `sort -z` used.
+  new_list="${dest}.new.tmp.$$"
+  { LC_ALL=C sort -z -o "$original_list" -- "$original_list" \
+    && LC_ALL=C sort -z -o "$review_list" -- "$review_list" \
+    && LC_ALL=C sort -z -o "$final_list" -- "$final_list" \
+    && LC_ALL=C comm -z -13 -- "$original_list" "$review_list" > "$new_list"; } \
+    || { rm -f "$original_list" "$review_list" "$final_list" "$new_list"
+         die "could not classify the path lists for the local scope report"; }
   while IFS= read -r -d '' path; do original_paths+=("$path"); done < "$original_list"
   while IFS= read -r -d '' path; do review_paths+=("$path"); done < "$review_list"
   while IFS= read -r -d '' path; do final_paths+=("$path"); done < "$final_list"
-  rm -f "$original_list" "$review_list" "$final_list"
-
-  for path in "${review_paths[@]}"; do
-    in_original=0
-    for original_path in "${original_paths[@]}"; do
-      if [[ "$path" == "$original_path" ]]; then
-        in_original=1
-        break
-      fi
-    done
-    if (( in_original == 0 )); then
-      new_paths+=("$path")
-      new_count=$((new_count + 1))
-    fi
-  done
+  while IFS= read -r -d '' path; do new_paths+=("$path"); done < "$new_list"
+  rm -f "$original_list" "$review_list" "$final_list" "$new_list"
 
   original_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${base}" --) \
     || die "could not summarize the original change for the local scope report"
@@ -965,8 +1027,8 @@ local_write_scope_report() {  # <destination>
     printf '\n## Paths changed by the review loop (%d)\n\n' "${#review_paths[@]}"
     if (( ${#review_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
     for path in "${review_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
-    printf '\n## Review-created paths outside the original change (%d)\n\n' "$new_count"
-    if (( new_count == 0 )); then printf -- '- (none)\n'; fi
+    printf '\n## Review-created paths outside the original change (%d)\n\n' "${#new_paths[@]}"
+    if (( ${#new_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
     for path in "${new_paths[@]}"; do printf -- '- `%q` — requires an explicit scope reason\n' "$path"; done
     printf '\n## Paths in the final change (%d)\n\n' "${#final_paths[@]}"
     if (( ${#final_paths[@]} == 0 )); then printf -- '- (none)\n'; fi

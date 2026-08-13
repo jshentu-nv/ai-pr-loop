@@ -375,10 +375,10 @@ never continue past a failed mutation as if it landed.
    git diff "$(cat {{HISTORY_DIR}}/local/base.sha)"..HEAD
    ```
 
-   Read `{{HISTORY_DIR}}/iter-{{ITER}}/review-scope.md` too. It lists paths
-   changed by the loop and calls out paths that were not in the original
-   change. A new path can be valid, such as a focused regression test, but it
-   needs a clear reason tied to this {{PR_NOUN}}.
+   Read the `review-scope.md` report named at the top of this prompt too.
+   It lists paths changed by the loop and calls out paths that were not in
+   the original change. A new path can be valid, such as a focused
+   regression test, but it needs a clear reason tied to this {{PR_NOUN}}.
 {{/local}}
 
    **5a. Before you file it — pressure-test every finding.** A review that cries

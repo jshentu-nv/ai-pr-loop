@@ -139,12 +139,16 @@ Optional flags worth surfacing if the user mentions a constraint:
 
   **Constraints added after launch.** A running agent turn cannot see a new
   chat message. If the user adds a scope, style, compatibility, or behavior
-  constraint while the loop is active, do not let the old run continue under
-  stale instructions. Stop it with the same target plus `--stop`, then rerun
-  the prior command with the new constraint included. Context flags replace
-  the stored snapshot, so include all still-active earlier context in that
-  rerun as well. The loop's completion artifacts make the rerun resume the
-  unfinished iteration instead of silently skipping it.
+  constraint mid-run, do not let the loop continue under stale instructions.
+  Stop it with the same target plus `--stop` and wait for that run to exit.
+  A rerun that starts too soon fails loudly — wait and retry it. Then rerun
+  the prior command with the new constraint plus `--restart`. Context flags
+  replace the stored snapshot, so include all still-active earlier context
+  in that rerun as well. `--restart` closes a race: Codex can post APPROVED
+  just before the stop lands. A plain rerun then takes the "already
+  APPROVED" exit, and no agent ever reads the new constraint. `--restart`
+  always runs a fresh review round against the current state, so the
+  constraint reaches both agents.
 
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if

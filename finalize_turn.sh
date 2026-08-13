@@ -456,6 +456,16 @@ if (( ${NO_PUSH:-0} == 1 )); then
   log "finalize: --no-push — $HEAD_SHA stays in $REPO_DIR; re-run without --no-push to push it"
   exit 0
 fi
+# Check the complete publication unit one last time. This catches a missed
+# stage/amend, an unexpected second parent, or a dirty tree before any remote
+# state changes. git_safe keeps hooks and fsmonitor out of the probe, but a
+# `git status` can still run repo-config-planted code (a clean filter). The
+# probe therefore runs BEFORE the destination check below: an origin
+# redirect made during it is caught there, not obeyed.
+PUSH_DIRT=$(worktree_publishable_dirt "$REPO_DIR") \
+  || die "could not verify that the worktree is clean immediately before push"
+[[ -z "$PUSH_DIRT" ]] \
+  || die "the worktree is not clean immediately before push — refusing to publish a commit that may not contain the intended review changes: $PUSH_DIRT"
 # The squash may only reach the destination pinned when the review
 # started — checked again HERE because the reuse path (a held or rejected
 # squash pushed by a later invocation) runs no closing turn, so the
@@ -481,11 +491,6 @@ fi
 # core.hooksPath=/dev/null: a repository pre-push hook is code the turn
 # controls, running with the orchestrator's authority AFTER the destination
 # was validated — this push is mechanical, so no hook may run under it.
-# Check the complete publication unit one last time. This catches a missed
-# stage/amend, an unexpected second parent, or a dirty tree before any remote
-# state changes.
-[[ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal --ignore-submodules=none)" ]] \
-  || die "the worktree is not clean immediately before push — refusing to publish a commit that may not contain the intended review changes"
 [[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$HEAD_SHA" ]] \
   || die "HEAD moved after the squashed commit was verified — refusing to push"
 [[ "$(git -C "$REPO_DIR" rev-list --parents -n 1 "$HEAD_SHA")" == "$HEAD_SHA $BASE_SHA" ]] \
