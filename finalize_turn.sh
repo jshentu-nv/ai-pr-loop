@@ -44,16 +44,21 @@ hold_outcome() {  # <sha> <squash|nocommit>
   local_write_finalized "$1" "$2"
 }
 
-# Keep the trusted push destination durable across a blocked finalize. Any
-# git probe in this script can run a repo-config clean filter that rewrites
-# the on-disk pin ($(local_origin_file)) and the origin config to a hostile
-# value; $PINNED_DEST, snapshotted before the first probe, is the value the
-# review pinned. Restore it on every exit that leaves the pin in place, so a
-# blocked invocation never leaves a poisoned pin for an unchanged retry to
-# adopt as its own snapshot. A completed run deletes the pin, so only a pin
-# that still exists is restored.
+# Keep the trusted push destination durable across a blocked finalize. The
+# entry sync's `git status` can run a repo-config clean filter that rewrites
+# the on-disk pin ($(local_origin_file)) and the origin config to one hostile
+# value; $PINNED_DEST, snapshotted before that sync, is the value the review
+# pinned. Restore it on every exit that leaves the pin in place, so a blocked
+# invocation never leaves a poisoned pin for an unchanged retry to adopt as
+# its own snapshot. A completed run deletes the pin, so only a pin that still
+# exists is restored.
 restore_pin_on_exit() {
   if [[ -n "$PINNED_DEST" && -f "$(local_origin_file)" ]]; then
+    # A filter may have planted a directory at the atomic-write temp path to
+    # make this repair fail; clear it first. Both steps tolerate failure so
+    # this EXIT trap never aborts before the restore, nor flips the run's
+    # exit status under `set -e`.
+    rm -rf "$(local_origin_file).tmp" || true
     write_state_atomic "$(local_origin_file)" "$PINNED_DEST" || true
   fi
   return 0
@@ -97,16 +102,16 @@ fi
 BASE_SHA=$(<"$BASE_FILE")
 
 # Snapshot the pinned push destination into shell memory BEFORE any git
-# command touches the worktree. finalize runs several `git status` probes
-# (the entry sync below, and the pre-push check), each of which can execute
-# a repo-config clean filter — code a turn can plant. Such a filter could
-# rewrite BOTH the origin config and the on-disk pin to one matching
-# hostile value, so comparing those two on-disk values to each other would
-# pass. The push-time destination checks compare the live origin against
-# this in-memory snapshot instead, which no filter can reach.
+# command touches the worktree. A later git command that re-hashes worktree
+# content (the entry sync below, the squash's commit) can run a repo-config
+# clean filter — code a turn can plant — which could rewrite BOTH the origin
+# config and the on-disk pin to one matching hostile value, so comparing
+# those two on-disk values to each other would pass. The push-time
+# destination check compares the live origin against this in-memory snapshot
+# instead, which no filter can reach.
 PINNED_DEST=''
 [[ -s "$(local_origin_file)" ]] && PINNED_DEST=$(<"$(local_origin_file)")
-# Registered now, after the snapshot and before the first probe, so every
+# Registered now, after the snapshot and before the entry sync, so every
 # later exit repairs a pin a filter may have poisoned.
 trap restore_pin_on_exit EXIT
 
@@ -495,20 +500,6 @@ fi
   || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing — it is written when the review starts, and a turn may have removed it). Write the intended destination there (the output of 'git remote get-url --all origin' then 'git remote get-url --push --all origin', or '(none)') and re-run"
 [[ "$(origin_dest)" == "$PINNED_DEST" ]] \
   || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$PINNED_DEST" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
-
-# Check the complete publication unit one last time. This catches a missed
-# stage/amend, an unexpected second parent, or a dirty tree before any remote
-# state changes. git_safe keeps hooks and fsmonitor out of the probe.
-PUSH_DIRT=$(worktree_publishable_dirt "$REPO_DIR") \
-  || die "could not verify that the worktree is clean immediately before push"
-[[ -z "$PUSH_DIRT" ]] \
-  || die "the worktree is not clean immediately before push — refusing to publish a commit that may not contain the intended review changes: $PUSH_DIRT"
-
-# Re-check the destination against the in-memory snapshot after the probe:
-# neither the live origin nor its on-disk pin may have moved while the
-# probe ran.
-[[ "$(origin_dest)" == "$PINNED_DEST" && "$(<"$(local_origin_file)")" == "$PINNED_DEST" ]] \
-  || die "the origin destination or its recorded pin changed during the pre-push checks in $REPO_DIR — refusing to push to a destination the review never validated"
 
 if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
   # A supported terminal state, not a held one: with nowhere to push, the

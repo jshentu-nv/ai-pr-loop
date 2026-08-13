@@ -147,14 +147,17 @@ Optional flags worth surfacing if the user mentions a constraint:
   so include all still-active earlier context in that rerun as well.
 
   `--restart` gets past a prior APPROVED verdict, which a plain rerun would
-  exit on before any agent reads the constraint. If the stopped run left a
-  Codex review awaiting a Claude reply, the rerun answers that reply first,
-  then runs a fresh Codex round — so both agents still see the constraint.
-  Two flags make that fresh round reachable: `--converge 0`, so a prior
-  review that already met the convergence threshold cannot end the loop
-  first, and `--max` at least 2, so the pending Claude reply does not
-  consume a one-iteration budget before the fresh Codex round. If the prior
-  command capped `--max` lower, raise it on the rerun.
+  exit on before any agent reads the constraint. It always runs a fresh
+  Codex round on the current state, so the reviewer sees the constraint.
+  `--converge 0` is required so a prior review that already met the
+  convergence threshold cannot end the loop before that round.
+
+  One extra step applies only to a forge review+implement run (no
+  `--review-only`, no `--local`). There, a stopped run can leave a Codex
+  review awaiting a Claude reply. The rerun answers that reply first, then
+  runs the fresh Codex round — so `--max` must be at least 2, or the pending
+  reply consumes the whole budget before Codex runs. Local and review-only
+  runs skip the pending reply and go straight to the fresh Codex round.
 
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if

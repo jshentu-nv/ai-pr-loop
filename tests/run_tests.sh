@@ -5699,8 +5699,8 @@ t "finalize: tolerated submodule eol noise does not block the push"
 # Non-idempotent eol/filter state inside an initialized submodule survives
 # every cleanup (each checkout re-dirties it) and force_clean_to_commit
 # deliberately tolerates it — it cannot be published through a superproject
-# commit. The pre-push probe must tolerate exactly the same set, or every
-# review of such a repo stops just before its push.
+# commit. finalize must run to completion on such a repo, so its entry sync
+# tolerates that noise instead of aborting before the push.
 local_fixture
 git init -q -b main "$WORK/fin-subsrc"
 git -C "$WORK/fin-subsrc" config user.email t@t
@@ -5717,11 +5717,16 @@ finalize_run
 assert_eq "$FIN_RC" 0
 assert_eq "$(remote_head)" "$(local_head)"
 
-t "finalize: a clean filter planted in repo config cannot redirect the push"
-# git_safe does not block content filters, so any worktree probe can run
-# repo-config-planted code. Every destination check runs after a probe, so
-# a redirect the filter makes is always caught, never obeyed. The touch
-# forces a content re-check: the filter then runs on the first probe.
+# A repository clean filter is config-planted code that runs when git hashes
+# worktree content. finalize removed its pre-push worktree probe, so after the
+# squash the destination check, tree checks, and push read only commit objects
+# and config — none re-hash the worktree, so a planted filter cannot rewrite
+# the origin or the pin there. A filter can still fire earlier (the entry sync,
+# the squash's commit); the in-memory destination snapshot catches any redirect
+# it makes, and the EXIT trap restores a pin it poisoned. The invariant every
+# case below asserts: the hostile remote never receives a push.
+
+t "finalize: an unconditional clean filter cannot redirect the push"
 local_fixture; local_round 1
 _evil="$WORK/evil-filter-$RANDOM.git"; git init -q --bare "$_evil"
 mkdir -p "$LF_CLONE/.git/info"
@@ -5732,19 +5737,14 @@ touch "$LF_CLONE/f"
 finalize_run
 git -C "$LF_CLONE" config --unset filter.evil.clean
 rm -f "$LF_CLONE/.git/info/attributes"
-assert_eq "$FIN_RC" 1
-assert_substr "$WORK/fin.log" 'does not match the one recorded'
 if git -C "$_evil" show-ref -q 2>/dev/null; then
   bad "the filter-redirected remote received a push"; else ok; fi
-t "finalize: the filter-planted round left the pinned remote untouched"
-assert_eq "$(remote_head)" "$LF_BASE"
 
 t "finalize: a filter rewriting both origin and its pin cannot redirect the push"
-# The stronger attack: the clean filter rewrites the origin config AND the
-# on-disk pin to one matching hostile value, so comparing the two on-disk
-# values to each other would pass. The push destination is checked against
-# an in-memory snapshot taken before any probe ran, which the filter cannot
-# reach.
+# The stronger attack rewrites the origin config AND the on-disk pin to one
+# matching hostile value, so comparing the two on-disk values to each other
+# would pass. The push destination is checked against an in-memory snapshot
+# taken before any probe ran, which the filter cannot reach.
 local_fixture; local_round 1
 _evil="$WORK/evil-both-$RANDOM.git"; git init -q --bare "$_evil"
 mkdir -p "$LF_CLONE/.git/info"
@@ -5755,83 +5755,78 @@ touch "$LF_CLONE/f"
 finalize_run
 git -C "$LF_CLONE" config --unset filter.evil.clean
 rm -f "$LF_CLONE/.git/info/attributes"
-assert_eq "$FIN_RC" 1
 if git -C "$_evil" show-ref -q 2>/dev/null; then
   bad "the dual-rewrite filter redirected the push"; else ok; fi
-t "finalize: the dual-rewrite attempt left the pinned remote untouched"
-assert_eq "$(remote_head)" "$LF_BASE"
 
-t "finalize: a poisoned pin from a blocked run is not adopted by the retry"
-# A marker-gated clean filter rewrites origin and its pin only once the
-# post-squash 'finalized' marker exists, so it fires at the pre-push probe.
-# The first finalize blocks, restores the pin, and exits; an unchanged
-# retry must snapshot the restored pin and refuse again — never adopting
-# the poisoned value and pushing to the hostile remote.
+t "finalize: a marker-gated clean filter never runs after the squash marker"
+# The filter writes a witness only when it runs after the post-squash marker
+# exists. Because no push-path git command re-hashes the worktree, that
+# witness stays absent, the filter cannot poison anything, and the approved
+# squash reaches the pinned remote.
 local_fixture; local_round 1
-_evil="$WORK/evil-retry-$RANDOM.git"; git init -q --bare "$_evil"
+_evil="$WORK/evil-neut-$RANDOM.git"; git init -q --bare "$_evil"
+_fired="$WORK/fired-$RANDOM"; rm -f "$_fired"
 mkdir -p "$LF_CLONE/.git/info"
 printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
 git -C "$LF_CLONE" config filter.evil.clean \
-  "touch -d 2099-01-01 '$LF_CLONE/f'; if [ -f '$LF_STATE/local/finalized' ]; then git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; fi; cat"
+  "touch -d 2099-01-01 '$LF_CLONE/f'; if [ -f '$LF_STATE/local/finalized' ]; then echo yes > '$_fired'; git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; fi; cat"
 touch -d 2099-01-01 "$LF_CLONE/f"
-finalize_run                       # first invocation: blocks and restores the pin
+finalize_run
+git -C "$LF_CLONE" config --unset filter.evil.clean
+rm -f "$LF_CLONE/.git/info/attributes"
+assert_eq "$FIN_RC" 0
+if [[ -f "$_fired" ]]; then
+  bad "the planted clean filter executed on the push path"; else ok; fi
+t "finalize: the marker-gated run pushed the approved squash to the pinned remote"
+assert_eq "$(remote_head)" "$(local_head)"
+t "finalize: the marker-gated filter left the hostile remote empty"
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the hostile remote received a push"; else ok; fi
+
+t "finalize: an entry-sync filter poisoning the pin is restored, not adopted by a retry"
+# The entry sync's git status can still run a clean filter (a racily-clean
+# tracked file is re-hashed). Here an unconditional filter rewrites origin and
+# the pin on every fire, and — Codex's occupied-temp variant — plants a
+# directory at the pin's atomic-write temp path to break the repair. The first
+# finalize blocks (the in-memory snapshot catches the redirect) and its EXIT
+# trap clears the temp path and restores the pin, so an unchanged retry reads
+# the trusted value and refuses again. (A SIGKILL during the poison, before
+# the trap runs, is not covered — that pre-existing limit of the on-disk pin
+# is noted in the review thread.)
+local_fixture; local_round 1
+_evil="$WORK/evil-occ-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/info"
+printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.evil.clean \
+  "touch -d 2099-01-01 '$LF_CLONE/f'; git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; rm -rf '$LF_STATE/local/origin.url.tmp'; mkdir -p '$LF_STATE/local/origin.url.tmp'; cat"
+touch -d 2099-01-01 "$LF_CLONE/f"
+finalize_run
 assert_eq "$FIN_RC" 1
-finalize_run                       # unchanged retry: must still refuse
+finalize_run
 assert_eq "$FIN_RC" 1
 git -C "$LF_CLONE" config --unset filter.evil.clean
 rm -f "$LF_CLONE/.git/info/attributes"
 if git -C "$_evil" show-ref -q 2>/dev/null; then
-  bad "a retry adopted the poisoned pin and pushed to the hostile remote"; else ok; fi
-t "finalize: the poisoned-pin retry left the pinned remote untouched"
-assert_eq "$(remote_head)" "$LF_BASE"
+  bad "a retry adopted the entry-sync-poisoned pin and pushed to the hostile remote"; else ok; fi
 
-t "finalize: a pin poisoned before a non-destination die is still restored"
-# The filter makes the tree look dirty on its first post-squash fire, so the
-# first finalize exits through the 'not clean' die — not the destination
-# check. The trusted pin must still be restored on that exit, or the retry
-# (where the filter now reports clean) adopts the poisoned pin and pushes.
-local_fixture; local_round 1
-_evil="$WORK/evil-notclean-$RANDOM.git"; git init -q --bare "$_evil"
-_seen="$WORK/notclean-seen-$RANDOM"; rm -f "$_seen"
+t "finalize: a content-transforming clean filter still finalizes and pushes"
+# A repo whose tracked file goes through a content-transforming clean filter
+# (Git LFS, keyword expansion, normalization) must still finalize: nothing
+# in the push path re-hashes the worktree through that filter, so a
+# racily-clean filtered file cannot read as spurious dirt and block the push.
+local_fixture
 mkdir -p "$LF_CLONE/.git/info"
-printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
-git -C "$LF_CLONE" config filter.evil.clean \
-  "touch -d 2099-01-01 '$LF_CLONE/f'; if [ -f '$LF_STATE/local/finalized' ]; then git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; if [ ! -f '$_seen' ]; then touch '$_seen'; cat; echo EXTRA; exit 0; fi; fi; cat"
-touch -d 2099-01-01 "$LF_CLONE/f"
-finalize_run                       # first invocation: dirty tree -> 'not clean' die
-assert_eq "$FIN_RC" 1
-finalize_run                       # retry: filter now clean, but pin was restored
-assert_eq "$FIN_RC" 1
-git -C "$LF_CLONE" config --unset filter.evil.clean
+printf 'f filter=upper\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.upper.clean "tr a-z A-Z"
+git -C "$LF_CLONE" config filter.upper.required true
+printf 'round one\n' >> "$LF_CLONE/f"
+git -C "$LF_CLONE" add f; git -C "$LF_CLONE" commit -qm 'round 1'
+finalize_run
+git -C "$LF_CLONE" config --unset filter.upper.clean
+git -C "$LF_CLONE" config --unset filter.upper.required
 rm -f "$LF_CLONE/.git/info/attributes"
-if git -C "$_evil" show-ref -q 2>/dev/null; then
-  bad "a retry after a non-destination die pushed to the hostile remote"; else ok; fi
-t "finalize: the non-destination-die retry left the pinned remote untouched"
-assert_eq "$(remote_head)" "$LF_BASE"
-
-t "worktree_publishable_dirt: a failed probe dies instead of reading clean"
-# The probe's error prints nothing. Without the explicit capture-and-die,
-# empty output reads as a clean tree and the caller publishes on it.
-BRKP="$WORK/dirt-probe"; rm -rf "$BRKP"
-git init -q -b main "$BRKP"
-git -C "$BRKP" config user.email t@t; git -C "$BRKP" config user.name t
-printf 'x\n' > "$BRKP/f"; git -C "$BRKP" add f; git -C "$BRKP" commit -qm x
-mv "$BRKP/.git/index" "$BRKP/.git/index.bak"
-mkdir "$BRKP/.git/index"
-# No set -e here: the guard itself, not the caller's shell flags, must fail.
-if _dirt=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
-     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; worktree_publishable_dirt '$BRKP'" \
-     2>"$WORK/dirt-probe.log"); then
-  bad "a failed status probe was read as a clean tree"
-else
-  ok
-fi
-rmdir "$BRKP/.git/index"; mv "$BRKP/.git/index.bak" "$BRKP/.git/index"
-t "worktree_publishable_dirt: a healthy repo reports its dirt"
-printf 'dirty\n' >> "$BRKP/f"
-_dirt=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
-  "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; worktree_publishable_dirt '$BRKP'")
-assert_eq "$_dirt" ' M f'
+assert_eq "$FIN_RC" 0
+assert_eq "$(remote_head)" "$(local_head)"
 
 t "finalize: a held squash is not pushed to a remote redirected in between"
 local_fixture; local_round 1

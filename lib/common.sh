@@ -944,18 +944,6 @@ local_ensure_scope_merge_base() {  # <commit-a> <commit-b>
   done
 }
 
-# Publishable dirt in a loop-owned checkout: everything except
-# submodule-internal worktree state, which cannot enter a superproject
-# commit — the same set force_clean_to_commit tolerates. Dies when the
-# probe itself fails: a failed status prints nothing, and empty output
-# must never read as a clean tree.
-worktree_publishable_dirt() {  # <dir>
-  local dirt
-  dirt=$(git_safe -C "$1" status --porcelain --untracked-files=normal --ignore-submodules=dirty) \
-    || die "could not probe $1 for uncommitted state before publication"
-  printf '%s\n' "$dirt"
-}
-
 # Write a deterministic scope report for the current local tip. The report
 # is evidence, not an automatic rejection: a focused test can validly add a
 # new path, but the agents must explain why it belongs to this change.
