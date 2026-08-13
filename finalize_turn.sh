@@ -36,11 +36,32 @@ DESC_FILE="$LOCAL_DIR/pr-description.md"
 FINALIZED_FILE=$(local_finalized_file)
 INPROGRESS_FILE=$(local_finalize_inprogress_file)
 BASELINE_FILE="$LOCAL_DIR/metadata-baseline.json"
+SCOPE_FILE=$(local_scope_report_file)
 
 # Record a finalize outcome that has not landed terminally yet — the tip it
 # covers and what it is — as one atomic journal write.
 hold_outcome() {  # <sha> <squash|nocommit>
   local_write_finalized "$1" "$2"
+}
+
+# Keep the trusted push destination durable across a blocked finalize. The
+# entry sync's `git status` can run a repo-config clean filter that rewrites
+# the on-disk pin ($(local_origin_file)) and the origin config to one hostile
+# value; $PINNED_DEST, snapshotted before that sync, is the value the review
+# pinned. Restore it on every exit that leaves the pin in place, so a blocked
+# invocation never leaves a poisoned pin for an unchanged retry to adopt as
+# its own snapshot. A completed run deletes the pin, so only a pin that still
+# exists is restored.
+restore_pin_on_exit() {
+  if [[ -n "$PINNED_DEST" && -f "$(local_origin_file)" ]]; then
+    # A filter may have planted a directory at the atomic-write temp path to
+    # make this repair fail; clear it first. Both steps tolerate failure so
+    # this EXIT trap never aborts before the restore, nor flips the run's
+    # exit status under `set -e`.
+    rm -rf "$(local_origin_file).tmp" || true
+    write_state_atomic "$(local_origin_file)" "$PINNED_DEST" || true
+  fi
+  return 0
 }
 
 # The review's outcome is in its final resting place: record that
@@ -54,7 +75,8 @@ hold_outcome() {  # <sha> <squash|nocommit>
 mark_completed() {
   write_state_atomic "$(local_completed_file)" "$1"
   rm -f "$BASE_FILE" "$FINALIZED_FILE" "$INPROGRESS_FILE" \
-        "$(local_tip_file)" "$(local_origin_file)"
+        "$(local_tip_file)" "$(local_origin_file)" \
+        "$(local_target_base_file)"
 }
 
 # The PR/MR's current title and body, as one canonical string per forge —
@@ -79,6 +101,20 @@ if [[ ! -s "$BASE_FILE" ]]; then
 fi
 BASE_SHA=$(<"$BASE_FILE")
 
+# Snapshot the pinned push destination into shell memory BEFORE any git
+# command touches the worktree. A later git command that re-hashes worktree
+# content (the entry sync below, the squash's commit) can run a repo-config
+# clean filter — code a turn can plant — which could rewrite BOTH the origin
+# config and the on-disk pin to one matching hostile value, so comparing
+# those two on-disk values to each other would pass. The push-time
+# destination check compares the live origin against this in-memory snapshot
+# instead, which no filter can reach.
+PINNED_DEST=''
+[[ -s "$(local_origin_file)" ]] && PINNED_DEST=$(<"$(local_origin_file)")
+# Registered now, after the snapshot and before the entry sync, so every
+# later exit repairs a pin a filter may have poisoned.
+trap restore_pin_on_exit EXIT
+
 # The review turn that approved may have left build output in the worktree;
 # drop it, keeping every local round.
 sync_repo_to_local_head
@@ -86,6 +122,11 @@ sync_repo_to_local_head
 HEAD_SHA=$(git -C "$REPO_DIR" rev-parse HEAD)
 git -C "$REPO_DIR" merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA" \
   || die "HEAD ($HEAD_SHA) in $REPO_DIR no longer descends from the squash base ($BASE_SHA) — refusing to rewrite history the loop did not create"
+
+# Keep a human-readable split between the original change and everything the
+# review added. The closing agent must read it before composing the message;
+# the file remains in the state dir after the review completes.
+local_write_scope_report "$SCOPE_FILE"
 
 ROUNDS=$(git -C "$REPO_DIR" rev-list --count "${BASE_SHA}..${HEAD_SHA}")
 
@@ -176,6 +217,7 @@ else
     -e "s|{{BASE_SHA}}|${BASE_SHA}|g" \
     -e "s|{{ROUNDS}}|${ROUNDS}|g" \
     -e "s|{{HISTORY_DIR}}|${STATE_DIR}|g" \
+    -e "s|{{SCOPE_FILE}}|${SCOPE_FILE}|g" \
     -e "s|{{MESSAGE_FILE}}|${MSG_FILE}|g" \
     -e "s|{{TITLE_FILE}}|${TITLE_FILE}|g" \
     -e "s|{{DESC_FILE}}|${DESC_FILE}|g" \
@@ -448,15 +490,16 @@ if (( ${NO_PUSH:-0} == 1 )); then
   log "finalize: --no-push — $HEAD_SHA stays in $REPO_DIR; re-run without --no-push to push it"
   exit 0
 fi
-# The squash may only reach the destination pinned when the review
-# started — checked again HERE because the reuse path (a held or rejected
-# squash pushed by a later invocation) runs no closing turn, so the
-# checks around it never fire on the one invocation that actually pushes.
-# A missing record fails closed for the same reason as above.
-[[ -s "$(local_origin_file)" ]] \
+# The squash may only reach the destination pinned when the review started
+# ($PINNED_DEST, snapshotted at the top before any worktree probe ran).
+# Checked HERE too because the reuse path (a held or rejected squash pushed
+# by a later invocation) runs no closing turn, so the checks around it
+# never fire on the one invocation that actually pushes. A missing record
+# fails closed: a turn could delete the file to get a poisoned re-pin.
+[[ -n "$PINNED_DEST" ]] \
   || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing — it is written when the review starts, and a turn may have removed it). Write the intended destination there (the output of 'git remote get-url --all origin' then 'git remote get-url --push --all origin', or '(none)') and re-run"
-[[ "$(origin_dest)" == "$(<"$(local_origin_file)")" ]] \
-  || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$(<"$(local_origin_file)")" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
+[[ "$(origin_dest)" == "$PINNED_DEST" ]] \
+  || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$PINNED_DEST" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
 
 if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
   # A supported terminal state, not a held one: with nowhere to push, the
@@ -473,6 +516,12 @@ fi
 # core.hooksPath=/dev/null: a repository pre-push hook is code the turn
 # controls, running with the orchestrator's authority AFTER the destination
 # was validated — this push is mechanical, so no hook may run under it.
+[[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$HEAD_SHA" ]] \
+  || die "HEAD moved after the squashed commit was verified — refusing to push"
+[[ "$(git -C "$REPO_DIR" rev-list --parents -n 1 "$HEAD_SHA")" == "$HEAD_SHA $BASE_SHA" ]] \
+  || die "the final commit is not one single-parent squash on the recorded review base $BASE_SHA — refusing to push"
+[[ "$(git -C "$REPO_DIR" rev-parse "${HEAD_SHA}^{tree}")" == "$APPROVED_TREE" ]] \
+  || die "the final commit no longer contains the tree Codex approved — refusing to push"
 log "finalize: pushing $HEAD_SHA to origin"
 if ! git_safe -C "$REPO_DIR" push origin "HEAD:refs/heads/$HEAD_REF" >&2; then
   die "push of $HEAD_SHA was rejected (the branch moved while the review ran?). The squashed commit is in $REPO_DIR at $HEAD_SHA — reconcile it there and push manually; the loop never force-pushes"

@@ -879,6 +879,156 @@ local_tip_ref() {
 # commit. Written once per run and read by finalize_turn.sh.
 local_base_file() { printf '%s/base.sha\n' "$(local_state_dir)"; }
 
+# The target-side base of the change when the local review started. Together
+# with base.sha (the original PR/branch head), it lets every later turn split
+# the author's change from the review-created diff. Keep it pinned even when
+# the target branch advances while a long review is running.
+local_target_base_file() { printf '%s/target-base.sha\n' "$(local_state_dir)"; }
+
+# The final copy is kept after completion so the operator can audit which
+# paths the review changed and which of those paths were new to the change.
+local_scope_report_file() { printf '%s/review-scope.md\n' "$(local_state_dir)"; }
+
+# The scope report's three-dot diffs need the merge base of the pinned
+# commits. A shallow --dir clone can lack it: setup fetches only the base
+# and head tips there, so no common ancestor is present locally. Deepen the
+# history until the merge base exists. Managed clones are full clones, so
+# this normally runs no fetch at all.
+local_ensure_scope_merge_base() {  # <commit-a> <commit-b>
+  local d="$REPO_DIR" step=64 shallow_file boundary ref fetched
+  # A pinned commit can be absent outright (a stale or hand-edited state
+  # file). Report that as what it is — deepening cannot ever recover it.
+  git -C "$d" rev-parse --verify --quiet "$1^{commit}" >/dev/null \
+    || die "commit $1 is not present in $d — the recorded review state does not match this checkout"
+  git -C "$d" rev-parse --verify --quiet "$2^{commit}" >/dev/null \
+    || die "commit $2 is not present in $d — the recorded review state does not match this checkout"
+  until git -C "$d" merge-base "$1" "$2" >/dev/null 2>&1; do
+    [[ "$(git -C "$d" rev-parse --is-shallow-repository)" == "true" ]] \
+      || die "no merge base exists between $1 and $2 in $d — the scope report cannot split the original change from the review's work"
+    # Only PR scope pins two remote branch names to deepen. Branch scope
+    # would have to fetch the clone's configured refspec, which a turn can
+    # rewrite to force-update local refs — refuse instead. run.sh proves
+    # the merge base exists when a branch-scope review starts, so this die
+    # is reachable only through state the loop did not create.
+    [[ "$LOCAL_SCOPE" == "pr" && -n "${BASE_REF:-}" && -n "${HEAD_REF:-}" ]] \
+      || die "the shallow clone $d lacks the merge base of $1 and $2 — deepen it by hand (git -C $d fetch --unshallow origin) and re-run"
+    # This fetch may only reach the destination pinned when the review
+    # started. A turn could have redirected origin since then.
+    [[ -s "$(local_origin_file)" ]] \
+      || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing) — refusing to fetch"
+    [[ "$(origin_dest)" == "$(<"$(local_origin_file)")" ]] \
+      || die "the effective destination of origin in $d does not match the one recorded for this review — refusing to fetch from it"
+    shallow_file=$(git -C "$d" rev-parse --git-path shallow) \
+      || die "could not locate the shallow marker file of $d"
+    # --git-path answers relative to the repository, not to this process.
+    [[ "$shallow_file" == /* ]] || shallow_file="$d/$shallow_file"
+    boundary=$(cat "$shallow_file" 2>/dev/null || true)
+    # Deepen the pinned branches one ref at a time — one branch may be
+    # gone (a head deleted mid-review), and that must not stop the other
+    # from deepening. The fetch must update no ref and create no object
+    # beyond the deepened commits: --refmap= plus a colon-free refspec
+    # neutralizes a planted remote.origin.fetch, --no-tags a planted
+    # tagOpt=--tags, and --recurse-submodules=no a planted
+    # fetch.recurseSubmodules that would rewrite a submodule's own refs.
+    fetched=0
+    for ref in "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"; do
+      git_safe -C "$d" fetch --quiet --refmap= --no-tags --recurse-submodules=no \
+          --deepen="$step" origin "$ref" \
+        && fetched=1
+    done
+    (( fetched == 1 )) \
+      || die "could not deepen the shallow clone $d to reach the merge base of $1 and $2"
+    [[ "$(cat "$shallow_file" 2>/dev/null || true)" != "$boundary" ]] \
+      || die "deepening $d did not extend its shallow history — the merge base may no longer be reachable from any branch on origin; unshallow or re-clone $d by hand and re-run"
+    step=$((step * 2))
+  done
+}
+
+# Write a deterministic scope report for the current local tip. The report
+# is evidence, not an automatic rejection: a focused test can validly add a
+# new path, but the agents must explain why it belongs to this change.
+local_write_scope_report() {  # <destination>
+  local dest="$1" target base head tmp original_list review_list final_list
+  local original_stat review_stat final_stat path
+  local -a original_paths=() review_paths=() final_paths=() new_paths=()
+  local -A original_set=()
+
+  [[ -s "$(local_target_base_file)" ]] \
+    || die "local scope report has no target base ($(local_target_base_file) is missing)"
+  [[ -s "$(local_base_file)" ]] \
+    || die "local scope report has no review base ($(local_base_file) is missing)"
+  target=$(<"$(local_target_base_file)")
+  base=$(<"$(local_base_file)")
+  head=$(git -C "$REPO_DIR" rev-parse HEAD) \
+    || die "could not read HEAD for the local scope report"
+  local_ensure_scope_merge_base "$target" "$base"
+  local_ensure_scope_merge_base "$target" "$head"
+
+  mkdir -p "$(dirname "$dest")"
+  original_list="${dest}.original.tmp.$$"
+  review_list="${dest}.review.tmp.$$"
+  final_list="${dest}.final.tmp.$$"
+  if ! git -C "$REPO_DIR" diff --name-only -z "${target}...${base}" -- > "$original_list" \
+     || ! git -C "$REPO_DIR" diff --name-only -z "${base}..${head}" -- > "$review_list" \
+     || ! git -C "$REPO_DIR" diff --name-only -z "${target}...${head}" -- > "$final_list"; then
+    rm -f "$original_list" "$review_list" "$final_list"
+    die "could not list paths for the local scope report"
+  fi
+  while IFS= read -r -d '' path; do original_paths+=("$path"); done < "$original_list"
+  while IFS= read -r -d '' path; do review_paths+=("$path"); done < "$review_list"
+  while IFS= read -r -d '' path; do final_paths+=("$path"); done < "$final_list"
+  rm -f "$original_list" "$review_list" "$final_list"
+  # A review path is new when it is absent from the original change. An
+  # associative array gives constant-time membership, so this stays linear
+  # with no sort and no external tool — git and jq are the only base
+  # utilities the loop requires, and a non-GNU userland need not carry a
+  # NUL-capable comm or sort. Git never emits a NUL inside a path, so each
+  # path is a safe key. `git diff --name-only` already emits sorted paths,
+  # so every report section renders in a stable order without re-sorting.
+  for path in "${original_paths[@]}"; do original_set["$path"]=1; done
+  for path in "${review_paths[@]}"; do
+    [[ -n "${original_set["$path"]+x}" ]] || new_paths+=("$path")
+  done
+
+  original_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${base}" --) \
+    || die "could not summarize the original change for the local scope report"
+  review_stat=$(git -C "$REPO_DIR" diff --shortstat "${base}..${head}" --) \
+    || die "could not summarize the review-created diff for the local scope report"
+  final_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${head}" --) \
+    || die "could not summarize the final change for the local scope report"
+  [[ -n "$original_stat" ]] || original_stat='no changes'
+  [[ -n "$review_stat" ]] || review_stat='no changes'
+  [[ -n "$final_stat" ]] || final_stat='no changes'
+
+  tmp="${dest}.tmp.$$"
+  {
+    printf '# Review scope report\n\n'
+    printf 'This separates the original change from work added by the review loop.\n'
+    printf 'Reading a path is not permission to edit it. Every review-created path\n'
+    printf 'needs a reason tied to the change under review.\n\n'
+    printf -- '- Target base: `%s`\n' "$target"
+    printf -- '- Original change head: `%s`\n' "$base"
+    printf -- '- Current reviewed head: `%s`\n\n' "$head"
+    printf '## Size\n\n'
+    printf -- '- Original change: %s\n' "$original_stat"
+    printf -- '- Review-created diff: %s\n' "$review_stat"
+    printf -- '- Final change: %s\n\n' "$final_stat"
+    printf '## Paths in the original change (%d)\n\n' "${#original_paths[@]}"
+    if (( ${#original_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${original_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+    printf '\n## Paths changed by the review loop (%d)\n\n' "${#review_paths[@]}"
+    if (( ${#review_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${review_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+    printf '\n## Review-created paths outside the original change (%d)\n\n' "${#new_paths[@]}"
+    if (( ${#new_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${new_paths[@]}"; do printf -- '- `%q` — requires an explicit scope reason\n' "$path"; done
+    printf '\n## Paths in the final change (%d)\n\n' "${#final_paths[@]}"
+    if (( ${#final_paths[@]} == 0 )); then printf -- '- (none)\n'; fi
+    for path in "${final_paths[@]}"; do printf -- '- `%q`\n' "$path"; done
+  } > "$tmp" || { rm -f "$tmp"; die "could not write local scope report $dest"; }
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; die "could not publish local scope report $dest"; }
+}
+
 # Where the last committed round left HEAD. The tip ref keeps pr-scope
 # rounds reachable; this file is the EXPECTED tip for both scopes, checked
 # on every resume and sync so a branch or ref that moved outside the loop's
@@ -1143,6 +1293,9 @@ local_setup_repo() {
       || die "could not clear stale ref refs/ai-pr-loop/base in $d"
     git_safe -C "$d" update-ref refs/ai-pr-loop/base "$LOCAL_BASE_SHA" \
       || die "could not point refs/ai-pr-loop/base at $LOCAL_BASE_SHA in $d"
+    if [[ ! -s "$(local_target_base_file)" ]]; then
+      write_state_atomic "$(local_target_base_file)" "$LOCAL_BASE_SHA"
+    fi
     force_clean_to_commit "$d" "$tip" attach
     if [[ ! -s "$(local_base_file)" ]]; then
       printf '%s\n' "$tip" > "$(local_base_file)"
@@ -1183,6 +1336,14 @@ local_setup_repo() {
       || die "git fetch of '$BASE_REF'/'$HEAD_REF' from origin failed"
     origin_head=$(git -C "$d" rev-parse --verify --quiet "refs/ai-pr-loop/head^{commit}") \
       || die "could not resolve the PR head after fetch"
+    # Older in-progress state predates the scope report. Migrate it using the
+    # target ref fetched for this invocation. New runs pin this file before
+    # any review round, so later target-branch movement cannot rewrite scope.
+    if [[ ! -s "$(local_target_base_file)" ]]; then
+      write_state_atomic "$(local_target_base_file)" \
+        "$(git -C "$d" rev-parse "refs/ai-pr-loop/base^{commit}")"
+      log "local: recorded the target base for review scope reporting"
+    fi
     if [[ "$origin_head" != "$base" ]]; then
       # One remote position is not external movement: the exact squash this
       # run already validated and pushed, with the crash landing between
@@ -1205,6 +1366,8 @@ local_setup_repo() {
   else
     sync_repo_to_pr_head
     tip=$(git -C "$d" rev-parse HEAD) || die "could not read HEAD in $d"
+    write_state_atomic "$(local_target_base_file)" \
+      "$(git -C "$d" rev-parse "refs/ai-pr-loop/base^{commit}")"
     printf '%s\n' "$tip" > "$(local_base_file)"
     local_record_tip
     log "local: squash base recorded at $tip (PR head)"

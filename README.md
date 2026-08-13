@@ -192,12 +192,13 @@ are namespaced by host so a same-slug repo on another forge/host can never
 share a checkout, state, or agent sessions (GitHub keeps the legacy
 `<owner>__<name>` layout).
 
-## Additional context (web links, notes, files)
+## Additional context and review constraints
 
 Both agents review the diff against the PR description and the repo's own
-conventions. You can hand them **extra reference material** — a design doc,
-an RFC, a related issue, an API reference, a style guide — and it's shared
-by *both* the Codex Reviewer and the Claude Implementer:
+conventions. You can hand them **extra reference material or constraints** —
+a design doc, an RFC, a related issue, an API reference, a style guide, a
+scope limit, or a comment-writing rule — and it is shared by *both* the Codex
+Reviewer and the Claude Implementer:
 
 ```bash
 # Attach web links (repeatable). The agents fetch them themselves
@@ -218,6 +219,11 @@ by *both* the Codex Reviewer and the Claude Implementer:
 | `--context TEXT` | A free-text note. Repeatable. |
 | `--context-file FILE` | A local file; its contents are injected verbatim. Read at launch, so the path needn't survive to later re-runs. Repeatable. |
 | `--clear-context` | Drop context stored from a prior run on this PR. |
+
+The prompts treat these constraints as part of the review contract. In
+particular, the agents must distinguish broad inspection from narrow edit
+scope: a touched file is not, by itself, permission to fix a pre-existing
+problem in that file.
 
 All inputs are rendered once to `state/<owner>__<name>/pr-<N>/context.md`,
 whose path is injected into both prompts; each agent reads it (and fetches
@@ -399,8 +405,11 @@ counts, no "addressed review comments".
 state/<repo-ident>/<target>/
   iter-01/codex-review.md      # the reviewer's findings, citing path:line
   iter-01/claude-response.md   # fixes, pushback, verification
+  iter-01/review-scope.md      # original change vs review-created paths
   iter-02/...
   local/base.sha               # the commit the run started from
+  local/target-base.sha        # target base pinned when the review started
+  local/review-scope.md        # final scope report, kept after completion
   local/tip.sha                # where the last committed round left HEAD
   local/commit-message.txt     # the composed message for the squash
   local/completed.sha          # terminal marker: the review's final commit

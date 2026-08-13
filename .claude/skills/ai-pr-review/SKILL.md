@@ -113,11 +113,14 @@ Optional flags worth surfacing if the user mentions a constraint:
   pushing, for inspection ("let me look before it goes up"). Re-running
   without the flag pushes it without composing the message again.
 
-- **Additional context** (shared by both agents) — when the user wants the
-  bots to consider external reference material (a design doc, RFC, related
-  issue, API reference, style guide), pass it through. Phrases like "review
+- **Additional context and constraints** (shared by both agents) — when the
+  user wants the bots to consider reference material or a review constraint
+  (a design doc, RFC, related issue, API reference, style guide, scope limit,
+  or comment-writing rule), pass it through. Phrases like "review
   this against <link>", "here's the design doc: <url>", "keep <url> in mind",
-  "use this spec". All are repeatable and shared by both Codex and Claude:
+  "use this spec", "only change code needed for this ticket", or "write
+  comments in this style" all belong here. All are repeatable and shared by
+  both Codex and Claude:
   - `--context-url URL` — a web link. The agents fetch it themselves
     (Claude via WebFetch, Codex via curl).
   - `--context TEXT` — a free-text note.
@@ -133,6 +136,28 @@ Optional flags worth surfacing if the user mentions a constraint:
   they fetch the URLs under the user's `gh` identity. Only attach links/files
   the user actually asked for — don't infer context URLs from the surrounding
   conversation.
+
+  **Constraints added after launch.** A running agent turn cannot see a new
+  chat message. If the user adds a scope, style, compatibility, or behavior
+  constraint mid-run, do not let the loop continue under stale instructions.
+  Stop it with the same target plus `--stop` and wait for that run to exit.
+  A rerun that starts too soon fails loudly — wait and retry it. Then rerun
+  the prior command with the new constraint, plus `--restart --converge 0`
+  and `--max` set to at least 2. Context flags replace the stored snapshot,
+  so include all still-active earlier context in that rerun as well.
+
+  `--restart` gets past a prior APPROVED verdict, which a plain rerun would
+  exit on before any agent reads the constraint. It always runs a fresh
+  Codex round on the current state, so the reviewer sees the constraint.
+  `--converge 0` is required so a prior review that already met the
+  convergence threshold cannot end the loop before that round.
+
+  One extra step applies only to a forge review+implement run (no
+  `--review-only`, no `--local`). There, a stopped run can leave a Codex
+  review awaiting a Claude reply. The rerun answers that reply first, then
+  runs the fresh Codex round — so `--max` must be at least 2, or the pending
+  reply consumes the whole budget before Codex runs. Local and review-only
+  runs skip the pending reply and go straight to the fresh Codex round.
 
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if
