@@ -5337,6 +5337,28 @@ else
   bad "odd-name scope report failed: $(tail -3 "$WORK/scope-odd.log" | tr '\n' ' ')"
 fi
 
+t "local scope report: classifies with no comm or sort on PATH"
+# Base utilities are git and jq only; a non-GNU userland need not carry a
+# NUL-capable comm or sort. The classifier must run without either.
+NOGNU="$WORK/nognu-stub"; rm -rf "$NOGNU"; mkdir -p "$NOGNU"
+printf '#!/bin/sh\necho "%s must not run" >&2\nexit 127\n' comm > "$NOGNU/comm"
+printf '#!/bin/sh\necho "%s must not run" >&2\nexit 127\n' sort > "$NOGNU/sort"
+chmod +x "$NOGNU/comm" "$NOGNU/sort"
+local_fixture
+printf 'review edit\n' >> "$LF_CLONE/f"
+printf 'new\n' > "$LF_CLONE/newfile.txt"
+git -C "$LF_CLONE" add -- f newfile.txt
+git -C "$LF_CLONE" commit -qm 'review round'
+if env -i PATH="$NOGNU:/usr/bin:/bin" HOME="$WORK" \
+     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
+     "$BASH_BIN" -c "set -euo pipefail; . '$ROOT/lib/common.sh'; local_write_scope_report '$LF_STATE/scope-nognu.md'" \
+     > "$WORK/scope-nognu.log" 2>&1; then
+  assert_substr "$LF_STATE/scope-nognu.md" '## Review-created paths outside the original change (1)'
+  assert_substr "$LF_STATE/scope-nognu.md" '`newfile.txt` — requires an explicit scope reason'
+else
+  bad "no-coreutils scope report failed: $(tail -3 "$WORK/scope-nognu.log" | tr '\n' ' ')"
+fi
+
 t "local scope report: a shallow --dir clone deepens until the merge base exists"
 # A depth-1 clone plus the setup's explicit tip fetches has no local merge
 # base for the three-dot diffs. The report deepens the clone until the
@@ -5391,6 +5413,79 @@ if scope_run "$SHW/state/scope3.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=featur
   assert_eq "$(git -C "$SHW/clone3" rev-parse victim)" "$_victim"
 else
   bad "shallow scope report failed: $(tail -3 "$WORK/scope-refspec.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: a shallow deepen fetches no tags"
+# A planted remote.origin.tagOpt=--tags would otherwise pull tags the
+# review never validated. --no-tags on the deepen fetch neutralizes it.
+TAGD="$WORK/tag-deepen"; rm -rf "$TAGD"; mkdir -p "$TAGD/state/local"
+git init -q --bare -b main "$TAGD/remote.git"
+git init -q -b main "$TAGD/seed"
+git -C "$TAGD/seed" config user.email t@t; git -C "$TAGD/seed" config user.name t
+echo a > "$TAGD/seed/f"; git -C "$TAGD/seed" add f; git -C "$TAGD/seed" commit -qm c0
+git -C "$TAGD/seed" push -q "$TAGD/remote.git" HEAD:refs/heads/main
+git -C "$TAGD/seed" checkout -qb feature/x
+echo f1 >> "$TAGD/seed/f"; git -C "$TAGD/seed" commit -qam f1
+echo f2 >> "$TAGD/seed/f"; git -C "$TAGD/seed" commit -qam f2
+git -C "$TAGD/seed" tag deep-tag        # a tag below the depth-1 boundary
+echo f3 >> "$TAGD/seed/f"; git -C "$TAGD/seed" commit -qam f3
+git -C "$TAGD/seed" push -q "$TAGD/remote.git" HEAD:refs/heads/feature/x
+git -C "$TAGD/seed" push -q "$TAGD/remote.git" deep-tag
+git -C "$TAGD/seed" checkout -q main
+echo m1 >> "$TAGD/seed/f"; git -C "$TAGD/seed" commit -qam m1   # advance main past the root
+git -C "$TAGD/seed" push -q "$TAGD/remote.git" HEAD:refs/heads/main
+TAGD_TARGET=$(git -C "$TAGD/seed" rev-parse main)
+git clone -q --depth 1 --branch feature/x "file://$TAGD/remote.git" "$TAGD/clone"
+git -C "$TAGD/clone" fetch -q origin \
+  "+refs/heads/main:refs/ai-pr-loop/base" "+refs/heads/feature/x:refs/ai-pr-loop/head"
+git -C "$TAGD/clone" config remote.origin.tagOpt --tags
+# The setup fetch does not download the below-boundary commit deep-tag points
+# at, so no tag is present yet; only the deepen reaches it.
+assert_eq "$(git -C "$TAGD/clone" tag -l | tr -d '[:space:]')" ""
+printf '%s\n' "$TAGD_TARGET" > "$TAGD/state/local/target-base.sha"
+git -C "$TAGD/clone" rev-parse HEAD > "$TAGD/state/local/base.sha"
+printf '%s\n%s\n' "file://$TAGD/remote.git" "file://$TAGD/remote.git" > "$TAGD/state/local/origin.url"
+if scope_run "$TAGD/state/scope.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=feature/x \
+     REPO_DIR="$TAGD/clone" STATE_DIR="$TAGD/state" > "$WORK/scope-tag.log" 2>&1; then
+  assert_eq "$(git -C "$TAGD/clone" tag -l | tr -d '[:space:]')" ""
+else
+  bad "shallow tag deepen failed: $(tail -3 "$WORK/scope-tag.log" | tr '\n' ' ')"
+fi
+
+t "local scope report: a shallow deepen does not recurse into submodules"
+# fetch.recurseSubmodules=true would otherwise force a submodule fetch that
+# can move the submodule's caller-owned refs. --recurse-submodules=no on
+# the deepen fetch neutralizes it.
+SUBD="$WORK/sub-deepen"; rm -rf "$SUBD"; mkdir -p "$SUBD/state/local"
+git init -q -b main "$SUBD/subseed"     # the submodule source (has a checked-out main)
+git -C "$SUBD/subseed" config user.email t@t; git -C "$SUBD/subseed" config user.name t
+echo s1 > "$SUBD/subseed/s"; git -C "$SUBD/subseed" add s; git -C "$SUBD/subseed" commit -qm s1
+git init -q --bare "$SUBD/remote.git"
+git init -q -b main "$SUBD/seed"
+git -C "$SUBD/seed" config user.email t@t; git -C "$SUBD/seed" config user.name t
+echo a > "$SUBD/seed/f"; git -C "$SUBD/seed" add f; git -C "$SUBD/seed" commit -qm c1
+git -C "$SUBD/seed" -c protocol.file.allow=always submodule add -q "$SUBD/subseed" sub 2>/dev/null
+git -C "$SUBD/seed" commit -qm addsub
+SUBD_TARGET=$(git -C "$SUBD/seed" rev-parse HEAD)
+git -C "$SUBD/seed" push -q "$SUBD/remote.git" HEAD:refs/heads/main
+git -C "$SUBD/seed" checkout -qb feature/x
+for _i in 1 2 3; do echo "c$_i" >> "$SUBD/seed/f"; git -C "$SUBD/seed" commit -qam "c$_i"; done
+git -C "$SUBD/seed" push -q "$SUBD/remote.git" HEAD:refs/heads/feature/x
+git -c protocol.file.allow=always clone -q --depth 1 --branch feature/x "file://$SUBD/remote.git" "$SUBD/clone"
+git -C "$SUBD/clone" fetch -q origin \
+  "+refs/heads/main:refs/ai-pr-loop/base" "+refs/heads/feature/x:refs/ai-pr-loop/head"
+git -C "$SUBD/clone" -c protocol.file.allow=always submodule update --init -q sub
+git -C "$SUBD/clone" config fetch.recurseSubmodules true
+git -C "$SUBD/clone/sub" update-ref -d refs/remotes/origin/main   # the recurse marker
+printf '%s\n' "$SUBD_TARGET" > "$SUBD/state/local/target-base.sha"
+git -C "$SUBD/clone" rev-parse HEAD > "$SUBD/state/local/base.sha"
+printf '%s\n%s\n' "file://$SUBD/remote.git" "file://$SUBD/remote.git" > "$SUBD/state/local/origin.url"
+if scope_run "$SUBD/state/scope.md" LOCAL_SCOPE=pr BASE_REF=main HEAD_REF=feature/x \
+     REPO_DIR="$SUBD/clone" STATE_DIR="$SUBD/state" > "$WORK/scope-sub.log" 2>&1; then
+  if git -C "$SUBD/clone/sub" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+    bad "the deepen fetch recursed into the submodule"; else ok; fi
+else
+  bad "shallow submodule deepen failed: $(tail -3 "$WORK/scope-sub.log" | tr '\n' ' ')"
 fi
 
 t "finalize: three local rounds become one pushed commit"
@@ -5642,6 +5737,28 @@ assert_substr "$WORK/fin.log" 'does not match the one recorded'
 if git -C "$_evil" show-ref -q 2>/dev/null; then
   bad "the filter-redirected remote received a push"; else ok; fi
 t "finalize: the filter-planted round left the pinned remote untouched"
+assert_eq "$(remote_head)" "$LF_BASE"
+
+t "finalize: a filter rewriting both origin and its pin cannot redirect the push"
+# The stronger attack: the clean filter rewrites the origin config AND the
+# on-disk pin to one matching hostile value, so comparing the two on-disk
+# values to each other would pass. The push destination is checked against
+# an in-memory snapshot taken before any probe ran, which the filter cannot
+# reach.
+local_fixture; local_round 1
+_evil="$WORK/evil-both-$RANDOM.git"; git init -q --bare "$_evil"
+mkdir -p "$LF_CLONE/.git/info"
+printf 'f filter=evil\n' > "$LF_CLONE/.git/info/attributes"
+git -C "$LF_CLONE" config filter.evil.clean \
+  "git -C '$LF_CLONE' remote set-url origin '$_evil' >/dev/null 2>&1; printf '%s\n%s\n' '$_evil' '$_evil' > '$LF_STATE/local/origin.url'; cat"
+touch "$LF_CLONE/f"
+finalize_run
+git -C "$LF_CLONE" config --unset filter.evil.clean
+rm -f "$LF_CLONE/.git/info/attributes"
+assert_eq "$FIN_RC" 1
+if git -C "$_evil" show-ref -q 2>/dev/null; then
+  bad "the dual-rewrite filter redirected the push"; else ok; fi
+t "finalize: the dual-rewrite attempt left the pinned remote untouched"
 assert_eq "$(remote_head)" "$LF_BASE"
 
 t "worktree_publishable_dirt: a failed probe dies instead of reading clean"

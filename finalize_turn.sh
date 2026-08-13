@@ -81,6 +81,17 @@ if [[ ! -s "$BASE_FILE" ]]; then
 fi
 BASE_SHA=$(<"$BASE_FILE")
 
+# Snapshot the pinned push destination into shell memory BEFORE any git
+# command touches the worktree. finalize runs several `git status` probes
+# (the entry sync below, and the pre-push check), each of which can execute
+# a repo-config clean filter — code a turn can plant. Such a filter could
+# rewrite BOTH the origin config and the on-disk pin to one matching
+# hostile value, so comparing those two on-disk values to each other would
+# pass. The push-time destination checks compare the live origin against
+# this in-memory snapshot instead, which no filter can reach.
+PINNED_DEST=''
+[[ -s "$(local_origin_file)" ]] && PINNED_DEST=$(<"$(local_origin_file)")
+
 # The review turn that approved may have left build output in the worktree;
 # drop it, keeping every local round.
 sync_repo_to_local_head
@@ -456,25 +467,30 @@ if (( ${NO_PUSH:-0} == 1 )); then
   log "finalize: --no-push — $HEAD_SHA stays in $REPO_DIR; re-run without --no-push to push it"
   exit 0
 fi
+# The squash may only reach the destination pinned when the review started
+# ($PINNED_DEST, snapshotted at the top before any worktree probe ran).
+# Checked HERE too because the reuse path (a held or rejected squash pushed
+# by a later invocation) runs no closing turn, so the checks around it
+# never fire on the one invocation that actually pushes. A missing record
+# fails closed: a turn could delete the file to get a poisoned re-pin.
+[[ -n "$PINNED_DEST" ]] \
+  || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing — it is written when the review starts, and a turn may have removed it). Write the intended destination there (the output of 'git remote get-url --all origin' then 'git remote get-url --push --all origin', or '(none)') and re-run"
+[[ "$(origin_dest)" == "$PINNED_DEST" ]] \
+  || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$PINNED_DEST" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
+
 # Check the complete publication unit one last time. This catches a missed
 # stage/amend, an unexpected second parent, or a dirty tree before any remote
-# state changes. git_safe keeps hooks and fsmonitor out of the probe, but a
-# `git status` can still run repo-config-planted code (a clean filter). The
-# probe therefore runs BEFORE the destination check below: an origin
-# redirect made during it is caught there, not obeyed.
+# state changes. git_safe keeps hooks and fsmonitor out of the probe.
 PUSH_DIRT=$(worktree_publishable_dirt "$REPO_DIR") \
   || die "could not verify that the worktree is clean immediately before push"
 [[ -z "$PUSH_DIRT" ]] \
   || die "the worktree is not clean immediately before push — refusing to publish a commit that may not contain the intended review changes: $PUSH_DIRT"
-# The squash may only reach the destination pinned when the review
-# started — checked again HERE because the reuse path (a held or rejected
-# squash pushed by a later invocation) runs no closing turn, so the
-# checks around it never fire on the one invocation that actually pushes.
-# A missing record fails closed for the same reason as above.
-[[ -s "$(local_origin_file)" ]] \
-  || die "no pinned origin destination is recorded for this review ($(local_origin_file) is missing — it is written when the review starts, and a turn may have removed it). Write the intended destination there (the output of 'git remote get-url --all origin' then 'git remote get-url --push --all origin', or '(none)') and re-run"
-[[ "$(origin_dest)" == "$(<"$(local_origin_file)")" ]] \
-  || die "the effective destination of origin in $REPO_DIR does not match the one recorded for this review ($(printf '%s' "$(<"$(local_origin_file)")" | tr '\n' ' ')) — refusing to push anywhere the review never validated. Fix the remote configuration, or write the intended destination into $(local_origin_file)"
+
+# Re-check the destination against the in-memory snapshot after the probe:
+# neither the live origin nor its on-disk pin may have moved while the
+# probe ran.
+[[ "$(origin_dest)" == "$PINNED_DEST" && "$(<"$(local_origin_file)")" == "$PINNED_DEST" ]] \
+  || die "the origin destination or its recorded pin changed during the pre-push checks in $REPO_DIR — refusing to push to a destination the review never validated"
 
 if ! git -C "$REPO_DIR" remote get-url origin >/dev/null 2>&1; then
   # A supported terminal state, not a held one: with nowhere to push, the

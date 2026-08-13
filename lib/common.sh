@@ -925,12 +925,15 @@ local_ensure_scope_merge_base() {  # <commit-a> <commit-b>
     boundary=$(cat "$shallow_file" 2>/dev/null || true)
     # Deepen the pinned branches one ref at a time — one branch may be
     # gone (a head deleted mid-review), and that must not stop the other
-    # from deepening. --refmap= with a colon-free refspec: the fetch must
-    # update no local ref, even when a turn planted a remote.origin.fetch
-    # refspec that maps fetched branches onto local ones.
+    # from deepening. The fetch must update no ref and create no object
+    # beyond the deepened commits: --refmap= plus a colon-free refspec
+    # neutralizes a planted remote.origin.fetch, --no-tags a planted
+    # tagOpt=--tags, and --recurse-submodules=no a planted
+    # fetch.recurseSubmodules that would rewrite a submodule's own refs.
     fetched=0
     for ref in "refs/heads/$BASE_REF" "refs/heads/$HEAD_REF"; do
-      git_safe -C "$d" fetch --quiet --refmap= --deepen="$step" origin "$ref" \
+      git_safe -C "$d" fetch --quiet --refmap= --no-tags --recurse-submodules=no \
+          --deepen="$step" origin "$ref" \
         && fetched=1
     done
     (( fetched == 1 )) \
@@ -958,8 +961,9 @@ worktree_publishable_dirt() {  # <dir>
 # new path, but the agents must explain why it belongs to this change.
 local_write_scope_report() {  # <destination>
   local dest="$1" target base head tmp original_list review_list final_list
-  local new_list original_stat review_stat final_stat path
+  local original_stat review_stat final_stat path
   local -a original_paths=() review_paths=() final_paths=() new_paths=()
+  local -A original_set=()
 
   [[ -s "$(local_target_base_file)" ]] \
     || die "local scope report has no target base ($(local_target_base_file) is missing)"
@@ -982,21 +986,21 @@ local_write_scope_report() {  # <destination>
     rm -f "$original_list" "$review_list" "$final_list"
     die "could not list paths for the local scope report"
   fi
-  # Sort the original and review lists so `comm` can difference them. Sort
-  # the final list only so every report section renders in the same order.
-  # C collation everywhere: `comm` requires the byte order `sort -z` used.
-  new_list="${dest}.new.tmp.$$"
-  { LC_ALL=C sort -z -o "$original_list" -- "$original_list" \
-    && LC_ALL=C sort -z -o "$review_list" -- "$review_list" \
-    && LC_ALL=C sort -z -o "$final_list" -- "$final_list" \
-    && LC_ALL=C comm -z -13 -- "$original_list" "$review_list" > "$new_list"; } \
-    || { rm -f "$original_list" "$review_list" "$final_list" "$new_list"
-         die "could not classify the path lists for the local scope report"; }
   while IFS= read -r -d '' path; do original_paths+=("$path"); done < "$original_list"
   while IFS= read -r -d '' path; do review_paths+=("$path"); done < "$review_list"
   while IFS= read -r -d '' path; do final_paths+=("$path"); done < "$final_list"
-  while IFS= read -r -d '' path; do new_paths+=("$path"); done < "$new_list"
-  rm -f "$original_list" "$review_list" "$final_list" "$new_list"
+  rm -f "$original_list" "$review_list" "$final_list"
+  # A review path is new when it is absent from the original change. An
+  # associative array gives constant-time membership, so this stays linear
+  # with no sort and no external tool — git and jq are the only base
+  # utilities the loop requires, and a non-GNU userland need not carry a
+  # NUL-capable comm or sort. Git never emits a NUL inside a path, so each
+  # path is a safe key. `git diff --name-only` already emits sorted paths,
+  # so every report section renders in a stable order without re-sorting.
+  for path in "${original_paths[@]}"; do original_set["$path"]=1; done
+  for path in "${review_paths[@]}"; do
+    [[ -n "${original_set["$path"]+x}" ]] || new_paths+=("$path")
+  done
 
   original_stat=$(git -C "$REPO_DIR" diff --shortstat "${target}...${base}" --) \
     || die "could not summarize the original change for the local scope report"
