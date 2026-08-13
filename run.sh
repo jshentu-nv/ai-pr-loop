@@ -30,8 +30,10 @@
 #                      [--local] [--no-push]
 #                      [--context-url URL]... [--context TEXT]...
 #                      [--context-file FILE]... [--clear-context]
+#                      [--claude-bin EXECUTABLE]
 #                      [--claude-model MODEL] [--claude-effort LEVEL]
 #                      [--claude-perms MODE]
+#                      [--codex-bin EXECUTABLE]
 #                      [--codex-model MODEL] [--codex-effort LEVEL]
 #                      [--codex-tier TIER] [--print-config]
 #                      [--auto-resume N] [--no-auto-resume] [--stop]
@@ -115,6 +117,11 @@
 #                 Drop any context persisted from a prior invocation on this
 #                 PR. Ignored when new --context* flags are also given (those
 #                 replace the prior context instead).
+#   --claude-bin EXECUTABLE
+#                 Claude CLI executable name on PATH, or an absolute/relative
+#                 path. Default: $CLAUDE_BIN when set, otherwise `claude`.
+#                 The value is one executable, not a shell command; use a
+#                 wrapper script when fixed extra arguments are needed.
 #   --claude-model MODEL
 #                 Model for the Claude implementer's `claude -p` turns, passed
 #                 as `--model MODEL`. Default: fable (Claude Fable 5; alias
@@ -134,14 +141,20 @@
 #                 where bypass is policy-disabled. Auto mode is not available
 #                 on every account/provider, and ineligible hosts silently
 #                 downgrade it; a deterministic preflight probe reads the
-#                 CLI-reported effective mode (cached per PR) and uses the
-#                 settings safety net when auto does not stick. A CLI that
+#                 CLI-reported effective mode (cached per PR, executable,
+#                 and model) and uses the settings safety net when auto does
+#                 not stick. A CLI that
 #                 hard-rejects the flag at startup instead triggers a single
 #                 retry with the same net. bypass: --dangerously-skip-permissions plus a
 #                 settings safety net (auto-accepted edits + allowed
 #                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
 #                 bypass. off: leave the host's CLI/settings default
 #                 untouched.
+#   --codex-bin EXECUTABLE
+#                 Codex CLI executable name on PATH, or an absolute/relative
+#                 path. Default: $CODEX_BIN when set, otherwise `codex`.
+#                 The value is one executable, not a shell command; use a
+#                 wrapper script when fixed extra arguments are needed.
 #   --codex-model MODEL
 #                 Model for the Codex reviewer's `codex exec` turns, passed as
 #                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
@@ -162,10 +175,10 @@
 #                 "Fast" tier: 1.5x speed, increased usage). Use `off` to
 #                 leave the host's codex config untouched.
 #   --print-config
-#                 Print the resolved model/effort/tier knobs (after adaptive
-#                 defaults) and exit without contacting GitHub; the PR number
-#                 is optional in this mode. Used by tests/run_tests.sh to
-#                 observe the resolution.
+#                 Print the resolved executable/model/effort/tier knobs
+#                 (after adaptive defaults) and exit without contacting
+#                 GitHub; the PR number is optional in this mode. Used by
+#                 tests/run_tests.sh to observe the resolution.
 #   --preflight-only
 #                 Run the full authenticated preflight — authority
 #                 validation, credential resolution (env-isolated,
@@ -260,6 +273,8 @@ CONTEXT_URLS=()
 CONTEXT_NOTES=()
 CONTEXT_FILES=()
 CLEAR_CONTEXT=0
+# CLAUDE_BIN / CODEX_BIN come from lib/common.sh: their environment values
+# win over the built-in names, and the CLI flags below win over both.
 CLAUDE_MODEL="fable"
 CLAUDE_EFFORT="ultracode"
 CLAUDE_PERMS="auto"
@@ -293,9 +308,11 @@ while [[ $# -gt 0 ]]; do
     --context)       [[ $# -ge 2 ]] || die "--context needs text";       CONTEXT_NOTES+=("$2"); shift 2 ;;
     --context-file)  [[ $# -ge 2 ]] || die "--context-file needs a path"; CONTEXT_FILES+=("$2"); shift 2 ;;
     --clear-context) CLEAR_CONTEXT=1; shift ;;
+    --claude-bin)    [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "--claude-bin needs an executable"; CLAUDE_BIN="$2"; shift 2 ;;
     --claude-model)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-model needs a model";  CLAUDE_MODEL="$2";  shift 2 ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
     --claude-perms)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-perms needs a mode";   CLAUDE_PERMS="$2";  shift 2 ;;
+    --codex-bin)     [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "--codex-bin needs an executable"; CODEX_BIN="$2"; shift 2 ;;
     --codex-model)   [[ $# -ge 2 && "$2" != -* ]] || die "--codex-model needs a model";   CODEX_MODEL="$2";   shift 2 ;;
     --codex-effort)  [[ $# -ge 2 && -n "$2" ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
@@ -542,6 +559,43 @@ esac
 [[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
 [[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
 
+# Executable overrides are deliberately a single scalar, never split or
+# evaluated as shell. Resolve both PATH names and explicit paths to one
+# absolute external executable before any turn changes directory into the
+# reviewed checkout. This pins what preflight validated even when PATH has a
+# relative entry, and excludes shell functions/builtins such as `eval`. A
+# leading '-' is rejected as an ambiguous CLI value (spell such an executable
+# with a path, e.g. /opt/bin/-claude).
+resolve_agent_bin() {  # <flag> <value>
+  local flag="$1" value="$2" resolved dir base canon
+  [[ -n "$value" ]] || die "$flag needs an executable"
+  [[ "$value" != -* ]] || die "$flag executable must not begin with '-' (use a path to it)"
+  case "$value" in
+    *$'\n'*|*$'\r'*|*$'\t'*) die "$flag executable must not contain tabs or newlines" ;;
+  esac
+  resolved=$(type -P -- "$value" 2>/dev/null) \
+    || die "missing required command: $value"
+  [[ -f "$resolved" && -x "$resolved" ]] \
+    || die "missing required command: $value"
+  base="${resolved##*/}"
+  case "$resolved" in
+    /*)  dir="${resolved%/*}"; [[ -n "$dir" ]] || dir=/ ;;
+    */*) dir="${resolved%/*}" ;;
+    *)   dir=. ;;
+  esac
+  canon=$(CDPATH= cd -- "$dir" && pwd -P) \
+    || die "could not resolve $flag executable directory: $dir"
+  printf '%s/%s\n' "${canon%/}" "$base"
+}
+# Stopping is deliberately independent of the agent toolchain: the selected
+# executable may have been renamed or removed while a supervisor is live, and
+# cancellation still has to reach that process. All other roles pin both
+# executables before preflight or a turn can run.
+if (( STOP_ONLY == 0 )); then
+  CLAUDE_BIN=$(resolve_agent_bin --claude-bin "$CLAUDE_BIN")
+  CODEX_BIN=$(resolve_agent_bin --codex-bin "$CODEX_BIN")
+fi
+
 # Default checkout location when --dir not given: one managed clone per repo
 # identity, shared across PRs of that repo. (Concurrent loops on the same
 # repo should pass --dir to point at separate clones.) repo_ident_name keeps
@@ -572,7 +626,9 @@ if (( PRINT_CONFIG == 1 )); then
     "$( (( LOCAL_MODE == 1 )) && echo local || echo forge )" \
     "$LOCAL_SCOPE" "${BASE_ARG:--}" \
     "$( (( LOCAL_MODE == 1 && NO_PUSH == 1 )) && echo no || echo yes )"
+  printf 'claude-bin: %s\n' "$CLAUDE_BIN"
   printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
+  printf 'codex-bin: %s\n' "$CODEX_BIN"
   printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
   exit 0
 fi
@@ -1167,7 +1223,8 @@ REPO_NAME="${REPO_SLUG##*/}"
 export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
        LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON \
-       CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS CODEX_MODEL CODEX_EFFORT CODEX_TIER
+       CLAUDE_BIN CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS \
+       CODEX_BIN CODEX_MODEL CODEX_EFFORT CODEX_TIER
 
 preflight
 # --preflight-only stops before any side effect: no clone, no state dir, no
@@ -1331,8 +1388,8 @@ if (( LOCAL_MODE == 1 )); then
   log "  local: review exchanged on disk; local rounds squash into one commit$( (( NO_PUSH == 1 )) && echo ' (--no-push: not pushed)' )"
 fi
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude: model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
-log "  codex:  model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
+log "  claude: bin=$CLAUDE_BIN model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
+log "  codex:  bin=$CODEX_BIN model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

@@ -7,14 +7,15 @@
 #   - resolve_codex_effort: adaptive default, explicit precedence, off
 #   - claude_turn.sh argv: --model, ultracode --settings payload, --effort
 #     levels, off omission, --claude-perms modes (auto / bypass safety net /
-#     off), --session-id vs --resume
+#     off), executable override + cache isolation, --session-id vs --resume
 #   - codex_turn.sh argv: -m / model_reasoning_effort / service_tier mapping,
 #     off omission, adaptive effort for non-sol models, fresh vs `exec resume`,
-#     root-session discovery (sub-agent skip + cwd binding), stored-id
-#     migration / discard of unresumable ids
+#     executable override, root-session discovery (sub-agent skip + cwd
+#     binding), stored-id migration / discard of unresumable ids
 #   - run.sh flag validation die-paths (empty / unknown / next-flag-as-value)
 #     and resolved knob output via --print-config (adaptive default / explicit
-#     precedence)
+#     precedence), including safe executable resolution and flag-over-env
+#     precedence
 #   - forge resolution: PR/MR URL parsing (github / gitlab.com / self-hosted /
 #     legacy no-/-/ form), --host implying gitlab, URL-vs-flag conflicts,
 #     scheme preservation (http MR URLs / scheme-qualified --host),
@@ -148,6 +149,11 @@ cat > "$STUBS/claude" <<'EOF'
 # init line — the inconclusive path in claude_turn.sh.
 for a in "$@"; do
   if [[ "$a" == "stream-json" ]]; then
+    if [[ -n "${ARGV_FILE:-}" ]]; then
+      printf '%s\n' "$0" > "${ARGV_FILE}.probe-exe"
+    fi
+    [[ -z "${AGENT_EXE_LOG:-}" ]] \
+      || printf 'claude-probe\t%s\n' "$0" >> "$AGENT_EXE_LOG"
     if [[ "${STUB_REJECT_AUTO:-0}" == "1" ]]; then
       echo "Error: auto mode is unavailable for your plan" >&2
       exit 1
@@ -157,13 +163,18 @@ for a in "$@"; do
     exit 0
   fi
 done
-: > "$ARGV_FILE"
-for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
-printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
-# Record the background-task wait ceiling the turn script exported; without
-# it headless claude drops the final message (and the completion marker)
-# when a backgrounded build outlives the CLI's 600s default.
-printf '%s\n' "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}" > "${ARGV_FILE}.bgwait"
+if [[ -n "${ARGV_FILE:-}" ]]; then
+  : > "$ARGV_FILE"
+  printf '%s\n' "$0" > "${ARGV_FILE}.exe"
+  for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+  printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
+  # Record the background-task wait ceiling the turn script exported; without
+  # it headless claude drops the final message (and the completion marker)
+  # when a backgrounded build outlives the CLI's 600s default.
+  printf '%s\n' "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}" > "${ARGV_FILE}.bgwait"
+fi
+[[ -z "${AGENT_EXE_LOG:-}" ]] \
+  || printf 'claude\t%s\n' "$0" >> "$AGENT_EXE_LOG"
 # Simulate a host/account where auto permission mode is unavailable: the
 # real CLI rejects the flag at startup, before doing any work, with one of
 # its startup-eligibility diagnostics.
@@ -249,8 +260,13 @@ EOF
 
 cat > "$STUBS/codex" <<'EOF'
 #!/usr/bin/env bash
-: > "$ARGV_FILE"
-for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+if [[ -n "${ARGV_FILE:-}" ]]; then
+  : > "$ARGV_FILE"
+  printf '%s\n' "$0" > "${ARGV_FILE}.exe"
+  for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+fi
+[[ -z "${AGENT_EXE_LOG:-}" ]] \
+  || printf 'codex\t%s\n' "$0" >> "$AGENT_EXE_LOG"
 # Real `codex exec` writes a session rollout file recording its cwd; emulate
 # it so the session-capture path (snapshot / discover with cwd binding /
 # persist) is exercised. Also drop a DECOY root recorded for another checkout
@@ -493,6 +509,16 @@ exit $rc
 EOF
 
 chmod +x "$STUBS/claude" "$STUBS/codex" "$STUBS/gh" "$STUBS/glab" "$STUBS/curl" "$STUBS/mv"
+
+# Alternate agent executable paths deliberately contain spaces. They point to
+# the same behavioral stubs but let the argv tests catch unquoted expansion or
+# a hardcoded fallback to the default command name.
+ALT_BINS="$WORK/alternate agent bins"
+mkdir -p "$ALT_BINS"
+ALT_CLAUDE="$ALT_BINS/claude custom"
+ALT_CODEX="$ALT_BINS/codex custom"
+cp "$STUBS/claude" "$ALT_CLAUDE"
+cp "$STUBS/codex" "$ALT_CODEX"
 
 # --- turn runners --------------------------------------------------------
 
@@ -839,6 +865,13 @@ t "claude: fresh session pins --session-id"
 assert_pair "$ARGV" --session-id "$(cat "$CASE_DIR/state/claude.session.uuid")"
 assert_no_line "$ARGV" --resume
 
+t "claude: executable override reaches both the auto-mode probe and turn"
+new_case claude-custom-bin
+run_turn claude CLAUDE_BIN="$ALT_CLAUDE"
+assert_rc0
+assert_eq "$(cat "$ARGV.probe-exe" 2>/dev/null)" "$ALT_CLAUDE"
+assert_eq "$(cat "$ARGV.exe" 2>/dev/null)" "$ALT_CLAUDE"
+
 t "claude: bare effort level uses --effort and drops the settings payload"
 new_case claude-xhigh
 run_turn claude CLAUDE_EFFORT=xhigh
@@ -880,8 +913,8 @@ assert_no_line "$ARGV" --dangerously-skip-permissions
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
 assert_eq "$(wc -c < "$ARGV.calls" | tr -d ' ')" 1
 
-t "claude: downgrade probe result is cached per PR and model"
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "default fable"
+t "claude: downgrade probe result is cached per PR, executable, and model"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" $'default\tclaude\tfable'
 run_turn claude STUB_EFFECTIVE_PERMS=auto
 assert_rc0
 assert_no_line "$ARGV" --permission-mode
@@ -891,7 +924,7 @@ new_case claude-auto-eligible
 run_turn claude STUB_EFFECTIVE_PERMS=auto
 assert_rc0
 assert_pair "$ARGV" --permission-mode auto
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "auto fable"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" $'auto\tclaude\tfable'
 
 t "claude: changing the model re-probes instead of reusing cached eligibility"
 new_case claude-cache-model
@@ -902,7 +935,7 @@ run_turn claude CLAUDE_MODEL=model-b STUB_EFFECTIVE_PERMS=default
 assert_rc0
 assert_no_line "$ARGV" --permission-mode
 assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "default model-b"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" $'default\tclaude\tmodel-b'
 
 t "claude: switching back to an eligible model restores classifier gating"
 run_turn claude CLAUDE_MODEL=model-a STUB_EFFECTIVE_PERMS=auto
@@ -916,7 +949,30 @@ assert_rc0
 run_turn claude CLAUDE_MODEL=fable STUB_EFFECTIVE_PERMS=auto
 assert_rc0
 assert_pair "$ARGV" --permission-mode auto
-assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" "auto fable"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" $'auto\tclaude\tfable'
+
+t "claude: changing the executable re-probes cached auto-mode eligibility"
+new_case claude-cache-bin
+run_turn claude STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+run_turn claude CLAUDE_BIN="$ALT_CLAUDE" STUB_EFFECTIVE_PERMS=default
+assert_rc0
+assert_no_line "$ARGV" --permission-mode
+assert_value_has "$ARGV" --settings '"defaultMode": "acceptEdits"'
+assert_eq "$(cat "$ARGV.probe-exe" 2>/dev/null)" "$ALT_CLAUDE"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" \
+  $'default\t'"$ALT_CLAUDE"$'\tfable'
+
+t "claude: an old two-field auto-mode cache is re-probed and migrated"
+new_case claude-cache-legacy
+printf 'default fable\n' > "$CASE_DIR/state/claude.automode.effective"
+run_turn claude STUB_EFFECTIVE_PERMS=auto
+assert_rc0
+assert_pair "$ARGV" --permission-mode auto
+assert_eq "$(cat "$ARGV.probe-exe" 2>/dev/null)" "$STUBS/claude"
+assert_eq "$(cat "$CASE_DIR/state/claude.automode.effective" 2>/dev/null)" \
+  $'auto\tclaude\tfable'
 
 t "claude: rejected auto mode falls back to the settings safety net"
 new_case claude-auto-fallback
@@ -1006,6 +1062,13 @@ assert_no_line "$ARGV" resume
 t "codex: fresh run captures the session id from the rollout file"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
 
+t "codex: executable override is used for a fresh turn"
+new_case codex-custom-bin
+run_turn codex CODEX_BIN="$ALT_CODEX"
+assert_rc0
+assert_eq "$(cat "$ARGV.exe" 2>/dev/null)" "$ALT_CODEX"
+assert_line "$ARGV" exec
+
 t "codex: non-sol model with unset effort forces no reasoning level"
 new_case codex-alt-model
 run_turn codex CODEX_MODEL=gpt-oss-120b
@@ -1049,6 +1112,12 @@ assert_pair "$ARGV" resume cafebabe-dead-beef-sess
 
 t "codex: resume keeps the seeded session id"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" cafebabe-dead-beef-sess
+
+t "codex: executable override is used for a resumed turn"
+run_turn codex CODEX_BIN="$ALT_CODEX"
+assert_rc0
+assert_eq "$(cat "$ARGV.exe" 2>/dev/null)" "$ALT_CODEX"
+assert_pair "$ARGV" resume cafebabe-dead-beef-sess
 
 t "codex: stored sub-agent session id migrates to its root before resume"
 new_case codex-migrate
@@ -2885,6 +2954,49 @@ else bad "the checkout was rejected but the caller's ignored file was replaced";
 
 # --- run.sh flag validation ----------------------------------------------
 
+t "run.sh: empty --claude-bin is rejected"
+run_run_sh 1 --repo o/n --claude-bin ''
+assert_dies_with "--claude-bin needs an executable"
+
+t "run.sh: empty --codex-bin is rejected"
+run_run_sh 1 --repo o/n --codex-bin ''
+assert_dies_with "--codex-bin needs an executable"
+
+t "run.sh: --claude-bin refuses the next flag as its value"
+run_run_sh 1 --repo o/n --claude-bin --review-only
+assert_dies_with "--claude-bin needs an executable"
+
+t "run.sh: --codex-bin refuses the next flag as its value"
+run_run_sh 1 --repo o/n --codex-bin --review-only
+assert_dies_with "--codex-bin needs an executable"
+
+t "run.sh: a bare option-like executable name requires a path spelling"
+run_run_sh CLAUDE_BIN=-claude --repo o/n --print-config
+assert_dies_with "--claude-bin executable must not begin with '-'"
+
+t "run.sh: shell builtins are rejected as agent executables"
+run_run_sh 1 --repo o/n --claude-bin eval
+assert_dies_with "missing required command: eval"
+
+t "run.sh: a command-shaped executable value is never shell-evaluated"
+BIN_INJECTION_WITNESS="$WORK/bin-injection-ran"
+run_run_sh 1 --repo o/n --codex-bin "codex;touch $BIN_INJECTION_WITNESS"
+assert_dies_with "missing required command: codex;touch $BIN_INJECTION_WITNESS"
+if [[ -e "$BIN_INJECTION_WITNESS" ]]; then
+  bad "the executable override was evaluated as shell"
+else
+  ok
+fi
+
+t "run.sh: a missing custom executable fails preflight by its selected path"
+MISSING_AGENT_BIN="$WORK/missing agent bin"
+run_run_sh 1 --repo o/n --claude-bin "$MISSING_AGENT_BIN"
+assert_dies_with "missing required command: $MISSING_AGENT_BIN"
+
+t "run.sh: existing custom executables pass command preflight"
+run_run_sh 1 --repo o/n --claude-bin "$ALT_CLAUDE" --codex-bin "$ALT_CODEX"
+assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
+
 t "run.sh: empty --codex-effort is rejected"
 run_run_sh 1 --repo o/n --codex-effort ''
 assert_dies_with "--codex-effort needs a level"
@@ -3391,8 +3503,30 @@ assert_prints "dir: $ROOT/checkouts/o__n"
 # these have teeth against run.sh regressing to a forced level.
 t "run.sh: default knobs resolve to sol @ ultra on fast"
 run_run_sh --repo o/n --print-config
+assert_prints "claude-bin: $STUBS/claude"
 assert_prints 'claude: model=fable effort=ultracode perms=auto'
+assert_prints "codex-bin: $STUBS/codex"
 assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast'
+
+t "run.sh: executable flags override environment defaults without splitting paths"
+run_run_sh CLAUDE_BIN=env-claude CODEX_BIN=env-codex --repo o/n \
+  --claude-bin "$ALT_CLAUDE" --codex-bin "$ALT_CODEX" --print-config
+assert_prints "claude-bin: $ALT_CLAUDE"
+assert_prints "codex-bin: $ALT_CODEX"
+
+t "run.sh: relative executable paths are pinned to absolute paths"
+TEST_CALLER_DIR=$PWD
+cd "$ALT_BINS"
+run_run_sh --repo o/n --claude-bin './claude custom' \
+  --codex-bin './codex custom' --print-config
+cd "$TEST_CALLER_DIR"
+assert_prints "claude-bin: $ALT_CLAUDE"
+assert_prints "codex-bin: $ALT_CODEX"
+
+t "run.sh: executable environment overrides are used when flags are absent"
+run_run_sh CLAUDE_BIN="$ALT_CLAUDE" CODEX_BIN="$ALT_CODEX" --repo o/n --print-config
+assert_prints "claude-bin: $ALT_CLAUDE"
+assert_prints "codex-bin: $ALT_CODEX"
 
 t "run.sh: non-sol model resolves to adaptive off (no forced level)"
 run_run_sh --repo o/n --codex-model gpt-oss-120b --print-config
@@ -3467,6 +3601,18 @@ assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "1 --repo o/n"
 t "auto-resume: relaunch argv without context flags is unchanged"
 strip_context_worker_flags 5 --repo o/n --max 3 --review-only
 assert_eq "${STRIPPED_ARGV[*]+"${STRIPPED_ARGV[*]}"}" "5 --repo o/n --max 3 --review-only"
+
+t "auto-resume: relaunch preserves both agent executable overrides"
+strip_context_worker_flags 5 --claude-bin "$ALT_CLAUDE" --context note \
+  --codex-bin "$ALT_CODEX" --max 3
+assert_eq "${#STRIPPED_ARGV[@]}" 7
+assert_eq "${STRIPPED_ARGV[0]}" 5
+assert_eq "${STRIPPED_ARGV[1]}" --claude-bin
+assert_eq "${STRIPPED_ARGV[2]}" "$ALT_CLAUDE"
+assert_eq "${STRIPPED_ARGV[3]}" --codex-bin
+assert_eq "${STRIPPED_ARGV[4]}" "$ALT_CODEX"
+assert_eq "${STRIPPED_ARGV[5]}" --max
+assert_eq "${STRIPPED_ARGV[6]}" 3
 
 # --- auto-resume: run.sh roles ---------------------------------------------
 # These start a real detached supervisor. Every case here kills the loop
@@ -3549,9 +3695,10 @@ run_run_sh_supervised STUB_MR_OPEN=1 9 --repo g/p --forge gitlab --preflight-onl
 assert_prints 'identity: testuser'
 if [[ -e "$ROOT/state/gitlab.com__g__p" ]]; then bad "--preflight-only started a supervisor"; else ok; fi
 
-t "run.sh: --stop writes the sentinel and exits 0 without a preflight"
+t "run.sh: --stop ignores missing agent executables and exits 0 without a preflight"
 rm -rf "$ROOT/state/o__n"
-run_run_sh_supervised 1 --repo o/n --stop
+run_run_sh_supervised 1 --repo o/n \
+  --claude-bin "$WORK/removed claude" --codex-bin "$WORK/removed codex" --stop
 if [[ "$RUN_RC" -eq 0 && -e "$AR_GH_STATE/stop" ]]; then ok; else bad "--stop rc=$RUN_RC, sentinel missing"; fi
 assert_substr "$WORK/run.err" "stop: wrote"
 
@@ -4465,13 +4612,16 @@ git -C "$AR_APP_REPO" remote set-url origin https://gl.example/g/p.git
 t "run.sh: a worker that finishes records its status"
 rm -rf "$ROOT/state/gl.example__g__p"
 mkdir -p "$WORK/ar-approve-codex/sessions"
+AR_SUP_AGENT_LOG="$WORK/ar-supervised-agent-exe.log"
+: > "$AR_SUP_AGENT_LOG"
 SUP_PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin"
 # Budget 1 at a 1s backoff: an approved run must not relaunch at all, and a
 # fixture that breaks stops in seconds instead of backing off for minutes.
 run_run_sh_supervised STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
-  CODEX_HOME="$WORK/ar-approve-codex" \
+  CODEX_HOME="$WORK/ar-approve-codex" AGENT_EXE_LOG="$AR_SUP_AGENT_LOG" \
   AUTO_RESUME_BACKOFF_FLOOR=1 AUTO_RESUME_BACKOFF_CAP=1 \
-  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_APP_REPO" --auto-resume 1
+  https://gl.example/g/p/-/merge_requests/9 --dir "$AR_APP_REPO" --auto-resume 1 \
+  --claude-bin "$ALT_CLAUDE" --codex-bin "$ALT_CODEX"
 SUP_PATH=""
 AR_APP_LOG="$AR_LIVE_STATE/supervisor.log"
 assert_eq "$(head -1 "$AR_LIVE_STATE/worker.status" 2>/dev/null)" approved
@@ -4487,10 +4637,30 @@ if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "front-end exited rc=$RUN_RC"; fi
 t "run.sh: the front-end reports the finished run's status"
 assert_substr "$WORK/run.err" "supervisor exited; last worker status: approved"
 
+t "run.sh: executable flags survive the supervised launch"
+assert_substr "$AR_SUP_AGENT_LOG" $'codex\t'"$ALT_CODEX"
+
 # The stub thread already carries a completed round 1, so this invocation's
 # first worker resumed at iter 2 — that resume point is its budget baseline.
 t "run.sh: the first worker records the invocation's budget baseline"
 assert_eq "$(awk -F= '/^BASE=/{print $2}' "$AR_LIVE_STATE/worker.progress" 2>/dev/null)" 2
+rm -rf "$ROOT/state/gl.example__g__p"
+
+t "run.sh: executable flags reach Codex, Claude's probe, and Claude through a worker"
+AGENT_FLAG_LOG="$WORK/agent-flag-e2e.log"
+: > "$AGENT_FLAG_LOG"
+mkdir -p "$WORK/ar-bin-e2e-codex/sessions"
+env -i PATH="$AR_APP_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" \
+  STUB_MR_OPEN=1 STUB_GIT_REMOTE="$AR_APP_REMOTE" \
+  CODEX_HOME="$WORK/ar-bin-e2e-codex" ARGV_FILE="$WORK/ar-bin-e2e-argv" \
+  AGENT_EXE_LOG="$AGENT_FLAG_LOG" STUB_CODEX_VERDICT=CHANGES_REQUESTED \
+  bash "$ROOT/run.sh" --_worker https://gl.example/g/p/-/merge_requests/9 \
+    --dir "$AR_APP_REPO" --max 1 \
+    --claude-bin "$ALT_CLAUDE" --codex-bin "$ALT_CODEX" \
+    > "$WORK/ar-bin-e2e.out" 2> "$WORK/ar-bin-e2e.err"
+assert_substr "$AGENT_FLAG_LOG" $'codex\t'"$ALT_CODEX"
+assert_substr "$AGENT_FLAG_LOG" $'claude-probe\t'"$ALT_CLAUDE"
+assert_substr "$AGENT_FLAG_LOG" $'claude\t'"$ALT_CLAUDE"
 rm -rf "$ROOT/state/gl.example__g__p"
 
 # --- auto-resume: the iteration budget spans relaunches ----------------------
@@ -5490,10 +5660,13 @@ fi
 
 t "finalize: three local rounds become one pushed commit"
 local_fixture; local_round 1; local_round 2; local_round 3
-finalize_run
+finalize_run CLAUDE_BIN="$ALT_CLAUDE"
 assert_eq "$FIN_RC" 0
 assert_eq "$(git -C "$LF_CLONE" rev-list --count "$LF_BASE..HEAD")" 1
 assert_eq "$(remote_head)" "$(local_head)"
+
+t "finalize: the closing Claude turn uses the executable override"
+assert_eq "$(cat "$WORK/fin-argv.exe" 2>/dev/null)" "$ALT_CLAUDE"
 
 t "finalize: the pushed commit carries the composed message"
 assert_eq "$(git -C "$LF_CLONE" log -1 --format=%s)" 'Squashed subject line'

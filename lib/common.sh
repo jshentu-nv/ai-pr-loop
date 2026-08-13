@@ -20,6 +20,13 @@
 
 FORGE="${FORGE:-github}"
 
+# Agent CLI executables. Each value is one executable name or path, never a
+# shell command string; callers quote it as a single argv element. run.sh
+# exposes --claude-bin / --codex-bin and exports the resolved values, while
+# these defaults keep direct turn-script invocations working as before.
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+
 # --- Review exchange mode -------------------------------------------------
 #
 # LOCAL_MODE selects how the two agents exchange the review:
@@ -123,7 +130,7 @@ write_state_atomic() {  # <path> <content>
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+  command -v -- "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
 # Read a host-scoped glab config value with glab's environment overrides
@@ -198,8 +205,8 @@ glab_config_host_keys() {
 }
 
 preflight() {
-  require_cmd codex
-  require_cmd claude
+  require_cmd "$CODEX_BIN"
+  require_cmd "$CLAUDE_BIN"
   require_cmd git
   require_cmd jq
   # Local branch scope never speaks to a forge: no CLI, no token, no
@@ -1822,9 +1829,9 @@ emit_round_report() {  # <codex|claude> <iter>
 run_with_timeout() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -- "$secs" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+    gtimeout -- "$secs" "$@"
   else
     local pid watchdog rc=0
     "$@" &
@@ -2234,7 +2241,8 @@ resolve_codex_root_session_id() {
 # --- Claude CLI invocation ------------------------------------------------
 #
 # Shared by claude_turn.sh (one implementer round) and finalize_turn.sh (the
-# closing turn of a local review): both run `claude -p` against the same
+# closing turn of a local review): both run the configured Claude executable
+# with `-p` against the same
 # per-PR session, model, effort, and permission handling, so a knob resolved
 # one way for a round can never resolve the other way for the finalize.
 #
@@ -2283,8 +2291,9 @@ claude_prepare_cli() {
   #            (rc 0, empty stderr, every headless action denied), so a
   #            deterministic preflight probe reads the CLI-reported effective
   #            mode first and switches to the settings safety net when auto
-  #            does not stick (cached per PR). A CLI that instead hard-rejects
-  #            the flag at startup is handled by a one-shot retry (see below).
+  #            does not stick (cached per PR, executable, and model). A CLI
+  #            that instead hard-rejects the flag at startup is handled by a
+  #            one-shot retry (see below).
   #   bypass — --dangerously-skip-permissions, plus a settings safety net for
   #            hosts that silently downgrade bypass (managed no-bypass policies,
   #            nested launches from inside another Claude Code session — the
@@ -2309,7 +2318,7 @@ claude_prepare_cli() {
   # timeout, where a bare `timeout` would silently make every probe
   # inconclusive.
   probe_claude_effective_auto_mode() {
-    ( cd "$REPO_DIR" && run_with_timeout 60 claude -p \
+    ( cd "$REPO_DIR" && run_with_timeout 60 "$CLAUDE_BIN" -p \
         "${CLAUDE_MODEL_ARG[@]}" \
         --permission-mode auto \
         --output-format stream-json --verbose \
@@ -2320,28 +2329,29 @@ claude_prepare_cli() {
   case "$CLAUDE_PERMS_RESOLVED" in
     auto)
       # Definitive probe results are cached per PR AND per resolved model —
-      # eligibility is account/host/model state, and --claude-model can change
-      # between invocations sharing this state dir ('off' = host default model
-      # is a key of its own). A cache line is "<mode> <model>", mode first
-      # because modes are single tokens while a model string could contain
-      # whitespace — `read` hands the remainder to the model field verbatim,
-      # so the match is exact for any model. A stored line for a different
-      # model (or the older formats) is treated as absent and re-probed.
+      # eligibility is account/host/model state, and either --claude-bin or
+      # --claude-model can change between invocations sharing this state dir
+      # ('off' = host default model is a key of its own). A cache line is
+      # tab-delimited "<mode><tab><executable><tab><model>" so spaces in paths
+      # and model names remain exact. Older two-field cache lines do not match
+      # this format and are safely re-probed.
       # Delete the cache file after changing auto-mode enablement to re-probe.
       AUTOMODE_CACHE="$STATE_DIR/claude.automode.effective"
       EFFECTIVE_AUTO=''
       if [[ -s "$AUTOMODE_CACHE" ]]; then
-        read -r CACHED_MODE CACHED_MODEL < "$AUTOMODE_CACHE" || true
-        if [[ "${CACHED_MODEL:-}" == "$CLAUDE_MODEL_RESOLVED" && -n "${CACHED_MODE:-}" ]]; then
+        IFS=$'\t' read -r CACHED_MODE CACHED_BIN CACHED_MODEL < "$AUTOMODE_CACHE" || true
+        if [[ "${CACHED_BIN:-}" == "$CLAUDE_BIN" \
+              && "${CACHED_MODEL:-}" == "$CLAUDE_MODEL_RESOLVED" \
+              && -n "${CACHED_MODE:-}" ]]; then
           EFFECTIVE_AUTO="$CACHED_MODE"
-          log "claude: auto-mode probe (cached for model '$CACHED_MODEL') = '$EFFECTIVE_AUTO'"
+          log "claude: auto-mode probe (cached for '$CACHED_BIN', model '$CACHED_MODEL') = '$EFFECTIVE_AUTO'"
         fi
       fi
       if [[ -z "$EFFECTIVE_AUTO" ]]; then
         EFFECTIVE_AUTO=$(probe_claude_effective_auto_mode || true)
         if [[ -n "$EFFECTIVE_AUTO" ]]; then
-          printf '%s %s\n' "$EFFECTIVE_AUTO" "$CLAUDE_MODEL_RESOLVED" > "$AUTOMODE_CACHE"
-          log "claude: auto-mode probe (model '$CLAUDE_MODEL_RESOLVED') = '$EFFECTIVE_AUTO'"
+          printf '%s\t%s\t%s\n' "$EFFECTIVE_AUTO" "$CLAUDE_BIN" "$CLAUDE_MODEL_RESOLVED" > "$AUTOMODE_CACHE"
+          log "claude: auto-mode probe ('$CLAUDE_BIN', model '$CLAUDE_MODEL_RESOLVED') = '$EFFECTIVE_AUTO'"
         else
           log "claude: auto-mode probe inconclusive — proceeding with auto (startup-rejection retry still applies)"
         fi
@@ -2419,7 +2429,7 @@ claude_run_prompt() {
   _claude_exec() {
     ( cd "$REPO_DIR" && \
       CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
-      claude -p \
+      "$CLAUDE_BIN" -p \
         --disallowedTools "$CLAUDE_DISALLOWED_TOOLS" \
         "${CLAUDE_SESSION_ARG[@]}" \
         "${CLAUDE_MODEL_ARG[@]}" \

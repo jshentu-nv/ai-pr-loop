@@ -41,8 +41,10 @@ Requirements on the host:
   PAT-backed `glab auth login --hostname <host>` done for the target host
   (the token needs `api` scope; OAuth web/device glab sessions are
   rejected — see [GitLab support](#gitlab-support)).
-- `codex` CLI installed and logged in.
-- `claude` CLI installed and logged in.
+- Codex CLI installed and logged in (executable `codex` by default; select
+  another name/path with `--codex-bin` or `CODEX_BIN`).
+- Claude CLI installed and logged in (executable `claude` by default; select
+  another name/path with `--claude-bin` or `CLAUDE_BIN`).
 - `git`, `jq` available on `$PATH`.
 
 No NVIDIA / org-specific config — works on any GitHub/GitLab repo the
@@ -239,7 +241,22 @@ flag again to **replace** the stored context, or `--clear-context` to drop
 it. (`--clear-context` is ignored when new `--context*` flags are also
 given — those win.)
 
-## Models & reasoning effort
+## Agent executables, models & reasoning effort
+
+The executable names are configurable independently of the model knobs:
+
+- `--claude-bin EXECUTABLE` / `CLAUDE_BIN` selects the Claude CLI.
+- `--codex-bin EXECUTABLE` / `CODEX_BIN` selects the Codex CLI.
+
+The flag wins over its environment variable; defaults are `claude` and
+`codex`. `EXECUTABLE` may be an external program name on `PATH` or a path;
+the selected file is resolved once to an absolute path before the loop enters
+the reviewed checkout. Shell functions and builtins are not accepted. It is
+always treated as exactly one executable—not split or evaluated as shell—so
+use a wrapper script if the command needs fixed extra arguments. A bare name
+beginning with `-` must be spelled as a path (for example,
+`/opt/bin/-claude`). Alternate executables must implement the corresponding
+Claude Code or Codex CLI/session interface.
 
 Both agents run on a pinned model at high reasoning effort by default; you
 can dial each one. Every knob is passed explicitly on every turn (fresh and
@@ -266,12 +283,13 @@ apply in `-p` mode). Dial with:
   where bypass is policy-disabled. Auto mode isn't available on every
   account/provider (Pro and Bedrock/Vertex/Foundry are excluded;
   Team/Enterprise needs admin enablement), and ineligible hosts silently
-  downgrade it to default mode — so each PR's first turn runs a
-  deterministic preflight probe that reads the CLI-reported effective mode
-  (cached in the PR's state dir; delete `claude.automode.effective` to
-  re-probe after changing enablement) and switches to the same settings
-  safety net `bypass` uses when auto doesn't stick. A CLI that hard-rejects
-  the flag at startup instead triggers a single retry with that net.
+  downgrade it to default mode — so the first turn for each PR, Claude
+  executable, and model combination runs a deterministic preflight probe
+  that reads the CLI-reported effective mode (cached in the PR's state dir;
+  delete `claude.automode.effective` to re-probe after changing enablement)
+  and switches to the same settings safety net `bypass` uses when auto
+  doesn't stick. A CLI that hard-rejects the flag at startup instead
+  triggers a single retry with that net.
   `bypass`: `--dangerously-skip-permissions`
   plus a settings safety net (auto-accepted edits + allowed
   Bash/WebFetch/WebSearch) for hosts that silently downgrade bypass (managed
@@ -665,6 +683,10 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh --codex-effort high
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5 --codex-tier off
 
+# Use alternate compatible CLI executables (names on PATH or paths):
+~/ai-pr-loop/run.sh 42 --repo owner/repo \
+  --claude-bin claude-enterprise --codex-bin /opt/codex/bin/codex
+
 # Auto-resume (on by default, budget 10): change the budget, turn it off,
 # or stop a supervisor that is running elsewhere:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --auto-resume 3
@@ -722,11 +744,11 @@ already landed.
 `claude`/`codex`/`gh`: the turn scripts execute against PATH stubs that
 record their argv, and assertions check the recorded vectors (model /
 effort / tier mapping, `off` omission, the adaptive Codex effort default,
-explicit-level precedence, fresh-vs-resumed session flags) plus `run.sh`'s
-flag validation. The auto-resume cases start real supervisors against the
-same stubs; most die before an agent turn, and the terminal-status cases
-drive the Codex stub through an approved run to prove the supervisor stops
-on an end state. Local review mode is covered against real git: the
+explicit-level precedence, executable overrides, fresh-vs-resumed session
+flags) plus `run.sh`'s flag validation. The auto-resume cases start real
+supervisors against the same stubs; most die before an agent turn, and the
+terminal-status cases drive the Codex stub through an approved run to prove
+the supervisor stops on an end state. Local review mode is covered against real git: the
 per-round file contracts, resume high-water, squash-into-one-commit, the
 fast-forward-only push, and the single post-push title/description write.
 

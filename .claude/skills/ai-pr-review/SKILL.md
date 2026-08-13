@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted), or locally on a branch. Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", "review this branch locally", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account. With --local it posts nothing and lands the whole review as one squashed commit.
-argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-bin EXECUTABLE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-bin EXECUTABLE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -159,6 +159,11 @@ Optional flags worth surfacing if the user mentions a constraint:
   reply consumes the whole budget before Codex runs. Local and review-only
   runs skip the pending reply and go straight to the fresh Codex round.
 
+- `--claude-bin EXECUTABLE` — compatible Claude CLI name on PATH or path.
+  Default `CLAUDE_BIN`, then `claude`. Pass it when the user names another
+  executable. The value is one quoted executable, not a command string; fixed
+  arguments require a wrapper. A name beginning with `-` must be passed as a
+  path.
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if
   the user names a different implementer model; `off` leaves the CLI/settings
@@ -177,6 +182,11 @@ Optional flags worth surfacing if the user mentions a constraint:
   settings safety net for hosts that silently downgrade bypass; `off` = host
   default. Only set it if the user explicitly asks for unsandboxed/bypass
   operation.
+- `--codex-bin EXECUTABLE` — compatible Codex CLI name on PATH or path.
+  Default `CODEX_BIN`, then `codex`. Pass it when the user names another
+  executable. The value is one quoted executable, not a command string; fixed
+  arguments require a wrapper. A name beginning with `-` must be passed as a
+  path.
 - `--codex-model MODEL` — model for the Codex reviewer's turns, passed as
   `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
   different reviewer model; `off` leaves the host's codex config untouched.
@@ -221,28 +231,36 @@ and ask where they want it cloned. Do not silently clone for them.
 Run these checks in parallel and surface any failures **before** kicking off
 the loop.
 
+Set `CLAUDE_EXE` and `CODEX_EXE` below to the exact parsed flag values when
+the user selected overrides, otherwise to `${CLAUDE_BIN:-claude}` and
+`${CODEX_BIN:-codex}` respectively. Keep each as one quoted scalar; do not
+split a value into command plus arguments. Pass the same override flags to
+the authoritative `--preflight-only` call and eventual launch.
+
 GitHub:
 
 ```bash
 gh auth status 2>&1 | head -2
-command -v codex && codex --version 2>&1 | head -1
-command -v claude && claude --version 2>&1 | head -1
-gh pr view <PR_NUMBER> --repo <REPO_SLUG> --json state,headRefName,title,url
+command -v -- "$CODEX_EXE" && "$CODEX_EXE" --version 2>&1 | head -1
+command -v -- "$CLAUDE_EXE" && "$CLAUDE_EXE" --version 2>&1 | head -1
+"$RUN_SH" <PR_NUMBER or URL> [--repo REPO_SLUG] \
+  [--claude-bin "$CLAUDE_EXE"] [--codex-bin "$CODEX_EXE"] --preflight-only
 ```
 
 GitLab (self-hosted: substitute the host):
 
 ```bash
 command -v glab && glab --version 2>&1 | head -1
-command -v codex && codex --version 2>&1 | head -1
-command -v claude && claude --version 2>&1 | head -1
+command -v -- "$CODEX_EXE" && "$CODEX_EXE" --version 2>&1 | head -1
+command -v -- "$CLAUDE_EXE" && "$CLAUDE_EXE" --version 2>&1 | head -1
 # The orchestrator's own side-effect-free authenticated preflight: it
 # validates the URL/authority (rejecting e.g. userinfo smuggling before
 # any credential is used), resolves the credential exactly as the run
 # will (env-isolated, OAuth-rejecting), fetches the MR, and prints the
 # posting identity + canonical URL + branches — without cloning, posting,
 # or looping:
-"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> --preflight-only
+"$RUN_SH" <PR_OR_MR_URL or IID --repo SLUG --host HOST> \
+  [--claude-bin "$CLAUDE_EXE"] [--codex-bin "$CODEX_EXE"] --preflight-only
 ```
 
 The `identity:` line names the exact GitLab account behind every **API
@@ -307,6 +325,10 @@ Append any context the user supplied, e.g.
 `--context-url <url> --context "<note>" --context-file <path>` (repeatable;
 shared by both agents). On a re-run to grant more iterations, omit them —
 stored context is reused automatically.
+
+Append `--claude-bin <executable>` and/or `--codex-bin <executable>` whenever
+the user selected overrides. Keep them on re-runs so every resumed turn uses
+the same compatible CLI implementation.
 
 **The CI policy is built into both agents' prompts** (the "CI is part of
 the review" sections in `prompts/codex.md` / `prompts/claude.md`), so every

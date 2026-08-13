@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # One Codex review iteration. Reads env: REPO_OWNER, REPO_NAME, PR_NUMBER,
 # REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR,
-# REVIEW_ONLY, HAS_CONTEXT, CONTEXT_FILE, CODEX_MODEL, CODEX_EFFORT,
-# CODEX_TIER.
+# REVIEW_ONLY, HAS_CONTEXT, CONTEXT_FILE, CODEX_BIN, CODEX_MODEL,
+# CODEX_EFFORT, CODEX_TIER.
 # Exits 0 if APPROVED, 2 if CHANGES_REQUESTED, 1 on error / no verdict found.
 set -euo pipefail
 
@@ -204,7 +204,7 @@ esac
 rm -f "$ID/issue_counts.stdout" "$ID/verdict.stdout"
 
 set +e
-( cd "$REPO_DIR" && NO_COLOR=1 codex exec \
+( cd "$REPO_DIR" && NO_COLOR=1 "$CODEX_BIN" exec \
     "${CODEX_SUBCMD[@]}" \
     "${CODEX_MODEL_ARG[@]}" \
     "${CODEX_EFFORT_ARG[@]}" \

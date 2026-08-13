@@ -12,7 +12,8 @@
 # but still runs the closing turn for step 4: the review may have agreed
 # title/description corrections, and that update is the one remaining write.
 #
-# Same env contract as claude_turn.sh, plus LOCAL_SCOPE / NO_PUSH.
+# Same env contract as claude_turn.sh (including CLAUDE_BIN), plus
+# LOCAL_SCOPE / NO_PUSH.
 #
 # Exits: 0 finalized — pushed, landed locally when there is no origin
 #          (terminal), or held back by --no-push (resumable)

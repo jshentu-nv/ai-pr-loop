@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One Claude implementer iteration. Same env contract as codex_turn.sh, with
-# CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_PERMS in place of the CODEX_* knobs.
+# CLAUDE_BIN / CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_PERMS in place of the
+# CODEX_* knobs.
 # Exits 0 on success (turn marker found), 1 on error.
 set -euo pipefail
 
