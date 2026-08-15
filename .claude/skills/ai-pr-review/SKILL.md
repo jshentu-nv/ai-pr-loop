@@ -1,7 +1,7 @@
 ---
 name: ai-pr-review
 description: Orchestrate the two-agent ai-pr-loop on a GitHub pull request or a GitLab merge request (gitlab.com or self-hosted), or locally on a branch. Use when the user asks to "review PR X", "review MR X", "run AI review on <PR/MR URL>", "kick off the review bots", "review this branch locally", or similar — the user wants Codex (reviewer) + Claude (implementer) to iterate autonomously until convergence or approval. Posts comments under the user's forge API identity (gh PAT / GitLab token); pushes commits through the checkout's git credential, which may be a different account. With --local it posts nothing and lands the whole review as one squashed commit.
-argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-bin EXECUTABLE] [--claude-model MODEL] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-bin EXECUTABLE] [--codex-model MODEL] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
+argument-hint: "[pr-number or pr/mr-url] [--forge github|gitlab] [--host HOST] [--max N] [--converge N] [--restart] [--review-only] [--local] [--base REF] [--no-push] [--context-url URL] [--context TEXT] [--context-file FILE] [--claude-bin EXECUTABLE] [--claude-model MODEL] [--claude-context-window TOKENS|auto] [--claude-effort LEVEL] [--claude-perms MODE] [--codex-bin EXECUTABLE] [--codex-model MODEL] [--codex-context-window TOKENS|auto] [--codex-effort LEVEL] [--codex-tier TIER] [--auto-resume N] [--no-auto-resume] [--stop]"
 allowed-tools: Bash, Read, Monitor
 ---
 
@@ -168,6 +168,12 @@ Optional flags worth surfacing if the user mentions a constraint:
   as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if
   the user names a different implementer model; `off` leaves the CLI/settings
   default untouched.
+- `--claude-context-window TOKENS|auto` — context-window size shown in the
+  Claude implementer's forge-comment signature. `auto` (default) reports
+  `1000000` as the model default paired with `fable`; other aliases, custom
+  models, and model `off` report `unknown` unless an explicit token count is
+  supplied. Host/provider policy can override a model default. This labeled
+  metadata option does not change the Claude CLI's context allocation.
 - `--claude-effort LEVEL` — reasoning effort for the Claude implementer's
   turns. **Default `ultracode`** (xhigh + dynamic-workflow orchestration). Set
   it if the user asks for lighter/heavier implementer reasoning or flags cost:
@@ -190,6 +196,13 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--codex-model MODEL` — model for the Codex reviewer's turns, passed as
   `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
   different reviewer model; `off` leaves the host's codex config untouched.
+- `--codex-context-window TOKENS|auto` — context-window size shown in the
+  Codex reviewer's forge-comment signature. `auto` (default) uses Codex's
+  bundled model catalog to resolve the selected model's effective context
+  window and labels it `bundled default`; host configuration can override it.
+  Unresolved/custom models and model `off` show `unknown`. Supply an explicit
+  token count to sign `configured` metadata. This option does not change
+  Codex's context allocation.
 - `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
   applied as `-c model_reasoning_effort=LEVEL`. The default adapts to the
   model: **`ultra`** when the codex model is gpt-5.6-sol/-terra (the
@@ -200,6 +213,7 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--codex-tier TIER` — service (speed) tier for the Codex reviewer, applied
   as `-c service_tier=TIER`. **Default `fast`** (1.5x speed, increased
   usage); `off` leaves the host's codex config untouched.
+
 - `--auto-resume N` — restart budget for the auto-resume supervisor.
   **Default 10.** The supervisor runs in its own session and relaunches the
   loop when a run dies without finishing — killed externally, or an agent
@@ -213,6 +227,17 @@ Optional flags worth surfacing if the user mentions a constraint:
   then exit. Use when the user says "stop the review", "cancel the bots" and
   the background task is gone or unresponsive. Runs no preflight and clones
   nothing, so it is safe to call at any time.
+
+New forge comments and replies place a canonical runtime signature directly
+after the visible AI header:
+
+`<sub>Model: <code>...</code> · Effort: <code>...</code> · Context window: <code>... tokens (source)</code></sub>`
+
+The source is `bundled default`, `model default`, or `configured`; unknown
+sizes render as `<code>unknown</code>`. Local review files are unchanged.
+Summary resume detection still accepts the legacy hidden marker and
+alert/banner structure, so comments produced before runtime signatures were
+added remain valid resume points.
 
 ## Steps
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One Claude implementer iteration. Same env contract as codex_turn.sh, with
-# CLAUDE_BIN / CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_PERMS in place of the
-# CODEX_* knobs.
+# CLAUDE_BIN / CLAUDE_MODEL / CLAUDE_EFFORT / CLAUDE_PERMS /
+# CLAUDE_CONTEXT_WINDOW in place of the CODEX_* knobs.
 # Exits 0 on success (turn marker found), 1 on error.
 set -euo pipefail
 
@@ -80,6 +80,25 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   SCOPE_NOTE="**Review-created diff.** Read \`${SCOPE_FILE}\` before editing. It separates the original change from paths changed by this review and flags paths newly brought into scope. Your response must justify every path you change."
 fi
 
+# Resolve the pure model/effort metadata before prompt rendering.  The full
+# claude_prepare_cli call stays below because it also creates session state and
+# may probe permission mode; both paths reuse these exact resolved values.
+claude_resolve_model_effort
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  CLAUDE_CONTEXT_WINDOW_RESOLVED=unknown
+elif [[ -z "${CLAUDE_CONTEXT_WINDOW_RESOLVED:-}" ]]; then
+  CLAUDE_CONTEXT_WINDOW_RESOLVED=$(resolve_claude_context_window \
+    "$CLAUDE_MODEL_RESOLVED" "${CLAUDE_CONTEXT_WINDOW:-auto}")
+fi
+CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
+  "${CLAUDE_CONTEXT_WINDOW:-auto}" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
+AI_COMMENT_SIGNATURE=$(ai_comment_signature \
+  "$(ai_model_display "$CLAUDE_MODEL_RESOLVED")" \
+  "$(claude_effort_display "$CLAUDE_EFFORT_RESOLVED")" \
+  "$CLAUDE_CONTEXT_WINDOW_RESOLVED" "$CLAUDE_CONTEXT_WINDOW_SOURCE")
+AI_COMMENT_SIGNATURE_SED=$(prompt_sed_replacement "$AI_COMMENT_SIGNATURE")
+log "claude: context window = ${CLAUDE_CONTEXT_WINDOW_RESOLVED}"
+
 
 # Render the prompt. GitLab loops use the gitlab prompt variant — same
 # implementer contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -121,6 +140,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{GH_USER}}|${GH_USER}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
   -e "s|{{SCOPE_NOTE}}|${SCOPE_NOTE}|g" \
+  -e "s|{{AI_COMMENT_SIGNATURE}}|${AI_COMMENT_SIGNATURE_SED}|g" \
   > "$PROMPT_FILE"
 
 log "claude: iter $ITER — running"

@@ -33,9 +33,11 @@
 #                      [--claude-bin EXECUTABLE]
 #                      [--claude-model MODEL] [--claude-effort LEVEL]
 #                      [--claude-perms MODE]
+#                      [--claude-context-window TOKENS|auto]
 #                      [--codex-bin EXECUTABLE]
 #                      [--codex-model MODEL] [--codex-effort LEVEL]
-#                      [--codex-tier TIER] [--print-config]
+#                      [--codex-tier TIER]
+#                      [--codex-context-window TOKENS|auto] [--print-config]
 #                      [--auto-resume N] [--no-auto-resume] [--stop]
 #
 #   run.sh --local --base REF [--dir REPO_DIR] [other flags...]
@@ -150,6 +152,13 @@
 #                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
 #                 bypass. off: leave the host's CLI/settings default
 #                 untouched.
+#   --claude-context-window TOKENS|auto
+#                 Context-window metadata reported in Claude's public
+#                 comment signature. Default: auto — the 1000000-token model
+#                 default paired with `fable`; unknown for other aliases,
+#                 custom providers, or model=off. Host policy can override a
+#                 model default. Supply a positive integer to sign configured
+#                 metadata for the selected executable/provider.
 #   --codex-bin EXECUTABLE
 #                 Codex CLI executable name on PATH, or an absolute/relative
 #                 path. Default: $CODEX_BIN when set, otherwise `codex`.
@@ -174,11 +183,20 @@
 #                 `-c service_tier=TIER` on every turn. Default: fast (the
 #                 "Fast" tier: 1.5x speed, increased usage). Use `off` to
 #                 leave the host's codex config untouched.
+#   --codex-context-window TOKENS|auto
+#                 Context-window metadata reported in Codex's public
+#                 comment signature. Default: auto — exact-match the selected
+#                 model in `$CODEX_BIN debug models --bundled` and apply its
+#                 effective-window percentage. The signature labels that value
+#                 as a bundled default because host config can override it.
+#                 Supply a positive integer for custom providers/catalogs;
+#                 unresolved values report unknown.
 #   --print-config
-#                 Print the resolved executable/model/effort/tier knobs
-#                 (after adaptive defaults) and exit without contacting
-#                 GitHub; the PR number is optional in this mode. Used by
-#                 tests/run_tests.sh to observe the resolution.
+#                 Print the resolved executable/model/effort/tier knobs plus
+#                 context metadata and its source (after adaptive defaults),
+#                 then exit without contacting GitHub; the PR number is
+#                 optional in this mode. Used by tests/run_tests.sh to observe
+#                 the resolution.
 #   --preflight-only
 #                 Run the full authenticated preflight — authority
 #                 validation, credential resolution (env-isolated,
@@ -278,9 +296,11 @@ CLEAR_CONTEXT=0
 CLAUDE_MODEL="fable"
 CLAUDE_EFFORT="ultracode"
 CLAUDE_PERMS="auto"
+CLAUDE_CONTEXT_WINDOW="auto"
 CODEX_MODEL="gpt-5.6-sol"
 CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, off (host/model default) otherwise
 CODEX_TIER="fast"
+CODEX_CONTEXT_WINDOW="auto"
 AUTO_RESUME="$AUTO_RESUME_DEFAULT"
 STOP_ONLY=0
 ROLE=frontend             # frontend | supervise | worker (the last two are internal)
@@ -312,10 +332,12 @@ while [[ $# -gt 0 ]]; do
     --claude-model)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-model needs a model";  CLAUDE_MODEL="$2";  shift 2 ;;
     --claude-effort) [[ $# -ge 2 ]] || die "--claude-effort needs a level"; CLAUDE_EFFORT="$2"; shift 2 ;;
     --claude-perms)  [[ $# -ge 2 && "$2" != -* ]] || die "--claude-perms needs a mode";   CLAUDE_PERMS="$2";  shift 2 ;;
+    --claude-context-window) [[ $# -ge 2 && "$2" != -* ]] || die "--claude-context-window needs tokens or auto"; CLAUDE_CONTEXT_WINDOW="$2"; shift 2 ;;
     --codex-bin)     [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || die "--codex-bin needs an executable"; CODEX_BIN="$2"; shift 2 ;;
     --codex-model)   [[ $# -ge 2 && "$2" != -* ]] || die "--codex-model needs a model";   CODEX_MODEL="$2";   shift 2 ;;
     --codex-effort)  [[ $# -ge 2 && -n "$2" ]] || die "--codex-effort needs a level";  CODEX_EFFORT="$2";  shift 2 ;;
     --codex-tier)    [[ $# -ge 2 && "$2" != -* ]] || die "--codex-tier needs a tier";     CODEX_TIER="$2";    shift 2 ;;
+    --codex-context-window) [[ $# -ge 2 && "$2" != -* ]] || die "--codex-context-window needs tokens or auto"; CODEX_CONTEXT_WINDOW="$2"; shift 2 ;;
     --print-config)  PRINT_CONFIG=1; shift ;;
     --preflight-only) PREFLIGHT_ONLY=1; shift ;;
     --auto-resume)   [[ $# -ge 2 ]] || die "--auto-resume needs a restart budget"
@@ -558,6 +580,10 @@ esac
 [[ -n "$CLAUDE_MODEL" ]] || die "--claude-model needs a model (or 'off')"
 [[ -n "$CODEX_MODEL"  ]] || die "--codex-model needs a model (or 'off')"
 [[ -n "$CODEX_TIER"   ]] || die "--codex-tier needs a tier (or 'off')"
+[[ "$CLAUDE_CONTEXT_WINDOW" == "auto" || "$CLAUDE_CONTEXT_WINDOW" =~ ^[1-9][0-9]*$ ]] \
+  || die "--claude-context-window must be a positive integer token count or auto (got: $CLAUDE_CONTEXT_WINDOW)"
+[[ "$CODEX_CONTEXT_WINDOW" == "auto" || "$CODEX_CONTEXT_WINDOW" =~ ^[1-9][0-9]*$ ]] \
+  || die "--codex-context-window must be a positive integer token count or auto (got: $CODEX_CONTEXT_WINDOW)"
 
 # Executable overrides are deliberately a single scalar, never split or
 # evaluated as shell. Resolve both PATH names and explicit paths to one
@@ -596,6 +622,23 @@ if (( STOP_ONLY == 0 )); then
   CODEX_BIN=$(resolve_agent_bin --codex-bin "$CODEX_BIN")
 fi
 
+# --print-config exits before role dispatch, so resolve its display values
+# here. Normal supervised runs defer catalog lookup to the worker: neither the
+# front-end nor the supervisor needs comment metadata, and an incompatible
+# custom catalog command must not delay lifecycle setup.
+CLAUDE_CONTEXT_WINDOW_RESOLVED=unknown
+CODEX_CONTEXT_WINDOW_RESOLVED=unknown
+if (( STOP_ONLY == 0 && PRINT_CONFIG == 1 )); then
+  CLAUDE_CONTEXT_WINDOW_RESOLVED=$(resolve_claude_context_window \
+    "$CLAUDE_MODEL" "$CLAUDE_CONTEXT_WINDOW")
+  CODEX_CONTEXT_WINDOW_RESOLVED=$(resolve_codex_context_window \
+    "$CODEX_MODEL" "$CODEX_CONTEXT_WINDOW")
+fi
+CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
+  "$CLAUDE_CONTEXT_WINDOW" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
+CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
+  "$CODEX_CONTEXT_WINDOW" "$CODEX_CONTEXT_WINDOW_RESOLVED")
+
 # Default checkout location when --dir not given: one managed clone per repo
 # identity, shared across PRs of that repo. (Concurrent loops on the same
 # repo should pass --dir to point at separate clones.) repo_ident_name keeps
@@ -627,9 +670,15 @@ if (( PRINT_CONFIG == 1 )); then
     "$LOCAL_SCOPE" "${BASE_ARG:--}" \
     "$( (( LOCAL_MODE == 1 && NO_PUSH == 1 )) && echo no || echo yes )"
   printf 'claude-bin: %s\n' "$CLAUDE_BIN"
-  printf 'claude: model=%s effort=%s perms=%s\n' "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS"
+  printf 'claude: model=%s effort=%s perms=%s context-window=%s context-source=%s\n' \
+    "$CLAUDE_MODEL" "$CLAUDE_EFFORT" "$CLAUDE_PERMS" \
+    "$CLAUDE_CONTEXT_WINDOW_RESOLVED" \
+    "$(context_window_source_display "$CLAUDE_CONTEXT_WINDOW_SOURCE")"
   printf 'codex-bin: %s\n' "$CODEX_BIN"
-  printf 'codex: model=%s effort=%s tier=%s\n' "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER"
+  printf 'codex: model=%s effort=%s tier=%s context-window=%s context-source=%s\n' \
+    "$CODEX_MODEL" "$CODEX_EFFORT" "$CODEX_TIER" \
+    "$CODEX_CONTEXT_WINDOW_RESOLVED" \
+    "$(context_window_source_display "$CODEX_CONTEXT_WINDOW_SOURCE")"
   exit 0
 fi
 
@@ -1220,11 +1269,29 @@ done
 REPO_OWNER="${REPO_SLUG%%/*}"
 REPO_NAME="${REPO_SLUG##*/}"
 
+# Only a worker (or an unsupervised/preflight front-end) reaches this point.
+# Resolve forge-comment metadata only when a turn can actually post it. Local
+# mode strips every forge recipe, and preflight exits before any turn, so a
+# custom executable must not pay for or be required to implement catalog
+# discovery on those paths. --print-config is the explicit exception above.
+if (( LOCAL_MODE == 0 && PREFLIGHT_ONLY == 0 )); then
+  CLAUDE_CONTEXT_WINDOW_RESOLVED=$(resolve_claude_context_window \
+    "$CLAUDE_MODEL" "$CLAUDE_CONTEXT_WINDOW")
+  CODEX_CONTEXT_WINDOW_RESOLVED=$(resolve_codex_context_window \
+    "$CODEX_MODEL" "$CODEX_CONTEXT_WINDOW")
+  CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
+    "$CLAUDE_CONTEXT_WINDOW" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
+  CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
+    "$CODEX_CONTEXT_WINDOW" "$CODEX_CONTEXT_WINDOW_RESOLVED")
+fi
+
 export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
        LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON \
        CLAUDE_BIN CLAUDE_MODEL CLAUDE_EFFORT CLAUDE_PERMS \
-       CODEX_BIN CODEX_MODEL CODEX_EFFORT CODEX_TIER
+       CLAUDE_CONTEXT_WINDOW CLAUDE_CONTEXT_WINDOW_RESOLVED \
+       CODEX_BIN CODEX_MODEL CODEX_EFFORT CODEX_TIER \
+       CODEX_CONTEXT_WINDOW CODEX_CONTEXT_WINDOW_RESOLVED
 
 preflight
 # --preflight-only stops before any side effect: no clone, no state dir, no
@@ -1388,8 +1455,8 @@ if (( LOCAL_MODE == 1 )); then
   log "  local: review exchanged on disk; local rounds squash into one commit$( (( NO_PUSH == 1 )) && echo ' (--no-push: not pushed)' )"
 fi
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude: bin=$CLAUDE_BIN model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS"
-log "  codex:  bin=$CODEX_BIN model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER"
+log "  claude: bin=$CLAUDE_BIN model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS context-window=$CLAUDE_CONTEXT_WINDOW_RESOLVED context-source=$(context_window_source_display "$CLAUDE_CONTEXT_WINDOW_SOURCE")"
+log "  codex:  bin=$CODEX_BIN model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER context-window=$CODEX_CONTEXT_WINDOW_RESOLVED context-source=$(context_window_source_display "$CODEX_CONTEXT_WINDOW_SOURCE")"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 

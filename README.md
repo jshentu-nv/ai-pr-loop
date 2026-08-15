@@ -241,7 +241,7 @@ flag again to **replace** the stored context, or `--clear-context` to drop
 it. (`--clear-context` is ignored when new `--context*` flags are also
 given — those win.)
 
-## Agent executables, models & reasoning effort
+## Agent executables, models, context & reasoning effort
 
 The executable names are configurable independently of the model knobs:
 
@@ -275,6 +275,13 @@ apply in `-p` mode). Dial with:
 
 - `--claude-model MODEL` — passed as `--model`. Default `fable`; `off`
   leaves the CLI/settings default untouched.
+- `--claude-context-window TOKENS|auto` — context-window size reported in
+  Claude's forge-comment signature. `auto` (default) reports `1000000`
+  tokens as the model default paired with `fable`; other aliases, custom
+  model names, and `--claude-model off` report `unknown` unless you supply
+  an explicit token count. Host policy/provider settings can override a
+  model default. This is labeled display metadata only; it does not change
+  the Claude CLI's context allocation.
 - `--claude-effort LEVEL` — one of `ultracode` (default), `low`, `medium`,
   `high`, `xhigh`, `max`, or `off`.
 - `--claude-perms MODE` — permission handling for the headless turns. `auto`
@@ -309,6 +316,15 @@ unattended. Dial with:
 
 - `--codex-model MODEL` — passed as `-m`. Default `gpt-5.6-sol`; `off`
   leaves the host's codex config untouched.
+- `--codex-context-window TOKENS|auto` — context-window size reported in
+  Codex's forge-comment signature. `auto` (default) looks up the selected
+  model in Codex's bundled model catalog and reports its effective context
+  window (the catalog window adjusted by its effective-window percentage).
+  The signature labels this a `bundled default`: host
+  `model_context_window`, custom-catalog, and provider settings can override
+  it. If the model cannot be resolved, the signature reports `unknown`; an
+  explicit token count is labeled `configured`. This is display metadata only
+  and does not change Codex's context allocation.
 - `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
   model is gpt-5.6-sol/-terra (the only models that support it); for any
@@ -323,6 +339,7 @@ unattended. Dial with:
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh   # implementer: reasoning only, no orchestration
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-effort high     # reviewer: dial reasoning down
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5  # older reviewer model (no effort forced — host/model default)
+~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-context-window 200000 --codex-context-window auto
 ~/ai-pr-loop/run.sh 42 --repo owner/repo \
   --claude-model off --claude-effort off --claude-perms off \
   --codex-model off --codex-effort off --codex-tier off   # both: CLI/config defaults
@@ -339,13 +356,22 @@ high-signal.
 Both bots post under the same human token (GitHub: whichever account the
 local `gh` is logged in as, resolved at startup via `gh api user`; GitLab:
 the `GITLAB_TOKEN`/glab account, resolved via `/api/v4/user`). The loop
-tags every artifact three ways:
+distinguishes their forge comments with these signals:
 
 | Signal | Codex Reviewer | Claude Implementer |
 |---|---|---|
 | Hidden HTML marker (orchestrator parses) | `<!-- ai-loop:codex-reviewer iter=N -->` | `<!-- ai-loop:claude-implementer iter=N -->` |
 | Visible banner | `**[AI · Codex Reviewer · iter N]**` | `**[AI · Claude Implementer · iter N]**` |
+| Runtime signature | `<sub>Model: <code>…</code> · Effort: <code>…</code> · Context window: <code>… tokens (source)</code></sub>` | Same fields, using the Claude turn's values |
 | Git commit author (Claude only) | — | `claude-implementer (ai-bot) <claude-implementer+bot@users.noreply.github.com>` |
+
+The runtime signature immediately follows each visible AI header in new
+forge comments and replies. Window sources are explicit: `bundled default`,
+`model default`, or `configured`; an unresolved size is rendered as
+`Context window: <code>unknown</code>`. Local review artifacts are unchanged.
+Summary detection deliberately still keys on the hidden marker and the
+legacy alert/banner lines, so summaries posted by older versions remain
+valid resume points.
 
 `fetch_ai_thread` (in `lib/common.sh`) pulls both surfaces (GitHub:
 `/issues/N/comments` + `/pulls/N/comments`; GitLab: the MR `/discussions`

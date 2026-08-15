@@ -428,13 +428,13 @@ never continue past a failed mutation as if it landed.
          "path": "path/to/file.ext",
          "line": 42,
          "side": "RIGHT",
-         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**\n\n<failure and trigger>\n\n<why it matters>\n\n<smallest acceptable fix>"
+         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**\n{{AI_COMMENT_SIGNATURE}}\n\n<failure and trigger>\n\n<why it matters>\n\n<smallest acceptable fix>"
        },
        {
          "path": "other.ext",
          "line": 17,
          "side": "RIGHT",
-         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [NIT]**\n\n<failure and why it belongs to this change>"
+         "body": "<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}] [NIT]**\n{{AI_COMMENT_SIGNATURE}}\n\n<failure and why it belongs to this change>"
        }
      ]
    }
@@ -485,6 +485,7 @@ never continue past a failed mutation as if it landed.
          --arg body "$(cat <<'BODY'
    <!-- ai-loop:codex-reviewer iter={{ITER}} -->
    **[AI · Codex Reviewer · iter {{ITER}}] [BLOCKER]**
+   {{AI_COMMENT_SIGNATURE}}
 
    <failure and trigger>
 
@@ -511,6 +512,9 @@ never continue past a failed mutation as if it landed.
      the first line of every inline body. The orchestrator filters on it.
    - The `**[AI · Codex Reviewer · iter N] [SEVERITY]**` header should be
      the first visible line — humans use it to spot bot comments at a glance.
+   - The exact runtime-signature line shown in the recipes above **must**
+     immediately follow every visible AI header. Do not omit, reword, or
+     move it.
 {{#github}}
    - `side` is `RIGHT` for the head (added/modified lines), `LEFT` for the
      base (deleted lines). Use `RIGHT` unless commenting on a removed line.
@@ -556,13 +560,26 @@ never continue past a failed mutation as if it landed.
      gh api --method POST \
        repos/{{REPO_OWNER}}/{{REPO_NAME}}/pulls/{{PR_NUMBER}}/comments \
        -F in_reply_to=<id> \
-       -f body="<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]**\n\n<reply>"
+       -f body="$(cat <<'BODY'
+     <!-- ai-loop:codex-reviewer iter={{ITER}} -->
+     **[AI · Codex Reviewer · iter {{ITER}}]**
+     {{AI_COMMENT_SIGNATURE}}
+
+     <reply>
+     BODY
+     )"
 
      # Resolved acknowledgement on a fully-addressed prior thread
      gh api --method POST \
        repos/{{REPO_OWNER}}/{{REPO_NAME}}/pulls/{{PR_NUMBER}}/comments \
        -F in_reply_to=<root id of the thread you originally opened> \
-       -f body="<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]** Resolved."
+       -f body="$(cat <<'BODY'
+     <!-- ai-loop:codex-reviewer iter={{ITER}} -->
+     **[AI · Codex Reviewer · iter {{ITER}}]**
+     {{AI_COMMENT_SIGNATURE}}
+     Resolved.
+     BODY
+     )"
      ```
      `in_reply_to` must reference the **root** comment of the thread (your
      original inline finding), not a later reply in the chain. The
@@ -575,14 +592,27 @@ never continue past a failed mutation as if it landed.
      `{{THREAD_FILE}}`):
      ```bash
      # General reply (e.g. to a pushback)
-     jq -n --arg body "$(printf '<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]**\n\n<reply>')" \
+     jq -n --arg body "$(cat <<'BODY'
+     <!-- ai-loop:codex-reviewer iter={{ITER}} -->
+     **[AI · Codex Reviewer · iter {{ITER}}]**
+     {{AI_COMMENT_SIGNATURE}}
+
+     <reply>
+     BODY
+     )" \
            '{body: $body}' \
      | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
          -H 'Content-Type: application/json' --data @- \
          "$API/merge_requests/{{PR_NUMBER}}/discussions/<discussion_id>/notes"
 
      # Resolved acknowledgement on a fully-addressed prior thread
-     jq -n --arg body "$(printf '<!-- ai-loop:codex-reviewer iter={{ITER}} -->\n**[AI · Codex Reviewer · iter {{ITER}}]** Resolved.')" \
+     jq -n --arg body "$(cat <<'BODY'
+     <!-- ai-loop:codex-reviewer iter={{ITER}} -->
+     **[AI · Codex Reviewer · iter {{ITER}}]**
+     {{AI_COMMENT_SIGNATURE}}
+     Resolved.
+     BODY
+     )" \
            '{body: $body}' \
      | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
          -H 'Content-Type: application/json' --data @- \
@@ -610,6 +640,7 @@ never continue past a failed mutation as if it landed.
 
    > [!IMPORTANT]
    > **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration {{ITER}}.**
+   > {{AI_COMMENT_SIGNATURE}}
    > Posted by the `ai-pr-loop` automation under @{{GH_USER}}'s {{TOKEN_NOUN}}. **Not written by a human reviewer.** Both AI bots in this loop share that account; this comment is from the **Codex Reviewer**.
 
    <your summary markdown here>
@@ -627,6 +658,7 @@ never continue past a failed mutation as if it landed.
 
    > [!IMPORTANT]
    > **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration {{ITER}}.**
+   > {{AI_COMMENT_SIGNATURE}}
    > Posted by the `ai-pr-loop` automation under @{{GH_USER}}'s {{TOKEN_NOUN}}. **Not written by a human reviewer.** Both AI bots in this loop share that account; this comment is from the **Codex Reviewer**.
 
    <your summary markdown here>
@@ -643,7 +675,8 @@ never continue past a failed mutation as if it landed.
    The hidden HTML marker on line 1 **must** be exactly as shown so the
    orchestrator can locate your output. The `> [!IMPORTANT]` banner block
    **must** be the first visible content. Do not omit, reword, or alter
-   either.
+   either. The exact blockquoted runtime-signature line shown above **must**
+   immediately follow the automated-review banner line.
 
    Post the summary {{SUMMARY_NOUN}} **last**, after the inline comments succeed —
    the orchestrator treats it as the completion marker for this iteration.
@@ -653,7 +686,9 @@ never continue past a failed mutation as if it landed.
    hidden marker must be the ENTIRE first line, and the `> [!IMPORTANT]`
    opener plus the banner line (`> **AUTOMATED REVIEW — AI agent (Codex
    Reviewer), iteration {{ITER}}.**`) must be the first visible lines — a
-   further reason not to reword or reorder that block. If the summary POST
+   further reason not to reword or reorder that block. The runtime signature
+   follows those legacy structural lines, so summaries from older loop
+   versions remain resumable. If the summary POST
    fails, fix it and retry until it lands before printing the step-8 lines;
    never print a verdict for a summary that didn't post.
 

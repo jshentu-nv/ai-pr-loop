@@ -110,6 +110,154 @@ CLAUDE_GIT_EMAIL="claude-implementer+bot@users.noreply.github.com"
 log()  { printf '[ai-loop %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 die()  { log "ERROR: $*"; exit 1; }
 
+# --- Public AI comment metadata -----------------------------------------------
+#
+# Every forge comment/reply carries one canonical, human-readable runtime
+# signature.  Model selectors are deliberately free-form (custom providers and
+# wrapper CLIs use their own spellings), so values are HTML-escaped before they
+# enter a prompt and the finished line is escaped again before sed substitution.
+# Automatically discovered context windows are labeled as model/catalog
+# defaults. Host configuration and provider policy can override them; an
+# operator-supplied numeric value is labeled as configured metadata.
+
+ai_metadata_html_escape() {  # <arbitrary scalar>
+  local value="$1"
+  value=${value//$'\r'/ }
+  value=${value//$'\n'/ }
+  value=${value//$'\t'/ }
+  # @html handles markup/quotes. Numeric entities for shell/JSON metacharacters
+  # keep the rendered prompt data-only in every recipe while browsers still
+  # display the operator's original selector text.
+  jq -nr --arg value "$value" '
+    $value
+    | gsub("[\u0000-\u001f\u007f]"; "�")
+    | @html
+    | gsub("\\\\"; "&#92;")
+    | gsub("\\$"; "&#36;")
+    | gsub("`"; "&#96;")
+    | gsub("%"; "&#37;")
+  '
+}
+
+prompt_sed_replacement() {  # <single-line replacement>
+  # Escape every character with replacement-string meaning for the `|`
+  # delimiter used by the prompt renderers.  Callers pass only the one-line,
+  # HTML-escaped signature produced below.
+  printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+
+resolve_codex_context_window() {  # <model> [configured tokens|auto]
+  local model="$1" configured="${2:-auto}" catalog tokens
+  local codex_exe="${CODEX_BIN:-codex}"
+  if [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  [[ "$configured" == "auto" && "$model" != "off" && -n "$model" ]] || {
+    printf 'unknown\n'
+    return 0
+  }
+
+  # The selected executable is the source: alternate Codex builds can ship
+  # different bundled defaults for the same-looking slug. --bundled is
+  # deterministic and network-free. This is not a claim about the active host
+  # config: model_context_window, model_catalog_json, and provider settings can
+  # override it, so the public signature labels the result "bundled default".
+  if catalog=$(run_with_timeout 15 "$codex_exe" debug models --bundled 2>/dev/null); then
+    tokens=$(jq -er --arg model "$model" '
+      first(.models[]? | select(.slug == $model))
+      | (.context_window // empty) as $window
+      | (.effective_context_window_percent // 100) as $percent
+      | (($window * $percent / 100) | floor)
+      | select(. > 0)
+    ' <<<"$catalog" 2>/dev/null) || tokens=''
+    if [[ "$tokens" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$tokens"
+      return 0
+    fi
+  fi
+  printf 'unknown\n'
+}
+
+resolve_claude_context_window() {  # <model> [configured tokens|auto]
+  local model="$1" configured="${2:-auto}"
+  if [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  # Claude exposes no supported offline model catalog.  The loop owns one
+  # paired default: its `fable` default currently advertises a 1M-token Fable 5
+  # window. Every other alias, custom model/provider, and host-config default is
+  # intentionally unknown unless the operator supplies the numeric override.
+  if [[ "$configured" == "auto" && "$model" == "fable" ]]; then
+    printf '1000000\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+context_window_source() {  # <codex|claude> <configured tokens|auto> <resolved>
+  local who="$1" configured="$2" resolved="$3"
+  if [[ ! "$resolved" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'unknown\n'
+  elif [[ "$configured" != "auto" ]]; then
+    printf 'configured\n'
+  elif [[ "$who" == "codex" ]]; then
+    printf 'bundled\n'
+  else
+    printf 'model\n'
+  fi
+}
+
+context_window_source_display() {  # <configured|bundled|model|unknown>
+  case "$1" in
+    bundled) printf 'bundled-default\n' ;;
+    model)   printf 'model-default\n' ;;
+    *)       printf '%s\n' "$1" ;;
+  esac
+}
+
+ai_comment_signature() {  # <model label> <effort label> <window> [configured|bundled|model]
+  local model effort window source="${4:-configured}" window_label
+  model=$(ai_metadata_html_escape "$1")
+  effort=$(ai_metadata_html_escape "$2")
+  window="$3"
+  if [[ "$window" =~ ^[1-9][0-9]*$ ]]; then
+    case "$source" in
+      bundled) window_label="$window tokens (bundled default)" ;;
+      model)   window_label="$window tokens (model default)" ;;
+      *)       window_label="$window tokens (configured)" ;;
+    esac
+  else
+    window_label='unknown'
+  fi
+  window_label=$(ai_metadata_html_escape "$window_label")
+  printf '<sub>Model: <code>%s</code> · Effort: <code>%s</code> · Context window: <code>%s</code></sub>\n' \
+    "$model" "$effort" "$window_label"
+}
+
+ai_model_display() {  # <resolved selector>
+  case "$1" in
+    off|'') printf 'CLI/config default\n' ;;
+    *)      printf '%s\n' "$1" ;;
+  esac
+}
+
+codex_effort_display() {  # <resolved effort>
+  case "$1" in
+    off|'') printf 'CLI/config default\n' ;;
+    *)      printf '%s\n' "$1" ;;
+  esac
+}
+
+claude_effort_display() {  # <resolved effort>
+  case "$1" in
+    ultracode) printf 'xhigh (ultracode)\n' ;;
+    off|'')   printf 'CLI/config default\n' ;;
+    *)        printf '%s\n' "$1" ;;
+  esac
+}
+
 # Every git command the ORCHESTRATOR runs against a checkout an agent turn
 # can write to. The turn may plant hooks there — pre-commit, pre-push,
 # post-checkout, reference-transaction (which fires on ref updates, so
@@ -1589,15 +1737,33 @@ fetch_ai_thread_gitlab() {
 post_ai_comment() {
   # $1 = tag (codex|claude), $2 = iter, $3 = body markdown (no marker yet)
   local who="$1" iter="$2" body="$3"
-  local tag label
+  local tag label model effort window source signature
   case "$who" in
-    codex)  tag="$CODEX_MARKER_TAG";  label="$CODEX_LABEL"  ;;
-    claude) tag="$CLAUDE_MARKER_TAG"; label="$CLAUDE_LABEL" ;;
+    codex)
+      tag="$CODEX_MARKER_TAG"; label="$CODEX_LABEL"
+      model="${CODEX_MODEL:-gpt-5.6-sol}"
+      effort=$(resolve_codex_effort "$model" "${CODEX_EFFORT:-}")
+      window=$(resolve_codex_context_window "$model" "${CODEX_CONTEXT_WINDOW:-auto}")
+      source=$(context_window_source codex \
+        "${CODEX_CONTEXT_WINDOW:-auto}" "$window")
+      signature=$(ai_comment_signature \
+        "$(ai_model_display "$model")" "$(codex_effort_display "$effort")" "$window" "$source")
+      ;;
+    claude)
+      tag="$CLAUDE_MARKER_TAG"; label="$CLAUDE_LABEL"
+      model="${CLAUDE_MODEL:-fable}"
+      effort="${CLAUDE_EFFORT:-ultracode}"
+      window=$(resolve_claude_context_window "$model" "${CLAUDE_CONTEXT_WINDOW:-auto}")
+      source=$(context_window_source claude \
+        "${CLAUDE_CONTEXT_WINDOW:-auto}" "$window")
+      signature=$(ai_comment_signature \
+        "$(ai_model_display "$model")" "$(claude_effort_display "$effort")" "$window" "$source")
+      ;;
     *) die "unknown bot tag: $who" ;;
   esac
   local wrapped
-  wrapped=$(printf '<!-- %s iter=%d -->\n**[%s · iteration %d]**\n\n%s' \
-            "$tag" "$iter" "$label" "$iter" "$body")
+  wrapped=$(printf '<!-- %s iter=%d -->\n**[%s · iteration %d]**\n%s\n\n%s' \
+            "$tag" "$iter" "$label" "$iter" "$signature" "$body")
   case "$FORGE" in
     gitlab)
       jq -n --arg body "$wrapped" '{body: $body}' \
@@ -2253,7 +2419,18 @@ resolve_codex_root_session_id() {
 #                                        CLI's exit status lands in
 #                                        $CLAUDE_RUN_RC.
 
+claude_resolve_model_effort() {
+  # Pure resolution shared by prompt rendering and argv construction.  Keep it
+  # free of session/probe side effects: claude_turn needs truthful signature
+  # values before it renders the comment recipes, while finalize_turn only
+  # needs the CLI args.
+  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-fable}"
+  CLAUDE_EFFORT_RESOLVED="${CLAUDE_EFFORT:-ultracode}"
+}
+
 claude_prepare_cli() {
+  claude_resolve_model_effort
+
   # Persistent session: pin a UUID on iter 1 via --session-id, then --resume it.
   # This gives Claude its own internal memory of the whole review, on top of the
   # public PR thread it re-reads from disk each turn.
@@ -2273,7 +2450,6 @@ claude_prepare_cli() {
   # (default: fable — Claude Fable 5; the alias resolves to the latest model in
   # the claude CLI). "off" leaves the CLI/settings default untouched.
   CLAUDE_MODEL_ARG=()
-  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-fable}"
   case "$CLAUDE_MODEL_RESOLVED" in
     off|'') CLAUDE_MODEL_ARG=() ;;
     *)      CLAUDE_MODEL_ARG=(--model "$CLAUDE_MODEL_RESOLVED") ;;
@@ -2378,13 +2554,13 @@ claude_prepare_cli() {
   # The bypass-mode permission safety net rides in the same --settings payload.
   CLAUDE_EFFORT_ARG=()
   SETTINGS_PARTS=()
-  case "${CLAUDE_EFFORT:-ultracode}" in
+  case "$CLAUDE_EFFORT_RESOLVED" in
     ultracode)                 SETTINGS_PARTS+=('"ultracode": true') ;;
-    low|medium|high|xhigh|max) CLAUDE_EFFORT_ARG=(--effort "${CLAUDE_EFFORT}") ;;
+    low|medium|high|xhigh|max) CLAUDE_EFFORT_ARG=(--effort "$CLAUDE_EFFORT_RESOLVED") ;;
     off|'')                    ;;
-    *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT}' — using CLI default" ;;
+    *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT_RESOLVED}' — using CLI default" ;;
   esac
-  log "claude: effort = ${CLAUDE_EFFORT:-ultracode}"
+  log "claude: effort = ${CLAUDE_EFFORT_RESOLVED}"
   [[ -n "$CLAUDE_PERMISSIONS" ]] && SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS")
   CLAUDE_SETTINGS_ARG=()
   if (( ${#SETTINGS_PARTS[@]} > 0 )); then

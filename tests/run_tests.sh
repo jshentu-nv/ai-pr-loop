@@ -120,6 +120,12 @@ assert_line()      { if grep -Fxq -- "$2" "$1"; then ok; else bad "argv missing 
 assert_no_line()   { if grep -Fxq -- "$2" "$1"; then bad "argv unexpectedly contains: $2"; else ok; fi; }
 assert_no_substr() { if grep -Fq  -- "$2" "$1"; then bad "argv unexpectedly has substring: $2"; else ok; fi; }
 assert_substr()    { if grep -Fq  -- "$2" "$1"; then ok; else bad "file missing substring: $2"; fi; }
+assert_count() {  # file fixed-string expected-count
+  local got
+  got=$(grep -Fc -- "$2" "$1" 2>/dev/null || true)
+  if [[ "$got" -eq "$3" ]]; then ok
+  else bad "substring count for '$2' was $got, want $3"; fi
+}
 assert_pair() {  # file flag value — value must be the arg right after flag
   if awk -v f="$2" -v v="$3" 'prev==f && $0==v {found=1} {prev=$0} END {exit !found}' "$1"; then
     ok
@@ -260,6 +266,13 @@ EOF
 
 cat > "$STUBS/codex" <<'EOF'
 #!/usr/bin/env bash
+# Context-window discovery is metadata-only. Keep it out of the recorded turn
+# argv/session fixtures, just as the Claude permission probe is kept out of
+# its main-turn accounting above.
+if [[ "${1:-}" == "debug" && "${2:-}" == "models" && "${3:-}" == "--bundled" ]]; then
+  printf '%s\n' '{"models":[{"slug":"gpt-5.6-sol","context_window":272000,"effective_context_window_percent":95},{"slug":"gpt-5.6-terra","context_window":272000,"effective_context_window_percent":95}]}'
+  exit 0
+fi
 if [[ -n "${ARGV_FILE:-}" ]]; then
   : > "$ARGV_FILE"
   printf '%s\n' "$0" > "${ARGV_FILE}.exe"
@@ -861,6 +874,16 @@ assert_value_lacks "$ARGV" --settings acceptEdits
 assert_pair "$ARGV" --add-dir "$CASE_DIR/repo"
 assert_pair "$ARGV" --add-dir "$CASE_DIR/state"
 
+CLAUDE_DEFAULT_SIGNATURE='<sub>Model: <code>fable</code> · Effort: <code>xhigh (ultracode)</code> · Context window: <code>1000000 tokens (model default)</code></sub>'
+t "claude: github prompt signs every reply producer with resolved runtime metadata"
+assert_count "$CASE_DIR/state/iter-01/claude.prompt.md" "$CLAUDE_DEFAULT_SIGNATURE" 2
+t "claude: rendered prompt leaves no runtime-signature placeholder"
+if grep -qE '\{\{[^}]*SIGNATURE[^}]*\}\}' "$CASE_DIR/state/iter-01/claude.prompt.md" 2>/dev/null; then
+  bad "runtime-signature placeholder survived rendering"
+else
+  ok
+fi
+
 t "claude: fresh session pins --session-id"
 assert_pair "$ARGV" --session-id "$(cat "$CASE_DIR/state/claude.session.uuid")"
 assert_no_line "$ARGV" --resume
@@ -887,6 +910,24 @@ assert_no_line "$ARGV" --model
 assert_no_line "$ARGV" --effort
 assert_no_line "$ARGV" --settings
 assert_pair "$ARGV" --permission-mode auto
+
+t "claude: auto context does not invent a window for a CLI-selected model"
+assert_substr "$CASE_DIR/state/iter-01/claude.prompt.md" \
+  '<sub>Model: <code>CLI/config default</code> · Effort: <code>CLI/config default</code> · Context window: <code>unknown</code></sub>'
+
+t "claude: explicit context window is reflected in every github reply recipe"
+new_case claude-context-explicit
+run_turn claude CLAUDE_CONTEXT_WINDOW=200000
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/claude.prompt.md" \
+  '<sub>Model: <code>fable</code> · Effort: <code>xhigh (ultracode)</code> · Context window: <code>200000 tokens (configured)</code></sub>' 2
+
+t "claude: custom model keeps auto context truthful instead of borrowing fable's window"
+new_case claude-context-custom
+run_turn claude CLAUDE_MODEL=custom-model CLAUDE_EFFORT=high
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/claude.prompt.md" \
+  '<sub>Model: <code>custom-model</code> · Effort: <code>high</code> · Context window: <code>unknown</code></sub>' 2
 
 t "claude: bypass perms use skip-permissions plus the settings safety net"
 new_case claude-bypass
@@ -1059,6 +1100,16 @@ assert_line "$ARGV" --yolo
 assert_line "$ARGV" --skip-git-repo-check
 assert_no_line "$ARGV" resume
 
+CODEX_DEFAULT_SIGNATURE='<sub>Model: <code>gpt-5.6-sol</code> · Effort: <code>ultra</code> · Context window: <code>258400 tokens (bundled default)</code></sub>'
+t "codex: github prompt signs every finding, reply, and summary producer"
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" "$CODEX_DEFAULT_SIGNATURE" 5
+t "codex: rendered prompt leaves no runtime-signature placeholder"
+if grep -qE '\{\{[^}]*SIGNATURE[^}]*\}\}' "$CASE_DIR/state/iter-01/codex.prompt.md" 2>/dev/null; then
+  bad "runtime-signature placeholder survived rendering"
+else
+  ok
+fi
+
 t "codex: fresh run captures the session id from the rollout file"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
 
@@ -1076,6 +1127,10 @@ assert_rc0
 assert_pair "$ARGV" -m gpt-oss-120b
 assert_no_substr "$ARGV" model_reasoning_effort
 assert_pair "$ARGV" -c 'service_tier="fast"'
+
+t "codex: unknown model does not borrow the default model's context window"
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>gpt-oss-120b</code> · Effort: <code>CLI/config default</code> · Context window: <code>unknown</code></sub>' 5
 
 t "codex: explicit effort wins on non-sol model"
 new_case codex-alt-explicit
@@ -1098,6 +1153,42 @@ assert_no_line "$ARGV" -m
 assert_no_substr "$ARGV" model_reasoning_effort
 assert_no_substr "$ARGV" service_tier
 assert_line "$ARGV" --yolo
+
+t "codex: off knobs are labelled as CLI/config defaults, not model names"
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>CLI/config default</code> · Effort: <code>CLI/config default</code> · Context window: <code>unknown</code></sub>' 5
+
+t "codex: explicit context window wins over bundled model metadata"
+new_case codex-context-explicit
+run_turn codex CODEX_CONTEXT_WINDOW=131072
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>gpt-5.6-sol</code> · Effort: <code>ultra</code> · Context window: <code>131072 tokens (configured)</code></sub>' 5
+
+t "codex: signature rendering HTML-escapes model text without sed corruption"
+new_case codex-signature-escaping
+run_turn codex 'CODEX_MODEL=model&|\<tag>$(not-a-command)`also-not`%s' CODEX_EFFORT=high CODEX_CONTEXT_WINDOW=123456
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>model&amp;|&#92;&lt;tag&gt;&#36;(not-a-command)&#96;also-not&#96;&#37;s</code> · Effort: <code>high</code> · Context window: <code>123456 tokens (configured)</code></sub>' 5
+assert_no_substr "$CASE_DIR/state/iter-01/codex.prompt.md" '{{COMMENT_SIGNATURE}}'
+t "codex: hostile free-form model still leaves the github review recipe valid JSON"
+if awk '
+    /--input - <<'\''JSON'\''/ { body=1; next }
+    body && /^[[:space:]]*JSON$/ { exit }
+    body { sub(/^   /, ""); print }
+  ' "$CASE_DIR/state/iter-01/codex.prompt.md" | jq -e . >/dev/null 2>&1; then
+  ok
+else
+  bad "rendered github review JSON was corrupted by the model signature"
+fi
+
+t "codex: control bytes in a model selector are normalized in public metadata"
+new_case codex-signature-control
+run_turn codex $'CODEX_MODEL=control\033model' CODEX_EFFORT=high CODEX_CONTEXT_WINDOW=123456
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>control�model</code> · Effort: <code>high</code> · Context window: <code>123456 tokens (configured)</code></sub>' 5
 
 t "codex: seeded root session resumes with 'exec resume <id>'"
 new_case codex-resume
@@ -1212,6 +1303,15 @@ HW=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
   }
   latest_ai_comment_iter codex")
 assert_eq "$HW" 1
+
+t "resume high-water: runtime metadata after the exact banner preserves summary recognition"
+HW_META=$(env -i PATH="$STUBS:/usr/bin:/bin" "$BASH_BIN" -c "
+  . '$ROOT/lib/common.sh'
+  fetch_ai_thread() {
+    printf '%s\n' '{\"tag\":\"ai-loop:codex-reviewer\",\"iter\":4,\"surface\":\"issue\",\"in_reply_to_id\":null,\"body\":\"<!-- ai-loop:codex-reviewer iter=4 -->\\n\\n> [!IMPORTANT]\\n> **AUTOMATED REVIEW — AI agent (Codex Reviewer), iteration 4.**\\n> <sub>Model: <code>gpt-5.6-sol</code> · Effort: <code>ultra</code> · Context window: <code>258400 tokens (bundled default)</code></sub>\\nSummary text.\"}'
+  }
+  latest_ai_comment_iter codex")
+assert_eq "$HW_META" 4
 
 t "codex: turn fails when its summary never landed despite an APPROVED stdout"
 new_case codex-no-summary
@@ -2264,6 +2364,12 @@ else
 fi
 t "gitlab post_ai_comment: body carries the hidden marker"
 if grep -q 'ai-loop:codex-reviewer iter=2' "$PC_LOG" 2>/dev/null; then ok; else bad "marker missing from POST body"; fi
+t "gitlab post_ai_comment: helper-generated comments carry runtime metadata"
+if grep -Fq "$CODEX_DEFAULT_SIGNATURE" "$PC_LOG" 2>/dev/null; then
+  ok
+else
+  bad "runtime signature missing from POST body"
+fi
 
 t "codex gitlab: renders the gitlab prompt template with host + project id"
 new_case codex-gitlab
@@ -2279,6 +2385,14 @@ t "codex gitlab: prompt bans glab api for posting"
 if grep -q 'glab api' "$GL_PROMPT" 2>/dev/null; then ok; else bad "missing glab api warning"; fi
 t "codex gitlab: model knobs unchanged on the gitlab path"
 assert_pair "$ARGV" -m gpt-5.6-sol
+t "codex gitlab: every finding, reply, and summary recipe carries the signature"
+assert_count "$GL_PROMPT" "$CODEX_DEFAULT_SIGNATURE" 4
+t "codex gitlab: signature placeholder is fully rendered"
+if grep -qE '\{\{[^}]*SIGNATURE[^}]*\}\}' "$GL_PROMPT" 2>/dev/null; then
+  bad "runtime-signature placeholder survived rendering"
+else
+  ok
+fi
 
 t "codex gitlab: http scheme renders into the prompt API base"
 new_case codex-gitlab-http
@@ -2318,6 +2432,14 @@ else
 fi
 t "claude gitlab: inline finding carries its discussion_id"
 assert_eq "$(jq -r '.discussion_id' "$CASE_DIR/state/iter-01/codex-inline.ndjson" 2>/dev/null)" disc-inline
+t "claude gitlab: both inline and summary reply recipes carry the signature"
+assert_count "$GL_PROMPT" "$CLAUDE_DEFAULT_SIGNATURE" 2
+t "claude gitlab: signature placeholder is fully rendered"
+if grep -qE '\{\{[^}]*SIGNATURE[^}]*\}\}' "$GL_PROMPT" 2>/dev/null; then
+  bad "runtime-signature placeholder survived rendering"
+else
+  ok
+fi
 
 t "claude gitlab: http scheme renders into the prompt API base"
 new_case claude-gitlab-http
@@ -3009,6 +3131,30 @@ t "run.sh: unknown --claude-effort is rejected"
 run_run_sh 1 --repo o/n --claude-effort bogus
 assert_dies_with "--claude-effort must be one of"
 
+t "run.sh: empty --claude-context-window is rejected"
+run_run_sh 1 --repo o/n --claude-context-window ''
+assert_dies_with "--claude-context-window"
+
+t "run.sh: empty --codex-context-window is rejected"
+run_run_sh 1 --repo o/n --codex-context-window ''
+assert_dies_with "--codex-context-window"
+
+t "run.sh: --claude-context-window refuses the next flag as its value"
+run_run_sh 1 --repo o/n --claude-context-window --review-only
+assert_dies_with "--claude-context-window"
+
+t "run.sh: --codex-context-window refuses the next flag as its value"
+run_run_sh 1 --repo o/n --codex-context-window --review-only
+assert_dies_with "--codex-context-window"
+
+t "run.sh: nonnumeric --claude-context-window is rejected"
+run_run_sh 1 --repo o/n --claude-context-window huge
+assert_dies_with "--claude-context-window must be"
+
+t "run.sh: zero --codex-context-window is rejected"
+run_run_sh 1 --repo o/n --codex-context-window 0
+assert_dies_with "--codex-context-window must be"
+
 t "run.sh: empty --codex-model is rejected"
 run_run_sh 1 --repo o/n --codex-model ''
 assert_dies_with "--codex-model needs a model"
@@ -3504,9 +3650,21 @@ assert_prints "dir: $ROOT/checkouts/o__n"
 t "run.sh: default knobs resolve to sol @ ultra on fast"
 run_run_sh --repo o/n --print-config
 assert_prints "claude-bin: $STUBS/claude"
-assert_prints 'claude: model=fable effort=ultracode perms=auto'
+assert_prints 'claude: model=fable effort=ultracode perms=auto context-window=1000000 context-source=model-default'
 assert_prints "codex-bin: $STUBS/codex"
-assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast'
+assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast context-window=258400 context-source=bundled-default'
+
+t "run.sh: explicit numeric context windows are reported verbatim"
+run_run_sh --repo o/n --claude-context-window 200000 \
+  --codex-context-window 131072 --print-config
+assert_prints 'claude: model=fable effort=ultracode perms=auto context-window=200000 context-source=configured'
+assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast context-window=131072 context-source=configured'
+
+t "run.sh: explicit auto context windows resolve from the selected defaults"
+run_run_sh --repo o/n --claude-context-window auto \
+  --codex-context-window auto --print-config
+assert_prints 'claude: model=fable effort=ultracode perms=auto context-window=1000000 context-source=model-default'
+assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast context-window=258400 context-source=bundled-default'
 
 t "run.sh: executable flags override environment defaults without splitting paths"
 run_run_sh CLAUDE_BIN=env-claude CODEX_BIN=env-codex --repo o/n \
@@ -3530,11 +3688,11 @@ assert_prints "codex-bin: $ALT_CODEX"
 
 t "run.sh: non-sol model resolves to adaptive off (no forced level)"
 run_run_sh --repo o/n --codex-model gpt-oss-120b --print-config
-assert_prints 'codex: model=gpt-oss-120b effort=off tier=fast'
+assert_prints 'codex: model=gpt-oss-120b effort=off tier=fast context-window=unknown context-source=unknown'
 
 t "run.sh: explicit effort wins through run.sh's resolution"
 run_run_sh --repo o/n --codex-model gpt-oss-120b --codex-effort high --print-config
-assert_prints 'codex: model=gpt-oss-120b effort=high tier=fast'
+assert_prints 'codex: model=gpt-oss-120b effort=high tier=fast context-window=unknown context-source=unknown'
 
 # --- auto-resume: restart decision table -----------------------------------
 # The supervisor reads these files after every worker exit. Each row is
@@ -3686,7 +3844,7 @@ if [[ -e "$ROOT/state/o__n" ]]; then bad "--no-auto-resume still started a super
 t "run.sh: --print-config never starts a supervisor"
 rm -rf "$ROOT/state/o__n"
 run_run_sh_supervised 1 --repo o/n --print-config
-assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast'
+assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast context-window=258400 context-source=bundled-default'
 if [[ -e "$ROOT/state/o__n" ]]; then bad "--print-config started a supervisor"; else ok; fi
 
 t "run.sh: --preflight-only never starts a supervisor"

@@ -2,7 +2,7 @@
 # One Codex review iteration. Reads env: REPO_OWNER, REPO_NAME, PR_NUMBER,
 # REPO_DIR, BASE_REF, HEAD_REF, ITER, MAX_ITER, LOOP_HOME, STATE_DIR,
 # REVIEW_ONLY, HAS_CONTEXT, CONTEXT_FILE, CODEX_BIN, CODEX_MODEL,
-# CODEX_EFFORT, CODEX_TIER.
+# CODEX_EFFORT, CODEX_TIER, CODEX_CONTEXT_WINDOW.
 # Exits 0 if APPROVED, 2 if CHANGES_REQUESTED, 1 on error / no verdict found.
 set -euo pipefail
 
@@ -69,6 +69,50 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   SCOPE_NOTE="**Review-created diff.** Read \`${SCOPE_FILE}\` before filing findings. It separates the original change from paths changed by this review and flags paths newly brought into scope. Require a change-specific reason for every review-created path."
 fi
 
+# Resolve the reviewer's runtime knobs before rendering the prompt: the prompt
+# contains the exact signature that every public Codex comment/reply must carry.
+# These same resolved values build the CLI argv below, so the signed model and
+# effort can never drift from what the turn requested.
+CODEX_MODEL_ARG=()
+CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
+case "$CODEX_MODEL_RESOLVED" in
+  off|'') CODEX_MODEL_ARG=() ;;
+  *)      CODEX_MODEL_ARG=(-m "$CODEX_MODEL_RESOLVED") ;;
+esac
+(( ${#CODEX_MODEL_ARG[@]} > 0 )) && log "codex: model = ${CODEX_MODEL_RESOLVED}"
+
+CODEX_EFFORT_ARG=()
+CODEX_EFFORT_RESOLVED=$(resolve_codex_effort "$CODEX_MODEL_RESOLVED" "${CODEX_EFFORT:-}")
+case "$CODEX_EFFORT_RESOLVED" in
+  low|medium|high|xhigh|max|ultra) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
+  off)                             CODEX_EFFORT_ARG=() ;;
+  *)                               log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
+esac
+(( ${#CODEX_EFFORT_ARG[@]} > 0 )) && log "codex: reasoning effort = ${CODEX_EFFORT_RESOLVED}"
+
+CODEX_TIER_ARG=()
+CODEX_TIER_RESOLVED="${CODEX_TIER:-fast}"
+case "$CODEX_TIER_RESOLVED" in
+  off|'') CODEX_TIER_ARG=() ;;
+  *)      CODEX_TIER_ARG=(-c "service_tier=\"${CODEX_TIER_RESOLVED}\"") ;;
+esac
+(( ${#CODEX_TIER_ARG[@]} > 0 )) && log "codex: service tier = ${CODEX_TIER_RESOLVED}"
+
+if [[ "$LOCAL_MODE" == "1" ]]; then
+  CODEX_CONTEXT_WINDOW_RESOLVED=unknown
+elif [[ -z "${CODEX_CONTEXT_WINDOW_RESOLVED:-}" ]]; then
+  CODEX_CONTEXT_WINDOW_RESOLVED=$(resolve_codex_context_window \
+    "$CODEX_MODEL_RESOLVED" "${CODEX_CONTEXT_WINDOW:-auto}")
+fi
+CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
+  "${CODEX_CONTEXT_WINDOW:-auto}" "$CODEX_CONTEXT_WINDOW_RESOLVED")
+AI_COMMENT_SIGNATURE=$(ai_comment_signature \
+  "$(ai_model_display "$CODEX_MODEL_RESOLVED")" \
+  "$(codex_effort_display "$CODEX_EFFORT_RESOLVED")" \
+  "$CODEX_CONTEXT_WINDOW_RESOLVED" "$CODEX_CONTEXT_WINDOW_SOURCE")
+AI_COMMENT_SIGNATURE_SED=$(prompt_sed_replacement "$AI_COMMENT_SIGNATURE")
+log "codex: context window = ${CODEX_CONTEXT_WINDOW_RESOLVED}"
+
 
 # Render the prompt template. GitLab loops use the gitlab prompt variant —
 # same review contract, MR/discussions API commands (curl + PRIVATE-TOKEN)
@@ -112,6 +156,7 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{MODE_NOTE}}|${MODE_NOTE}|g" \
   -e "s|{{CONTEXT_NOTE}}|${CONTEXT_NOTE}|g" \
   -e "s|{{SCOPE_NOTE}}|${SCOPE_NOTE}|g" \
+  -e "s|{{AI_COMMENT_SIGNATURE}}|${AI_COMMENT_SIGNATURE_SED}|g" \
   > "$PROMPT_FILE"
 
 log "codex: iter $ITER — running"
@@ -152,43 +197,6 @@ if (( ${#CODEX_SUBCMD[@]} == 0 )); then
   SNAPSHOT_BEFORE="$ID/codex.sessions.before"
   snapshot_codex_sessions "$SNAPSHOT_BEFORE"
 fi
-
-# Model, reasoning effort, and service (speed) tier for the reviewer, set by
-# the orchestrator's --codex-model / --codex-effort / --codex-tier (defaults:
-# gpt-5.6-sol at ultra reasoning on the "fast" tier — 1.5x speed). Mapped to
-# `-m` / `-c model_reasoning_effort=...` / `-c service_tier=...` overrides,
-# which the CLI accepts on both fresh `exec` and `exec resume`. Each knob is
-# passed on every turn unless it resolves to "off" (explicitly, or via the
-# adaptive effort default below for models without a known ceiling), which
-# omits the override and leaves the host CLI/config default untouched.
-CODEX_MODEL_ARG=()
-CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
-case "$CODEX_MODEL_RESOLVED" in
-  off|'') CODEX_MODEL_ARG=() ;;
-  *)      CODEX_MODEL_ARG=(-m "$CODEX_MODEL_RESOLVED") ;;
-esac
-(( ${#CODEX_MODEL_ARG[@]} > 0 )) && log "codex: model = ${CODEX_MODEL_RESOLVED}"
-
-# Adaptive effort default: an unset/empty CODEX_EFFORT resolves per-model
-# (ultra for gpt-5.6-sol/-terra, otherwise 'off' — ceilings vary per model,
-# so no level is forced on models we don't know). Explicit values pass
-# verbatim. See resolve_codex_effort in lib/common.sh.
-CODEX_EFFORT_ARG=()
-CODEX_EFFORT_RESOLVED=$(resolve_codex_effort "$CODEX_MODEL_RESOLVED" "${CODEX_EFFORT:-}")
-case "$CODEX_EFFORT_RESOLVED" in
-  low|medium|high|xhigh|max|ultra) CODEX_EFFORT_ARG=(-c "model_reasoning_effort=\"${CODEX_EFFORT_RESOLVED}\"") ;;
-  off)                             CODEX_EFFORT_ARG=() ;;
-  *)                               log "codex: unknown CODEX_EFFORT='${CODEX_EFFORT_RESOLVED}' — using CLI/config default"; CODEX_EFFORT_ARG=() ;;
-esac
-(( ${#CODEX_EFFORT_ARG[@]} > 0 )) && log "codex: reasoning effort = ${CODEX_EFFORT_RESOLVED}"
-
-CODEX_TIER_ARG=()
-CODEX_TIER_RESOLVED="${CODEX_TIER:-fast}"
-case "$CODEX_TIER_RESOLVED" in
-  off|'') CODEX_TIER_ARG=() ;;
-  *)      CODEX_TIER_ARG=(-c "service_tier=\"${CODEX_TIER_RESOLVED}\"") ;;
-esac
-(( ${#CODEX_TIER_ARG[@]} > 0 )) && log "codex: service tier = ${CODEX_TIER_RESOLVED}"
 
 # Codex must be able to run gh + git, hence --yolo (autorun: the alias for
 # --dangerously-bypass-approvals-and-sandbox). (User explicitly requested

@@ -310,6 +310,7 @@ past a failed mutation as if it landed.
      -f body="$(cat <<'BODY'
    <!-- ai-loop:claude-implementer iter={{ITER}} -->
    **[AI · Claude Implementer · iter {{ITER}}]**
+   {{AI_COMMENT_SIGNATURE}}
 
    Fixed in <commit-sha>: <what changed>
    BODY
@@ -324,6 +325,7 @@ past a failed mutation as if it landed.
    jq -n --arg body "$(cat <<'BODY'
    <!-- ai-loop:claude-implementer iter={{ITER}} -->
    **[AI · Claude Implementer · iter {{ITER}}]**
+   {{AI_COMMENT_SIGNATURE}}
 
    Fixed in <commit-sha>: <what changed>
    BODY
@@ -336,6 +338,9 @@ past a failed mutation as if it landed.
 
    - The `<!-- ai-loop:claude-implementer iter={{ITER}} -->` marker **must**
      be the first line of every reply body. The orchestrator filters on it.
+   - The exact runtime-signature line shown in the recipes above **must**
+     immediately follow every visible AI header. Do not omit, reword, or
+     move it.
    - For fixes: cite the short commit SHA (`git rev-parse --short HEAD` after
      commit). One line is fine — the diff speaks for itself.
    - For pushback: state the disagreement and reasoning briefly. If a
@@ -360,6 +365,7 @@ past a failed mutation as if it landed.
 
    > [!NOTE]
    > **AUTOMATED REPLY — AI agent (Claude Implementer), iteration {{ITER}}.**
+   > {{AI_COMMENT_SIGNATURE}}
    > Posted by the `ai-pr-loop` automation under @{{GH_USER}}'s {{TOKEN_NOUN}}. **Not written by a human.** Both AI bots in this loop share that account; this comment is from the **Claude Implementer**. Code changes (if any) are committed by `claude-implementer (ai-bot)`.
 
    <your summary markdown here>
@@ -377,6 +383,7 @@ past a failed mutation as if it landed.
 
    > [!NOTE]
    > **AUTOMATED REPLY — AI agent (Claude Implementer), iteration {{ITER}}.**
+   > {{AI_COMMENT_SIGNATURE}}
    > Posted by the `ai-pr-loop` automation under @{{GH_USER}}'s {{TOKEN_NOUN}}. **Not written by a human.** Both AI bots in this loop share that account; this comment is from the **Claude Implementer**. Code changes (if any) are committed by `claude-implementer (ai-bot)`.
 
    <your summary markdown here>
@@ -391,7 +398,8 @@ past a failed mutation as if it landed.
    ```
 {{/gitlab}}
    The hidden HTML comment **must** be the very first line, exactly as
-   shown. Do not omit or alter it.
+   shown. Do not omit or alter it. The exact blockquoted runtime-signature
+   line shown above **must** immediately follow the automated-reply banner.
 
    Post the summary {{SUMMARY_NOUN}} **last**, after the inline replies — the
    orchestrator treats it as the completion marker for this iteration. It
@@ -402,6 +410,8 @@ past a failed mutation as if it landed.
    `> [!NOTE]` opener plus the banner line (`> **AUTOMATED REPLY — AI
    agent (Claude Implementer), iteration {{ITER}}.**`) must be the first
    visible lines — a further reason not to reword or reorder that block.
+   The runtime signature follows those legacy structural lines, so summaries
+   from older loop versions remain resumable.
    If the summary POST fails, fix it and retry until it lands.
 
 6. **Structure the summary body** like this:
