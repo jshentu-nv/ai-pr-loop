@@ -3244,8 +3244,12 @@ gen_uuid() {
     cat /proc/sys/kernel/random/uuid
   elif command -v uuidgen >/dev/null 2>&1; then
     uuidgen
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -NonInteractive -Command \
+      '[guid]::NewGuid().ToString()' \
+      | tr -d '\r'
   else
-    die "no UUID source available (need /proc/sys/kernel/random/uuid or uuidgen)"
+    die "no UUID source available (need /proc/sys/kernel/random/uuid, uuidgen, or PowerShell)"
   fi
 }
 
@@ -3285,6 +3289,27 @@ _codex_rollouts_since() {  # <snapshot file>
 # behind. It removes its own file, and this skip keeps a removal that failed
 # from handing the review's conversation to a session with no history.
 # Prints UUID on success; returns non-zero on failure.
+normalize_codex_cwd() {
+  local p="$1" drive rest
+  # Native Windows Codex records `D:\path` while Git Bash presents the same
+  # checkout as `/d/path`. Normalize only that unambiguous drive-path shape;
+  # leave ordinary POSIX paths untouched so Unix ownership checks stay exact.
+  if [[ "$p" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
+    drive="${BASH_REMATCH[1],,}"
+    rest="${BASH_REMATCH[2]//\\//}"
+    p="/${drive}/${rest}"
+  fi
+  while [[ "$p" != "/" && "$p" == */ ]]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
+
+codex_cwd_matches() {
+  local recorded="$1" expected="$2"
+  [[ -n "$recorded" && -n "$expected" ]] || return 1
+  [[ "$(normalize_codex_cwd "$recorded")" == \
+     "$(normalize_codex_cwd "$expected")" ]]
+}
+
 discover_new_codex_session_id() {
   local before="$1" want_cwd="${2:-}"
   local f meta id cwd
@@ -3297,7 +3322,7 @@ discover_new_codex_session_id() {
        == "$CODEX_METADATA_PROBE_PREFIX"* ]] && continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
-      [[ "$cwd" == "$want_cwd" ]] || continue
+      codex_cwd_matches "$cwd" "$want_cwd" || continue
     fi
     id=$(jq -er '.payload.id // empty' <<<"$meta" 2>/dev/null) || continue
     [[ -n "$id" ]] || continue
@@ -3382,7 +3407,7 @@ resolve_codex_root_session_id() {
          <<<"$found" >/dev/null 2>&1; then
       if [[ -n "$want_cwd" ]]; then
         cwd=$(jq -r '.payload.cwd // empty' <<<"$found" 2>/dev/null) || cwd=''
-        [[ "$cwd" == "$want_cwd" ]] || return 1
+        codex_cwd_matches "$cwd" "$want_cwd" || return 1
       fi
       printf '%s\n' "$id"
       return 0
@@ -3580,7 +3605,7 @@ claude_run_prompt() {
         --add-dir "$REPO_DIR" \
         --add-dir "$STATE_DIR" \
         --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
-        "$(cat "$_CLAUDE_PROMPT_FILE")" \
+        < "$_CLAUDE_PROMPT_FILE" \
         > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
   }
 

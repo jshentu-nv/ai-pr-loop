@@ -106,6 +106,7 @@ unset CDPATH
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+BASH_BIN="$(command -v bash)"
 
 PASS=0
 FAIL=0
@@ -113,7 +114,11 @@ CURRENT=""
 
 t()   { CURRENT="$1"; }
 ok()  { PASS=$((PASS + 1)); }
-bad() { FAIL=$((FAIL + 1)); printf 'FAIL: %s — %s\n' "$CURRENT" "$1" >&2; }
+bad() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: %s — %s\n' "$CURRENT" "$1" >&2
+  [[ "${AI_PR_LOOP_TEST_FAIL_FAST:-0}" != "1" ]] || exit 1
+}
 
 # Argv files hold one argument per line.
 assert_line()      { if grep -Fxq -- "$2" "$1"; then ok; else bad "argv missing exact arg: $2"; fi; }
@@ -134,17 +139,141 @@ assert_pair() {  # file flag value — value must be the arg right after flag
   fi
 }
 assert_eq() { if [[ "$1" == "$2" ]]; then ok; else bad "got '$1', want '$2'"; fi; }
-# Scoped to a single flag's value (the claude prompt rides in argv, so
-# whole-file substring checks would match prompt prose).
+# Scoped to a single flag's value.
 flag_value() { awk -v f="$2" 'prev==f {print; exit} {prev=$0}' "$1"; }
 assert_value_has()   { local v; v=$(flag_value "$1" "$2"); if [[ "$v" == *"$3"* ]]; then ok; else bad "$2 value missing '$3' (got: $v)"; fi; }
 assert_value_lacks() { local v; v=$(flag_value "$1" "$2"); if [[ "$v" == *"$3"* ]]; then bad "$2 value unexpectedly has '$3'"; else ok; fi; }
 assert_rc0() { if [[ "$TURN_RC" -eq 0 ]]; then ok; else bad "turn exited rc=$TURN_RC (log: $(tail -3 "$CASE_DIR/turn.log" 2>/dev/null | tr '\n' ' '))"; fi; }
 
+# --- repository controller contract ---------------------------------------
+
+t "agent contract: root AGENTS requires the canonical skill before actions"
+assert_substr "$ROOT/AGENTS.md" '.agents/skills/ai-pr-review/SKILL.md'
+
+t "agent contract: root AGENTS forbids finalizing an active review"
+assert_substr "$ROOT/AGENTS.md" 'Never send a final response while a review is active'
+
+t "agent contract: Codex-native skill is discoverable"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'Non-negotiable controller contract'
+
+t "agent contract: Claude entry points at the canonical skill"
+assert_substr "$ROOT/.claude/skills/ai-pr-review/SKILL.md" '../../../.agents/skills/ai-pr-review/SKILL.md'
+
+t "agent contract: no-Monitor fallback is fail-closed"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'Do not launch an unmonitored background review'
+
+t "agent contract: fallback explicitly keeps the assistant turn open"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'Do not send a final response between polls'
+
+t "UUID generation: a fresh session id is available on this platform"
+UUID_TEST_BIN="$WORK/uuid-test-bin"
+mkdir -p "$UUID_TEST_BIN"
+REAL_POWERSHELL="$(command -v powershell.exe 2>/dev/null || true)"
+if [[ -n "$REAL_POWERSHELL" ]]; then
+  cat > "$UUID_TEST_BIN/powershell.exe" <<EOF
+#!/usr/bin/env bash
+exec "$REAL_POWERSHELL" "\$@"
+EOF
+  chmod +x "$UUID_TEST_BIN/powershell.exe"
+fi
+UUID_VALUE=$(env -i PATH="$UUID_TEST_BIN:/usr/bin:/bin" "$BASH_BIN" -c \
+  ". '$ROOT/lib/common.sh'; gen_uuid")
+if [[ "$UUID_VALUE" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+  ok
+else
+  bad "invalid UUID: '$UUID_VALUE'"
+fi
+
+MON_STATE="$WORK/agent-monitor-state"
+MON_CURSOR="$WORK/agent-monitor.cursor"
+MON_HEARTBEAT="$WORK/agent-monitor.heartbeat"
+MON_REPORT="$MON_STATE/iter-01/codex-report.md"
+mkdir -p "$(dirname "$MON_REPORT")"
+printf '%s\n' 'finding one' 'APPROVED after fix' > "$MON_REPORT"
+printf '%s\n' \
+  '[ai-loop 00:00:00] noise' \
+  '[ai-loop 00:00:01] ===== Iteration 1 =====' \
+  "[ai-loop 00:00:02] codex: iter 1 report (2 lines) -> $MON_REPORT" \
+  > "$MON_STATE/supervisor.log"
+
+t "agent_status: emits new high-signal lines and the saved report"
+MON_OUT=$(bash "$ROOT/agent_status.sh" "$MON_STATE" "$MON_CURSOR" 0 "$MON_HEARTBEAT")
+MON_RC=$?
+if [[ "$MON_RC" -eq 0 ]]; then ok; else bad "agent_status exited $MON_RC"; fi
+assert_substr <(printf '%s\n' "$MON_OUT") '===== Iteration 1 ====='
+assert_substr <(printf '%s\n' "$MON_OUT") 'finding one'
+assert_substr <(printf '%s\n' "$MON_OUT") 'APPROVED after fix'
+assert_no_substr <(printf '%s\n' "$MON_OUT") 'noise'
+
+t "agent_status: advances its cursor and suppresses no-change output"
+MON_OUT2=$(bash "$ROOT/agent_status.sh" "$MON_STATE" "$MON_CURSOR" 0 "$MON_HEARTBEAT")
+MON_RC2=$?
+if [[ "$MON_RC2" -eq 3 && -z "$MON_OUT2" ]]; then ok
+else bad "no-change poll rc=$MON_RC2 output='$MON_OUT2'"; fi
+
+t "agent_status: monitoring refreshes the guard heartbeat"
+if [[ -s "$MON_CURSOR" && -e "$MON_HEARTBEAT" ]]; then ok
+else bad "cursor or heartbeat was not published"; fi
+
+GUARD_HEARTBEAT="$WORK/agent-guard.heartbeat"
+GUARD_STOPPED="$WORK/agent-guard.stopped"
+t "agent_guard: an expired monitoring lease stops the guarded run"
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=1 \
+AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS=1 \
+  bash "$ROOT/agent_guard.sh" "$GUARD_HEARTBEAT" 1 -- \
+    bash -c 'trap '"'"'printf stopped > "$1"; exit 0'"'"' TERM; while :; do sleep 1; done' \
+    _ "$GUARD_STOPPED" >/dev/null 2>&1
+GUARD_RC=$?
+if [[ "$GUARD_RC" -eq 124 && -s "$GUARD_STOPPED" ]]; then ok
+else bad "guard rc=$GUARD_RC stopped=$(test -s "$GUARD_STOPPED" && echo yes || echo no)"; fi
+
+if [[ "${AI_PR_LOOP_TEST_CONTRACT_ONLY:-0}" == "1" ]]; then
+  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  (( FAIL == 0 )) || exit 1
+  exit 0
+fi
+
 # --- stubs ---------------------------------------------------------------
 
 STUBS="$WORK/bin"
 mkdir -p "$STUBS"
+
+REAL_JQ="$(command -v jq 2>/dev/null || true)"
+if [[ -z "$REAL_JQ" ]]; then
+  printf 'tests require jq on PATH\n' >&2
+  exit 1
+fi
+REAL_GIT="$(command -v git 2>/dev/null || true)"
+if [[ -z "$REAL_GIT" ]]; then
+  printf 'tests require git on PATH\n' >&2
+  exit 1
+fi
+REAL_GIT_DIR="${REAL_GIT%/*}"
+cat > "$STUBS/jq" <<EOF
+#!/usr/bin/env bash
+set -o pipefail
+"$REAL_JQ" "\$@" | tr -d '\\r'
+EOF
+cat > "$STUBS/git" <<EOF
+#!/usr/bin/env bash
+exec "$REAL_GIT" "\$@"
+EOF
+cat > "$STUBS/uuidgen" <<'EOF'
+#!/usr/bin/env bash
+printf '00000000-0000-4000-8000-%04x%04x%04x\n' \
+  "$RANDOM" "$RANDOM" "$RANDOM"
+EOF
+chmod +x "$STUBS/jq" "$STUBS/git" "$STUBS/uuidgen"
+
+# Native Windows jq writes CRLF even under Git Bash. Normalize only the test
+# runner's jq stdout so string assertions behave the same on every platform;
+# child fixtures use the STUBS/jq wrapper above.
+jq() {
+  local jq_rc
+  "$REAL_JQ" "$@" | tr -d '\r'
+  jq_rc=${PIPESTATUS[0]}
+  return "$jq_rc"
+}
 
 cat > "$STUBS/claude" <<'EOF'
 #!/usr/bin/env bash
@@ -223,11 +352,17 @@ if [[ -n "${ARGV_FILE:-}" ]]; then
   : > "$ARGV_FILE"
   printf '%s\n' "$0" > "${ARGV_FILE}.exe"
   for a in "$@"; do printf '%s\n' "$a" >> "$ARGV_FILE"; done
+  cat > "${ARGV_FILE}.stdin"
   printf 'x' >> "${ARGV_FILE}.calls"   # 1 byte per invocation
   # Record the background-task wait ceiling the turn script exported; without
   # it headless claude drops the final message (and the completion marker)
   # when a backgrounded build outlives the CLI's 600s default.
   printf '%s\n' "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}" > "${ARGV_FILE}.bgwait"
+fi
+if [[ -n "${ARGV_FILE:-}" ]]; then
+  STUB_PROMPT=$(cat "${ARGV_FILE}.stdin")
+else
+  STUB_PROMPT=$(cat)
 fi
 [[ -z "${AGENT_EXE_LOG:-}" ]] \
   || printf 'claude\t%s\n' "$0" >> "$AGENT_EXE_LOG"
@@ -261,9 +396,8 @@ fi
 # The finalize turn of a local review: compose the squashed commit's message
 # (its own prompt, its own marker). STUB_NO_FINALIZE_MSG=1 prints the marker
 # without writing the file — the shape a crashed compose leaves behind.
-for a in "$@"; do
-  case "$a" in
-    *"Finalize the local review"*)
+case "$STUB_PROMPT" in
+  *"Finalize the local review"*)
       if [[ "${STUB_NO_FINALIZE_MSG:-0}" != "1" ]]; then
         mkdir -p "$STATE_DIR/local"
         printf '%s\n' "${STUB_FINALIZE_MSG:-Squashed subject line}" \
@@ -292,8 +426,7 @@ for a in "$@"; do
       echo "[CLAUDE_FINALIZE: COMPLETE]"
       exit 0
       ;;
-  esac
-done
+esac
 # Local review mode: the turn's contract is a written response file, not a
 # comment. STUB_NO_LOCAL_ARTIFACT=1 (both bots) and STUB_NO_CLAUDE_LOCAL_ARTIFACT=1
 # (this bot only) print the marker without writing it.
@@ -886,7 +1019,8 @@ run_run_sh_supervised() {
   while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
   # ${arr[@]+...} keeps the empty-array expansion safe under `set -u` on
   # bash 3.2 (stock macOS).
-  env -i PATH="${SUP_PATH:-$STUBS:/usr/bin:/bin}" HOME="$WORK" ${envs[@]+"${envs[@]}"} \
+  env -i PATH="${SUP_PATH:-$STUBS:/usr/bin:/bin}" HOME="$WORK" REAL_GIT="$REAL_GIT" \
+    ${envs[@]+"${envs[@]}"} \
     bash "$ROOT/run.sh" "$@" > "$WORK/run.out" 2> "$WORK/run.err"
   RUN_RC=$?
 }
@@ -897,7 +1031,8 @@ SUP_PATH=""
 run_run_sh() {
   local envs=()
   while [[ $# -gt 0 && "$1" == [A-Z_]*=* ]]; do envs+=("$1"); shift; done
-  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" ${envs[@]+"${envs[@]}"} \
+  env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" REAL_GIT="$REAL_GIT" \
+    ${envs[@]+"${envs[@]}"} \
     bash "$ROOT/run.sh" "$@" --no-auto-resume > "$WORK/run.out" 2> "$WORK/run.err"
   RUN_RC=$?
 }
@@ -1032,9 +1167,17 @@ if (( SECONDS - WD_START < 10 )); then ok; else bad "kill took $((SECONDS - WD_S
 
 FBIN="$WORK/fallback-bin"
 mkdir -p "$FBIN"
-ln -s "$(command -v sleep)" "$FBIN/sleep"
-ln -s "$(command -v head)" "$FBIN/head"
-BASH_BIN="$(command -v bash)"
+REAL_SLEEP="$(command -v sleep)"
+REAL_HEAD="$(command -v head)"
+cat > "$FBIN/sleep" <<EOF
+#!$BASH_BIN
+exec "$REAL_SLEEP" "\$@"
+EOF
+cat > "$FBIN/head" <<EOF
+#!$BASH_BIN
+exec "$REAL_HEAD" "\$@"
+EOF
+chmod +x "$FBIN/sleep" "$FBIN/head"
 
 t "watchdog: fallback without timeout/gtimeout passes through exit status"
 if env -i PATH="$FBIN" "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; run_with_timeout 5 sleep 0"; then
@@ -1338,6 +1481,29 @@ printf '{"payload":{"id":"root-b-uuid","cwd":"/checkout-b","source":"exec"}}\n' 
 t "discover: interleaved roots — cwd binding picks this checkout's root"
 assert_eq "$(CODEX_HOME="$DISC3" discover_new_codex_session_id "$DISC3/before-empty" /checkout-b)" root-b-uuid
 
+t "codex cwd: native Windows and Git-Bash drive paths are equivalent"
+if codex_cwd_matches 'D:\src\repo' /d/src/repo; then
+  ok
+else
+  bad "equivalent Windows/MSYS paths differed"
+fi
+
+t "codex cwd: distinct Windows drive paths remain distinct"
+if codex_cwd_matches 'D:\src\repo-a' /d/src/repo-b; then
+  bad "distinct Windows/MSYS paths matched"
+else
+  ok
+fi
+
+DISC4="$WORK/discover-win-cwd"
+mkdir -p "$DISC4/sessions"
+: > "$DISC4/before-empty"
+printf '%s\n' '{"payload":{"id":"win-root-uuid","cwd":"D:\\src\\repo","source":"exec"}}' \
+  > "$DISC4/sessions/rollout-2026-01-01T00-00-01-root.jsonl"
+
+t "discover: binds a native Windows rollout cwd to its Git-Bash checkout"
+assert_eq "$(CODEX_HOME="$DISC4" discover_new_codex_session_id "$DISC4/before-empty" /d/src/repo)" win-root-uuid
+
 t "discover: cwd binding fails closed on rollouts without a cwd (older codex)"
 if CODEX_HOME="$DISC2" discover_new_codex_session_id "$DISC2/before-empty" /anywhere >/dev/null 2>&1; then
   bad "unexpectedly captured a root that cannot prove checkout ownership"
@@ -1393,6 +1559,9 @@ printf '{"payload":{"id":"sub3-uuid","source":{"subagent":{"thread_spawn":{"pare
 
 t "resolve-session: root id resolves to itself"
 assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id root-uuid)" root-uuid
+
+t "resolve-session: validates a native Windows root against Git-Bash cwd"
+assert_eq "$(CODEX_HOME="$DISC4" resolve_codex_root_session_id win-root-uuid /d/src/repo)" win-root-uuid
 
 t "resolve-session: sub-agent id migrates to its parent root"
 assert_eq "$(CODEX_HOME="$DISC" resolve_codex_root_session_id sub-uuid)" root-uuid
@@ -1452,6 +1621,8 @@ assert_no_line "$ARGV" --dangerously-skip-permissions
 assert_value_lacks "$ARGV" --settings acceptEdits
 assert_pair "$ARGV" --add-dir "$CASE_DIR/repo"
 assert_pair "$ARGV" --add-dir "$CASE_DIR/state"
+assert_no_substr "$ARGV" '# Claude Implementer turn'
+assert_substr "$ARGV.stdin" '# Claude Implementer turn'
 
 CLAUDE_DEFAULT_SIGNATURE='<sub>Model: <code>claude-fable-5</code> · Effort: <code>xhigh (ultracode)</code> · Context window: <code>1000000 tokens (effective)</code></sub>'
 t "claude: github prompt signs every reply producer with resolved runtime metadata"
@@ -2659,7 +2830,7 @@ t "gitlab thread: a marked note on page 2 survives a clamped page size"
 GLCT_RC=0
 GLCT=$(env -i PATH="$STUBS:/usr/bin:/bin" ITER=1 STUB_GL_CLAMPED_THREAD=1 "$BASH_BIN" -c \
   "$GL_ENV; . '$ROOT/lib/common.sh'; fetch_ai_thread" 2>/dev/null) || GLCT_RC=$?
-GLCT_IDS=$(jq -r '.id' <<<"$GLCT" | tr '\n' ' ')
+GLCT_IDS=$(jq -r '.id' <<<"$GLCT" | tr -d '\r' | tr '\n' ' ')
 if [[ "$GLCT_RC" == 0 && " $GLCT_IDS " == *" 201 "* && " $GLCT_IDS " == *" 202 "* ]]; then
   ok
 else
@@ -3426,7 +3597,7 @@ sync_setup() {  # <head-branch> -> $SYNC_REMOTE $SYNC_CLONE $SYNC_SEED $SYNC_HEA
   SYNC_CLONE="$WORK/$n-clone"; git clone -q "$SYNC_REMOTE" "$SYNC_CLONE"
 }
 sync_run() {  # <head-ref> [VAR=VAL ...]
-  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     REPO_DIR="$SYNC_CLONE" BASE_REF=main HEAD_REF="$1" "${@:2}" \
     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1
 }
@@ -3530,7 +3701,7 @@ else ok; fi
 
 t "sync: after the first clean --dir sync, agent-turn artifacts are cleaned, not fatal"
 sync_setup feature/x
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SYNC_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c '
        . "$1/lib/common.sh"
@@ -3577,7 +3748,7 @@ printf 'w.txt text eol=lf\n' > "$EOL_SEED/.gitattributes"
 git -C "$EOL_SEED" add .gitattributes; git -C "$EOL_SEED" commit -qm attrs   # no renormalize
 git -C "$EOL_SEED" push -q "$EOL_REMOTE" HEAD:refs/heads/feature/x
 EOL_CLONE="$WORK/$EOLN-clone"; git clone -q "$EOL_REMOTE" "$EOL_CLONE"
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$EOL_CLONE" BASE_REF=main HEAD_REF=feature/x \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "sync accepted eol-renormalization dirt that git add -A would publish"
@@ -3605,7 +3776,7 @@ SMI_CLONE="$WORK/$SMIN-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SMI_REMOTE" "$SMI_CLONE"
 git -C "$SMI_CLONE/dep" checkout -q "$SMI_S2"          # caller drifted the gitlink
 git -C "$SMI_CLONE" config submodule.dep.ignore all    # ...and their config hides it
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SMI_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "submodule.<name>.ignore=all hid the drifted gitlink from the --dir dirt guard"
@@ -3625,7 +3796,7 @@ git -C "$HK_SEED" push -q "$HK_REMOTE" HEAD:refs/heads/feature/x
 HK_CLONE="$WORK/$HKN-clone"; git clone -q "$HK_REMOTE" "$HK_CLONE"   # clean, at base
 printf '#!/bin/sh\ntouch generated.txt\n' > "$HK_CLONE/.git/hooks/post-checkout"
 chmod +x "$HK_CLONE/.git/hooks/post-checkout"
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$HK_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
    && [[ "$(git -C "$HK_CLONE" rev-parse HEAD)" == "$HK_HEAD" ]] \
@@ -3649,7 +3820,7 @@ SMH_CLONE="$WORK/$SMH-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SMH_REMOTE" "$SMH_CLONE"
 echo caller-data > "$SMH_CLONE/dep/notes.txt"          # caller's untracked file inside dep
 git -C "$SMH_CLONE/dep" config status.showUntrackedFiles no   # ...hidden by inner config
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SMH_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "inner config hid caller's untracked submodule file (later trusted syncs would delete it)"
@@ -3679,7 +3850,7 @@ git -C "$SMM_SEED" push -q "$SMM_REMOTE" HEAD:refs/heads/feature/x
 SMM_CLONE="$WORK/$SMM-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SMM_REMOTE" "$SMM_CLONE"
 git -C "$SMM_CLONE/dep" checkout -q -b callerwork      # caller branch at recorded D2
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SMM_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
    && [[ "$(git -C "$SMM_CLONE/dep" rev-parse refs/heads/callerwork)" == "$SMM_D2" ]] \
@@ -3705,7 +3876,7 @@ git -C "$FSM_CLONE" status --porcelain >/dev/null         # ...while the tree is
 echo caller-edit >> "$FSM_CLONE/f"                        # NOW the hook hides this edit
 if [[ -n "$(git -C "$FSM_CLONE" status --porcelain)" ]]; then
   bad "test precondition failed: the fsmonitor hook did not hide the edit from status"
-elif env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+elif env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$FSM_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "an fsmonitor hook hid the caller's tracked edit from the --dir dirt guard"
@@ -3722,7 +3893,7 @@ git -C "$FST_SEED" push -q "$FST_REMOTE" HEAD:refs/heads/main
 git -C "$FST_SEED" push -q "$FST_REMOTE" HEAD:refs/heads/feature/x
 FST_CLONE="$WORK/$FST-clone"; git clone -q "$FST_REMOTE" "$FST_CLONE"
 printf '#!/bin/sh\nprintf "v2tok\\0"\n' > "$FST_CLONE/.git/fsmon"; chmod +x "$FST_CLONE/.git/fsmon"
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$FST_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c '
        . "$1/lib/common.sh"
@@ -3748,7 +3919,7 @@ git -C "$SPC_SEED" push -q "$SPC_REMOTE" HEAD:refs/heads/main
 git -C "$SPC_SEED" push -q "$SPC_REMOTE" HEAD:refs/heads/feature/x
 SPC_CLONE="$WORK/$SPC-clone"; git clone -q "$SPC_REMOTE" "$SPC_CLONE"
 git -C "$SPC_CLONE" sparse-checkout set dirA 2>/dev/null
-SPC_ERR=$(env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+SPC_ERR=$(env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     REPO_DIR="$SPC_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" 2>&1) && SPC_RC=0 || SPC_RC=$?
 if [[ "$SPC_RC" != 0 ]] && grep -q 'sparse-checkout disable' <<< "$SPC_ERR"; then ok
@@ -3771,7 +3942,7 @@ SAU_CLONE="$WORK/$SAU-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SAU_REMOTE" "$SAU_CLONE"
 echo hidden-edit >> "$SAU_CLONE/dep/g"
 git -C "$SAU_CLONE/dep" update-index --assume-unchanged g   # invisible to every status
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SAU_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "an assume-unchanged submodule edit passed the --dir guard (later syncs destroy it)"
@@ -3790,13 +3961,13 @@ AUW_CLONE="$WORK/$AUW-clone"; git clone -q "$AUW_REMOTE" "$AUW_CLONE"   # at hea
 echo hidden-edit >> "$AUW_CLONE/f"
 git -C "$AUW_CLONE" update-index --assume-unchanged f   # status now empty
 AUW_OK=1
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     REPO_DIR="$AUW_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 && AUW_OK=0
 grep -q hidden-edit "$AUW_CLONE/f" || AUW_OK=0
 git -C "$AUW_CLONE" update-index --no-assume-unchanged f
 git -C "$AUW_CLONE" update-index --skip-worktree f      # same hazard, other bit
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     REPO_DIR="$AUW_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
     "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 && AUW_OK=0
 grep -q hidden-edit "$AUW_CLONE/f" || AUW_OK=0
@@ -3827,7 +3998,7 @@ git -C "$SIG_SEED" push -q "$SIG_REMOTE" HEAD:refs/heads/feature/x
 SIG_CLONE="$WORK/$SIG-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SIG_REMOTE" "$SIG_CLONE"
 echo caller-private > "$SIG_CLONE/dep/secret"          # ignored at D1: probes clean
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SIG_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "--dir sync silently replaced the caller's ignored file inside the submodule"
@@ -3854,7 +4025,7 @@ git -C "$SME_SEED" push -q "$SME_REMOTE" HEAD:refs/heads/feature/x
 SME_CLONE="$WORK/$SME-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SME_REMOTE" "$SME_CLONE"
 SME_HEAD=$(git -C "$SME_SEED" rev-parse HEAD)
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SME_CLONE" BASE_REF=main HEAD_REF=feature/x \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
    && [[ "$(git -C "$SME_CLONE" rev-parse HEAD)" == "$SME_HEAD" ]]; then ok
@@ -3877,7 +4048,7 @@ SMC_CLONE="$WORK/$SMC-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SMC_REMOTE" "$SMC_CLONE"
 echo tampered >> "$SMC_CLONE/dep/g"                    # tracked edit inside submodule
 echo cache > "$SMC_CLONE/dep/generated.cache"          # untracked artifact inside submodule
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SMC_CLONE" BASE_REF=main HEAD_REF=feature/x \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
    && [[ ! -e "$SMC_CLONE/dep/generated.cache" ]] \
@@ -3914,7 +4085,7 @@ git -C "$SUB_SEED" push -q "$SUB_REMOTE" HEAD:refs/heads/feature/x
 SUB_CLONE="$WORK/$SUBN-clone"
 git -c protocol.file.allow=always clone -q --recurse-submodules "$SUB_REMOTE" "$SUB_CLONE"
 git -C "$SUB_CLONE/dep" checkout -q "$SUB_S2"          # drift the submodule HEAD
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$SUB_CLONE" BASE_REF=main HEAD_REF=feature/x \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1 \
    && [[ "$(git -C "$SUB_CLONE/dep" rev-parse HEAD)" == "$SUB_S1" ]]; then ok
@@ -3933,7 +4104,7 @@ git -C "$IGN_SEED" commit -qm "track secret"
 git -C "$IGN_SEED" push -q "$IGN_REMOTE" HEAD:refs/heads/feature/x
 IGN_CLONE="$WORK/$IGN-clone"; git clone -q "$IGN_REMOTE" "$IGN_CLONE"   # at base
 echo caller-private > "$IGN_CLONE/secret"              # ignored: porcelain empty
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      REPO_DIR="$IGN_CLONE" BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_pr_head" >/dev/null 2>&1; then
   bad "--dir sync silently overwrote the caller's ignored file"
@@ -4741,7 +4912,7 @@ cat > "$AR_BIN/git" <<'EOF'
 #!/usr/bin/env bash
 # Real git everywhere except the PR-head fetch, which fails.
 for a in "$@"; do [[ "$a" == "fetch" ]] && exit 1; done
-exec /usr/bin/git "$@"
+exec "$REAL_GIT" "$@"
 EOF
 chmod +x "$AR_BIN/git"
 AR_REPO="$WORK/ar-repo"
@@ -4780,7 +4951,7 @@ for a in "$@"; do
     exit 1
   fi
 done
-exec /usr/bin/git "$@"
+exec "$REAL_GIT" "$@"
 EOF
 chmod +x "$AR_LR_BIN/git"
 rm -rf "$ROOT/state/gl.example__g__p"
@@ -4789,10 +4960,15 @@ rm -rf "$ROOT/state/gl.example__g__p"
 mkdir -p "$ROOT/state/gl.example__g__p/pr-9"
 printf 'RUNS=9\nSTREAK=9\n' > "$ROOT/state/gl.example__g__p/pr-9/worker.progress"
 rm -f "$WORK/ar-lr-count"
+# Git Bash process startup is materially slower than a native Unix fork.
+# Keep ordinary retries comfortably below the long-run threshold, then make
+# only the selected third attempt cross it.
+AR_LR_THRESHOLD=15
+AR_LR_SLOW_SECS=16
 SUP_PATH="$AR_LR_BIN:$STUBS:/usr/bin:/bin"
 run_run_sh_supervised STUB_MR_OPEN=1 AUTO_RESUME_BACKOFF_FLOOR=1 \
-  AUTO_RESUME_LONG_RUN=3 STUB_FETCH_COUNT_FILE="$WORK/ar-lr-count" \
-  STUB_FETCH_SLOW_ON=3 STUB_FETCH_SLOW_SECS=4 \
+  AUTO_RESUME_LONG_RUN="$AR_LR_THRESHOLD" STUB_FETCH_COUNT_FILE="$WORK/ar-lr-count" \
+  STUB_FETCH_SLOW_ON=3 STUB_FETCH_SLOW_SECS="$AR_LR_SLOW_SECS" \
   https://gl.example/g/p/-/merge_requests/9 --dir "$AR_REPO" --auto-resume 3
 SUP_PATH=""
 assert_substr "$AR_GL_LOG" "restart 2/3 in 2s"
@@ -4822,7 +4998,7 @@ for a in "$@"; do
     exit 1
   fi
 done
-exec /usr/bin/git "$@"
+exec "$REAL_GIT" "$@"
 EOF
 chmod +x "$AR_CTX_BIN/git"
 AR_CTX_FILE="$WORK/ar-ctx-note.md"
@@ -5175,7 +5351,7 @@ for a in "$@"; do
     exec sleep 120
   fi
 done
-exec /usr/bin/git "$@"
+exec "$REAL_GIT" "$@"
 EOF
 chmod +x "$AR_LIVE_BIN/git"
 AR_LIVE_REPO="$WORK/ar-live-repo"
@@ -5614,7 +5790,7 @@ for a in "$@"; do
   if (( fetching == 1 )) && [[ "$a" == "origin" ]]; then a="$STUB_GIT_REMOTE"; fi
   args+=("$a")
 done
-exec /usr/bin/git "${args[@]}"
+exec "$REAL_GIT" "${args[@]}"
 EOF
 chmod +x "$AR_APP_BIN/git"
 AR_APP_REMOTE="$WORK/ar-approve-remote.git"
@@ -6485,7 +6661,7 @@ scope_run() {  # <dest> [VAR=VALUE ...] — write the scope report, isolated
   local dest="$1"; shift
   # set -euo pipefail: the same shell flags the turn scripts run the
   # function under. Later VAR=VALUE words override the defaults.
-  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" "$@" \
     "$BASH_BIN" -c "set -euo pipefail; . '$ROOT/lib/common.sh'; local_write_scope_report '$dest'"
 }
@@ -7080,7 +7256,7 @@ mkdir -p "$LF_CLONE/.git/hooks"
 printf '#!/bin/sh\ntouch generated.txt\n' > "$LF_CLONE/.git/hooks/post-index-change"
 chmod +x "$LF_CLONE/.git/hooks/post-index-change"
 printf 'stray\n' >> "$LF_CLONE/f"          # dirty the index so the probe rewrites it
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
   LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
   MANAGED_CLONE=0 \
   "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; force_clean_to_commit '$LF_CLONE' '$(local_head)' attach" \
@@ -7096,7 +7272,7 @@ printf '#!/bin/sh\ngit push -q --no-verify %s HEAD:refs/heads/stolen 2>/dev/null
   > "$LF_CLONE/.git/hooks/reference-transaction"
 chmod +x "$LF_CLONE/.git/hooks/reference-transaction"
 rm -f "$LF_STATE/local/base.sha"
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
   LOCAL_MODE=1 LOCAL_SCOPE=branch MANAGED_CLONE=0 \
   REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
   LOCAL_BASE_SHA="$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")" \
@@ -7113,7 +7289,7 @@ mkdir -p "$LF_CLONE/.git/hooks"
 printf '#!/bin/sh\ngit push -q --no-verify %s HEAD:refs/heads/stolen 2>/dev/null || true\n' "$_evil" \
   > "$LF_CLONE/.git/hooks/reference-transaction"
 chmod +x "$LF_CLONE/.git/hooks/reference-transaction"
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
   LOCAL_MODE=1 LOCAL_SCOPE=pr PR_NUMBER=42 MANAGED_CLONE=0 \
   REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" HEAD_REF=feature/x \
   "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_record_tip" >/dev/null 2>&1
@@ -7197,7 +7373,7 @@ if [[ -e "$WORK/fin-argv.calls" ]]; then
 # local-path origin a fixture must use.
 
 setup_run() {  # <fn> [VAR=VAL ...] — run one lib function against the fixture
-  env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+  env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
     LOCAL_MODE=1 LOCAL_SCOPE=pr MANAGED_CLONE=1 PR_NUMBER=42 \
     REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
     "${@:2}" \
@@ -7207,7 +7383,7 @@ setup_run() {  # <fn> [VAR=VAL ...] — run one lib function against the fixture
 t "local_setup_repo [branch]: pins the diff base from --base"
 local_fixture; rm -f "$LF_STATE/local/base.sha"
 _want=$(git -C "$LF_CLONE" rev-parse "$LF_BASE~1")
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch MANAGED_CLONE=0 \
      REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x \
      LOCAL_BASE_SHA="$_want" \
@@ -7653,7 +7829,7 @@ printf '%s %s\n' "squash" "$_sq" > "$LF_STATE/local/finalized"       # recorded,
 # A prior round anchored tip.sha at the round; the killed finalize never
 # advanced it. Without the adopt, sync dies "moved outside the loop".
 printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
      STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
@@ -7673,7 +7849,7 @@ printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"
 # loop's own finalize output; adopting it would clobber the human commit.
 echo human >> "$LF_CLONE/f"; git -C "$LF_CLONE" commit -qam "human on top"
 _human=$(git -C "$LF_CLONE" rev-parse HEAD)
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
      STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
@@ -7693,7 +7869,7 @@ _sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_
 git -C "$LF_CLONE" update-ref refs/heads/feature/x "$_sq"     # branch at the squash
 printf '%s %s\n' "$LF_BASE" "$_tree" > "$LF_STATE/local/finalize-inprogress"
 printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"           # no finalized journal yet
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
      STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
@@ -7730,7 +7906,7 @@ _sq=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_
 git -C "$LF_CLONE" checkout -q --detach "$_sq"         # HEAD at the squash, ref still at R
 printf '%s %s\n' "$LF_BASE" "$_tree" > "$LF_STATE/local/finalize-inprogress"
 printf '%s\n' "$_round" > "$LF_STATE/local/tip.sha"    # tip.sha still names the round
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=pr PR_NUMBER=42 REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" \
      BASE_REF=main HEAD_REF=feature/x MANAGED_CLONE=1 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; local_adopt_finalized_squash" >/dev/null 2>&1; then
@@ -7747,9 +7923,10 @@ _gitshim="$WORK/gitshim-$RANDOM"; mkdir -p "$_gitshim"
 { printf '#!/usr/bin/env bash\n'
   printf 'for a in "$@"; do [[ "$a" == commit ]] && c=1; [[ "$a" == -F ]] && f=1; done\n'
   printf '[[ -n "${c:-}" && -n "${f:-}" ]] && exit 1\n'
-  printf 'exec /usr/bin/git "$@"\n'; } > "$_gitshim/git"
+  printf 'exec "$REAL_GIT" "$@"\n'; } > "$_gitshim/git"
 chmod +x "$_gitshim/git"
-env -i PATH="$_gitshim:$STUBS:/usr/bin:/bin" HOME="$WORK" ARGV_FILE="$WORK/fin-argv" \
+env -i PATH="$_gitshim:$STUBS:/usr/bin:/bin" HOME="$WORK" REAL_GIT="$REAL_GIT" \
+  ARGV_FILE="$WORK/fin-argv" \
   CODEX_HOME="$WORK/codex-home" \
   LOCAL_MODE=1 LOCAL_SCOPE=branch FORGE=local MANAGED_CLONE=0 \
   REPO_DIR="$LF_CLONE" STATE_DIR="$LF_STATE" BASE_REF=main HEAD_REF=feature/x ITER=3 MAX_ITER=6 \
@@ -7824,7 +8001,7 @@ local_fixture; local_round 1; local_round 2
 _tip=$(local_head)
 printf 'build output\n' > "$LF_CLONE/artifact.o"
 printf 'stray edit\n' >> "$LF_CLONE/f"
-env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
   LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
   MANAGED_CLONE=0 \
   "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1
@@ -7838,7 +8015,7 @@ assert_eq "$(git -C "$LF_CLONE" symbolic-ref --short HEAD)" 'feature/x'
 
 t "sync_repo_to_local_head: a detached HEAD in a branch review fails closed"
 git -C "$LF_CLONE" checkout -q --detach HEAD
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
      MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then
@@ -7850,7 +8027,7 @@ local_fixture; local_round 1
 printf '%s\n' "$(local_head)" > "$LF_STATE/local/tip.sha"   # what local_record_tip persists
 printf 'foreign\n' >> "$LF_CLONE/f"
 git -C "$LF_CLONE" commit -qam "foreign commit"             # a commit no turn made
-if env -i PATH="/usr/bin:/bin" HOME="$WORK" \
+if env -i PATH="$REAL_GIT_DIR:/usr/bin:/bin" HOME="$WORK" \
      LOCAL_MODE=1 LOCAL_SCOPE=branch REPO_DIR="$LF_CLONE" HEAD_REF=feature/x \
      STATE_DIR="$LF_STATE" MANAGED_CLONE=0 \
      "$BASH_BIN" -c ". '$ROOT/lib/common.sh'; sync_repo_to_local_head" >/dev/null 2>&1; then

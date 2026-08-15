@@ -75,6 +75,27 @@ forge API identity (gh PAT on GitHub, GitLab token on GitLab) and pushing
 commits through the checkout's git credential (which may be a different
 account), and will ask you to confirm the first time it's about to post.
 
+### Controller safety for coding agents
+
+The canonical controller skill is
+`.agents/skills/ai-pr-review/SKILL.md`, so Codex discovers it from the
+repository. Claude's `.claude/skills/ai-pr-review/SKILL.md` is a pointer to
+that same procedure, and the root `AGENTS.md` makes reading it mandatory
+before any loop action.
+
+A coding agent must keep its conversation turn open until the review reaches
+a terminal state and relay every completed Codex/Claude report. When its host
+does not provide a persistent monitor tool, it uses:
+
+- `agent_status.sh` to consume only new high-signal events and print complete
+  saved turn reports; and
+- `agent_guard.sh` to stop the review if the controlling conversation stops
+  renewing its monitoring heartbeat.
+
+This fail-closed path prevents a detached coding-agent turn from leaving an
+expensive review running silently. It does not affect normal direct `run.sh`
+usage by a human.
+
 ## What the agents do
 
 **Codex Reviewer**
