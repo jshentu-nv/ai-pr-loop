@@ -283,9 +283,15 @@ the user selected overrides, otherwise to `${CLAUDE_BIN:-claude}` and
 split a value into command plus arguments. Pass the same override flags to
 the authoritative `--preflight-only` call and eventual launch.
 
+`git` and `jq` are hard prerequisites of every scope, local included.
+`jq` is absent from a stock Windows plus Git for Windows host: install it
+(`winget install jqlang.jq`, `brew install jq`, or the distribution's
+package) and report the missing tool to the user rather than launching.
+
 GitHub:
 
 ```bash
+command -v jq && command -v git
 gh auth status 2>&1 | head -2
 command -v -- "$CODEX_EXE" && "$CODEX_EXE" --version 2>&1 | head -1
 command -v -- "$CLAUDE_EXE" && "$CLAUDE_EXE" --version 2>&1 | head -1
@@ -293,9 +299,21 @@ command -v -- "$CLAUDE_EXE" && "$CLAUDE_EXE" --version 2>&1 | head -1
   [--claude-bin "$CLAUDE_EXE"] [--codex-bin "$CODEX_EXE"] --preflight-only
 ```
 
+A keyring-backed `gh auth login` needs no `GH_TOKEN` in the environment.
+The orchestrator resolves that session's token through `gh auth token` and
+exports it for the agent turns. Do not ask the user to export a PAT when
+`gh auth status` is already healthy.
+
+On Git Bash, `command -v` reports a `.cmd`/`.bat` agent wrapper as missing:
+the NTFS `noacl` mount makes it mode 0644, and a bare name is not probed
+against `PATHEXT`. That is a limitation of the check, not of the wrapper.
+`run.sh` resolves both spellings, so treat `--preflight-only` as the
+authoritative answer for the agent executables.
+
 GitLab (self-hosted: substitute the host):
 
 ```bash
+command -v jq && command -v git
 command -v glab && glab --version 2>&1 | head -1
 command -v -- "$CODEX_EXE" && "$CODEX_EXE" --version 2>&1 | head -1
 command -v -- "$CLAUDE_EXE" && "$CLAUDE_EXE" --version 2>&1 | head -1
@@ -423,11 +441,25 @@ OUT=/private/scratch/pr-42.loop.log
 
 "$LOOP_HOME/agent_status.sh" \
   "$AI_PR_LOOP_HOME/state/<repo-ident>/pr-42" \
-  "$CURSOR" 55 "$HEARTBEAT"
+  "$CURSOR" 55 "$HEARTBEAT" "$OUT"
 ```
+
+Always pass `$OUT` as the fifth argument. It is the one log that covers
+every mode: a run without a supervisor (`--no-auto-resume`, or
+`auto-resume: disabled` on a host with no session primitive) writes no
+`supervisor.log` at all, and a supervised run's front-end tails this
+invocation's supervisor lines into `$OUT` anyway. `supervisor.log` is also
+appended to across reviews, so it carries the previous review's verdict.
 
 The guard intentionally stops the loop if the controlling conversation stops
 polling. This is safer than allowing an expensive review to continue silently.
+An expired lease is a real stop, in two steps: the guard re-runs the same
+`run.sh` command with `--stop`, which writes the stop sentinel and signals a
+live supervisor, and then signals the run's whole process group. Both steps
+are needed. Signalling alone would not end a supervised review — for
+`run.sh`, `SIGTERM` means detach, and the supervisor would keep reviewing.
+`--stop` alone would not end an unsupervised one, because that run reads no
+sentinel.
 
 Each iteration can take 2-15 minutes depending on repo size and whether the
 per-agent session is being resumed (cold Codex run = slow; resumed = fast).
@@ -471,7 +503,7 @@ finishes.
 Without a persistent Monitor, repeatedly call:
 
 ```bash
-"$LOOP_HOME/agent_status.sh" STATE_DIR CURSOR_FILE 55 HEARTBEAT_FILE
+"$LOOP_HOME/agent_status.sh" STATE_DIR CURSOR_FILE 55 HEARTBEAT_FILE RUN_LOG_FILE
 ```
 
 Exit 0 means it printed one or more new events. Exit 3 means no high-signal

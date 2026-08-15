@@ -603,10 +603,21 @@ resolve_agent_bin() {  # <flag> <value>
   case "$value" in
     *$'\n'*|*$'\r'*|*$'\t'*) die "$flag executable must not contain tabs or newlines" ;;
   esac
-  resolved=$(type -P -- "$value" 2>/dev/null) \
+  # resolve_command_path, not type -P: on a Git Bash noacl mount a .cmd/.bat
+  # wrapper is mode 0644, which fails both the PATH lookup for an explicit
+  # path and the -x test, yet the Windows loader runs it. It also probes
+  # PATHEXT so a bare `codex-hub` reaches `codex-hub.cmd`.
+  resolved=$(resolve_command_path "$value") \
     || die "missing required command: $value"
-  [[ -f "$resolved" && -x "$resolved" ]] \
+  is_executable_file "$resolved" \
     || die "missing required command: $value"
+  # A Windows-spelled path (C:\tools\agent.cmd) has no '/' to split on, so the
+  # directory/base split below would treat the whole value as a bare name.
+  # Only Git Bash gets this rewrite: on a real POSIX host a backslash is an
+  # ordinary character in a filename.
+  if is_windows_bash; then
+    resolved="${resolved//\\//}"
+  fi
   base="${resolved##*/}"
   case "$resolved" in
     /*)  dir="${resolved%/*}"; [[ -n "$dir" ]] || dir=/ ;;

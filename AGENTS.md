@@ -29,6 +29,8 @@ For any request to start, restart, continue, monitor, inspect, or stop an
    failure, preserve the checkout and state, and resume only after the
    controller contract is restored.
 
-The repository's Claude-facing skill entry is a pointer to the same canonical
-skill. Keep the controller procedure in `.agents/skills/ai-pr-review/SKILL.md`
-so Codex and Claude cannot silently drift to different workflows.
+Claude Code does not read this file. The root `CLAUDE.md` is its mandatory
+entry point and routes it back here, and `.claude/skills/ai-pr-review/SKILL.md`
+is a metadata pointer to the canonical skill. Keep the contract above in this
+file and the controller procedure in `.agents/skills/ai-pr-review/SKILL.md`, so
+Codex and Claude cannot silently drift to different workflows.

@@ -80,8 +80,10 @@ account), and will ask you to confirm the first time it's about to post.
 The canonical controller skill is
 `.agents/skills/ai-pr-review/SKILL.md`, so Codex discovers it from the
 repository. Claude's `.claude/skills/ai-pr-review/SKILL.md` is a pointer to
-that same procedure, and the root `AGENTS.md` makes reading it mandatory
-before any loop action.
+that same procedure. Each agent also has a root entry point it loads on its
+own — `AGENTS.md` for Codex, `CLAUDE.md` for Claude Code — and both make
+reading the canonical skill mandatory before any loop action. The contract
+itself lives in `AGENTS.md`; `CLAUDE.md` routes there.
 
 A coding agent must keep its conversation turn open until the review reaches
 a terminal state and relay every completed Codex/Claude report. When its host

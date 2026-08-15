@@ -1095,10 +1095,104 @@ write_state_atomic() {  # <path> <content>
     && mv -f "$1.tmp" "$1"
 }
 
+# --- Executable resolution -----------------------------------------------------
+#
+# Git Bash / MSYS mounts NTFS with `noacl`, so a .cmd or .bat wrapper reports
+# mode 0644 even though the Windows loader runs it, and `chmod +x` cannot
+# change that mode. Bash's own tests follow the mode: `[[ -x ]]` and
+# `command -v -- <explicit path>` both reject a working wrapper. Bash's PATH
+# search is kinder — it accepts a .cmd found on PATH — but it does no
+# PATHEXT probing, so a bare `codex-hub` never reaches `codex-hub.cmd`.
+# These helpers restore both halves. They stay inert off Windows, where a
+# .cmd file is genuinely not executable.
+
+is_windows_bash() {
+  case "${OSTYPE:-}" in msys*|cygwin*|win32*) return 0 ;; *) return 1 ;; esac
+}
+
+# The PATHEXT entries the Windows loader can run straight from bash, in the
+# operator's own order. PATHEXT also lists script types (.vbs, .js) that need
+# an interpreter bash never invokes, so those are dropped.
+windows_exec_exts() {
+  local raw ext found=0 parts
+  IFS=';' read -r -a parts <<<"${PATHEXT:-.COM;.EXE;.BAT;.CMD}"
+  for raw in ${parts[@]+"${parts[@]}"}; do
+    ext="${raw,,}"
+    ext="${ext#"${ext%%[![:space:]]*}"}"
+    ext="${ext%"${ext##*[![:space:]]}"}"
+    case "$ext" in
+      .com|.exe|.bat|.cmd) printf '%s\n' "$ext"; found=1 ;;
+    esac
+  done
+  (( found == 1 )) || printf '%s\n' .com .exe .bat .cmd
+}
+
+# True when this path names something we can run: a regular file that either
+# carries the execute bit or is a Windows wrapper the loader will run.
+is_executable_file() {  # <path>
+  local p="$1"
+  [[ -f "$p" ]] || return 1
+  [[ -x "$p" ]] && return 0
+  is_windows_bash || return 1
+  [[ -r "$p" ]] || return 1
+  case "${p,,}" in *.com|*.exe|*.bat|*.cmd) return 0 ;; esac
+  return 1
+}
+
+# `type -P` with the two Windows gaps closed. Prints the resolved path.
+resolve_command_path() {  # <value>
+  local value="$1" resolved ext
+  [[ -n "$value" ]] || return 1
+  if [[ "$value" == */* || "$value" == *\\* ]]; then
+    # An explicit path. `type -P` applies the execute-bit test a noacl
+    # wrapper fails, so test the path directly instead.
+    if is_executable_file "$value"; then printf '%s\n' "$value"; return 0; fi
+    if is_windows_bash; then
+      while IFS= read -r ext; do
+        if is_executable_file "$value$ext"; then
+          printf '%s\n' "$value$ext"; return 0
+        fi
+      done < <(windows_exec_exts)
+    fi
+    return 1
+  fi
+  if resolved=$(type -P -- "$value" 2>/dev/null) && [[ -n "$resolved" ]]; then
+    printf '%s\n' "$resolved"; return 0
+  fi
+  is_windows_bash || return 1
+  # Directory-major, like the Windows loader: the first PATH entry holding any
+  # accepted extension wins, and PATHEXT only orders the candidates within it.
+  # type -P is not enough on its own — Git Bash's PATH search accepts a
+  # mode-0644 .cmd today, but its execute-bit test rejects the same file.
+  local dir exts
+  exts=$(windows_exec_exts)
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || dir=.
+    while IFS= read -r ext; do
+      if is_executable_file "$dir/$value$ext"; then
+        printf '%s\n' "$dir/$value$ext"; return 0
+      fi
+    done <<<"$exts"
+  done < <(printf '%s\n' "${PATH//:/$'\n'}")
+  return 1
+}
+
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {
   command -v -- "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# The agent executables only. They are pinned by resolve_agent_bin to a full
+# path carrying its extension, so a Windows wrapper is invoked correctly even
+# though bash's own lookup rejects its 0644 mode. require_cmd must stay strict
+# for the plain tool names (git, jq, gh, glab, curl): those are invoked bare,
+# and Git Bash's exec appends only `.exe` — accepting a `jq.cmd` here would
+# pass preflight and then fail with 127 in the middle of a review.
+require_agent_cmd() {
+  command -v -- "$1" >/dev/null 2>&1 && return 0
+  resolve_command_path "$1" >/dev/null 2>&1 && return 0
+  die "missing required command: $1"
 }
 
 # Read a host-scoped glab config value with glab's environment overrides
@@ -1173,8 +1267,8 @@ glab_config_host_keys() {
 }
 
 preflight() {
-  require_cmd "$CODEX_BIN"
-  require_cmd "$CLAUDE_BIN"
+  require_agent_cmd "$CODEX_BIN"
+  require_agent_cmd "$CLAUDE_BIN"
   require_cmd git
   require_cmd jq
   # Local branch scope never speaks to a forge: no CLI, no token, no
@@ -1188,7 +1282,28 @@ preflight() {
   case "$FORGE" in
     github)
       require_cmd gh
-      [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "GH_TOKEN/GITHUB_TOKEN not set"
+      # Both agent prompts tell the turns that GH_TOKEN is in their
+      # environment, so this block's job is to make that true.
+      #
+      # The recommended `gh auth login` stores its token in the OS keyring and
+      # exports nothing, so requiring a token variable rejects a correctly
+      # configured host. Ask the CLI for that session's token instead. The
+      # hostname is explicit: `gh auth token` alone answers for gh's default
+      # host, which may be an enterprise instance, and only github.com reaches
+      # this code.
+      if [[ -n "${GH_TOKEN:-}" ]]; then
+        export GH_TOKEN
+      elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        export GH_TOKEN="$GITHUB_TOKEN"
+      else
+        local gh_keyring_token
+        gh_keyring_token=$(gh auth token --hostname github.com 2>/dev/null \
+          | tr -d '\r\n') || gh_keyring_token=''
+        [[ -n "$gh_keyring_token" ]] \
+          || die "GH_TOKEN/GITHUB_TOKEN not set and 'gh auth token' returned nothing; run 'gh auth login' or set a valid GH_TOKEN"
+        export GH_TOKEN="$gh_keyring_token"
+        log "github: using the token from the gh CLI session (no GH_TOKEN/GITHUB_TOKEN in the environment)"
+      fi
       # Resolve the authenticated user so prompts can render the banner with
       # the right @handle (instead of a hardcoded one). Also doubles as an
       # auth check.

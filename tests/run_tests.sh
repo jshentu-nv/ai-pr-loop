@@ -159,6 +159,33 @@ assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'Non-negotiable contr
 t "agent contract: Claude entry points at the canonical skill"
 assert_substr "$ROOT/.claude/skills/ai-pr-review/SKILL.md" '../../../.agents/skills/ai-pr-review/SKILL.md'
 
+# Claude Code never reads AGENTS.md, so the skill pointer alone left it with
+# no repository-level instruction to route loop work through the skill.
+t "agent contract: Claude has a mandatory root entry point"
+if [[ -f "$ROOT/CLAUDE.md" ]]; then ok; else bad "no root CLAUDE.md"; fi
+
+t "agent contract: root CLAUDE routes to the contract and the canonical skill"
+assert_substr "$ROOT/CLAUDE.md" 'AGENTS.md'
+assert_substr "$ROOT/CLAUDE.md" '.agents/skills/ai-pr-review/SKILL.md'
+
+t "agent contract: root CLAUDE requires invoking the skill, not reading it"
+assert_substr "$ROOT/CLAUDE.md" 'Invoke the `ai-pr-review` skill'
+
+t "agent contract: AGENTS names the Claude entry point"
+assert_substr "$ROOT/AGENTS.md" 'CLAUDE.md'
+
+t "agent contract: the controller preflight names the hard jq prerequisite"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'command -v jq'
+
+t "agent contract: the controller is told a keyring gh session is enough"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'gh auth token'
+
+t "agent contract: the controller is warned about Windows .cmd wrappers"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'PATHEXT'
+
+t "agent contract: the fallback monitors the captured run log too"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'CURSOR" 55 "$HEARTBEAT" "$OUT"'
+
 t "agent contract: no-Monitor fallback is fail-closed"
 assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" 'Do not launch an unmonitored background review'
 
@@ -195,6 +222,9 @@ printf '%s\n' \
   '[ai-loop 00:00:01] ===== Iteration 1 =====' \
   "[ai-loop 00:00:02] codex: iter 1 report (2 lines) -> $MON_REPORT" \
   > "$MON_STATE/supervisor.log"
+# An established monitor, mid-review. A cursor-less monitor of supervisor.log
+# deliberately starts at the end of the file instead; that is covered below.
+printf '0\n' > "$MON_CURSOR"
 
 t "agent_status: emits new high-signal lines and the saved report"
 MON_OUT=$(bash "$ROOT/agent_status.sh" "$MON_STATE" "$MON_CURSOR" 0 "$MON_HEARTBEAT")
@@ -215,17 +245,246 @@ t "agent_status: monitoring refreshes the guard heartbeat"
 if [[ -s "$MON_CURSOR" && -e "$MON_HEARTBEAT" ]]; then ok
 else bad "cursor or heartbeat was not published"; fi
 
-GUARD_HEARTBEAT="$WORK/agent-guard.heartbeat"
-GUARD_STOPPED="$WORK/agent-guard.stopped"
-t "agent_guard: an expired monitoring lease stops the guarded run"
+# Report bodies are copied into the same log, and the agents' own stdout lands
+# there unfiltered, so an announcement-shaped line can be agent-authored. The
+# monitor must read only the orchestrator's own report path.
+t "agent_status: a spoofed report announcement cannot read another file"
+SPOOF_STATE="$WORK/agent-monitor-spoof"
+SPOOF_CURSOR="$WORK/agent-monitor-spoof.cursor"
+SPOOF_WITNESS="$WORK/agent-monitor-spoof.witness"
+mkdir -p "$SPOOF_STATE/iter-01"
+printf '%s\n' 'the real codex report' > "$SPOOF_STATE/iter-01/codex-report.md"
+printf '%s\n' 'WITNESS-FILE-CONTENT' > "$SPOOF_WITNESS"
+printf '%s\n' \
+  "[ai-loop 00:00:01]   codex: iter 99 report (1 lines) -> $SPOOF_WITNESS" \
+  "[ai-loop 00:00:02] codex: iter 1 report (1 lines) -> $SPOOF_WITNESS" \
+  > "$SPOOF_STATE/supervisor.log"
+printf '0\n' > "$SPOOF_CURSOR"
+SPOOF_OUT=$(bash "$ROOT/agent_status.sh" "$SPOOF_STATE" "$SPOOF_CURSOR" 0 2>/dev/null)
+assert_no_substr <(printf '%s\n' "$SPOOF_OUT") 'WITNESS-FILE-CONTENT'
+assert_substr <(printf '%s\n' "$SPOOF_OUT") 'the real codex report'
+
+# A run with no supervisor writes no supervisor.log, and a stale one from an
+# earlier review must not hide it.
+t "agent_status: a run with no supervisor is still visible"
+NOSUP_STATE="$WORK/agent-monitor-nosup"
+NOSUP_CURSOR="$WORK/agent-monitor-nosup.cursor"
+NOSUP_RUNLOG="$WORK/agent-monitor-nosup.out"
+mkdir -p "$NOSUP_STATE/iter-01"
+printf '%s\n' 'left over from the previous review' 'VERDICT: APPROVED' \
+  > "$NOSUP_STATE/supervisor.log"
+printf '%s\n' \
+  '[ai-loop 00:00:00] auto-resume: disabled — running the loop in this process' \
+  '[ai-loop 00:00:01] AI PR loop finished: approved' \
+  > "$NOSUP_RUNLOG"
+NOSUP_OUT=$(bash "$ROOT/agent_status.sh" "$NOSUP_STATE" "$NOSUP_CURSOR" 0 '' "$NOSUP_RUNLOG")
+NOSUP_RC=$?
+if [[ "$NOSUP_RC" -eq 0 ]]; then ok; else bad "no-supervisor poll exited $NOSUP_RC"; fi
+assert_substr <(printf '%s\n' "$NOSUP_OUT") 'AI PR loop finished: approved'
+assert_no_substr <(printf '%s\n' "$NOSUP_OUT") 'left over from the previous review'
+
+# The front-end tails the supervisor log into the captured output, so reading
+# both would report every event twice.
+t "agent_status: an event carried by both logs is reported once"
+DUP_STATE="$WORK/agent-monitor-dup"
+DUP_CURSOR="$WORK/agent-monitor-dup.cursor"
+DUP_RUNLOG="$WORK/agent-monitor-dup.out"
+mkdir -p "$DUP_STATE"
+printf '%s\n' '[ai-loop 00:00:01] ===== Iteration 7 =====' > "$DUP_STATE/supervisor.log"
+cp "$DUP_STATE/supervisor.log" "$DUP_RUNLOG"
+DUP_OUT=$(bash "$ROOT/agent_status.sh" "$DUP_STATE" "$DUP_CURSOR" 0 '' "$DUP_RUNLOG")
+assert_eq "$(grep -c 'Iteration 7' <<<"$DUP_OUT")" 1
+
+# supervisor.log is appended to across reviews. Replaying it would hand the
+# controller the previous review's terminal verdict seconds after launch.
+t "agent_status: a fresh monitor does not replay a previous review"
+OLDLOG_STATE="$WORK/agent-monitor-oldlog"
+OLDLOG_CURSOR="$WORK/agent-monitor-oldlog.cursor"
+mkdir -p "$OLDLOG_STATE"
+printf '%s\n' \
+  '[ai-loop 00:00:01] ===== Iteration 1 =====' \
+  '[ai-loop 00:00:02] AI PR loop finished: approved' \
+  > "$OLDLOG_STATE/supervisor.log"
+OLDLOG_OUT=$(bash "$ROOT/agent_status.sh" "$OLDLOG_STATE" "$OLDLOG_CURSOR" 0)
+OLDLOG_RC=$?
+if [[ "$OLDLOG_RC" -eq 3 && -z "$OLDLOG_OUT" ]]; then ok
+else bad "replayed a previous review: rc=$OLDLOG_RC out='$OLDLOG_OUT'"; fi
+
+t "agent_status: a seeded monitor still reports what lands next"
+printf '%s\n' '[ai-loop 00:00:03] ===== Iteration 2 =====' \
+  >> "$OLDLOG_STATE/supervisor.log"
+OLDLOG_OUT2=$(bash "$ROOT/agent_status.sh" "$OLDLOG_STATE" "$OLDLOG_CURSOR" 0)
+assert_substr <(printf '%s\n' "$OLDLOG_OUT2") '===== Iteration 2 ====='
+assert_no_substr <(printf '%s\n' "$OLDLOG_OUT2") 'Iteration 1'
+
+# --- agent executables on Windows -----------------------------------------
+
+WINBIN="$WORK/winbin"
+# A name of this suite's own, so a real agent wrapper of the same name
+# somewhere else on PATH cannot answer for the stub.
+WINAGENT=aiprloop-test-hub
+mkdir -p "$WINBIN"
+printf '@echo off\r\necho stub\r\n' > "$WINBIN/$WINAGENT.cmd"
+chmod 0644 "$WINBIN/$WINAGENT.cmd" 2>/dev/null || true
+
+# A Git Bash noacl mount reports every .cmd/.bat as mode 0644, so the wrapper
+# above is the exact shape that used to die with "missing required command".
+# is_windows_bash is overridden so the resolution logic is covered on every
+# host, not only when the suite happens to run on Windows.
+win_resolve() {  # <value>
+  PATH="$WINBIN:/usr/bin:/bin" PATHEXT='.COM;.EXE;.BAT;.CMD' "$BASH_BIN" -c "
+    . '$ROOT/lib/common.sh'
+    is_windows_bash() { return 0; }
+    resolve_command_path \"\$1\"" _ "$1" 2>/dev/null
+}
+
+t "agent executables: a bare name resolves through PATHEXT"
+assert_eq "$(win_resolve "$WINAGENT")" "$WINBIN/$WINAGENT.cmd"
+
+t "agent executables: an explicit wrapper path resolves without the -x bit"
+assert_eq "$(win_resolve "$WINBIN/$WINAGENT.cmd")" "$WINBIN/$WINAGENT.cmd"
+
+t "agent executables: an explicit extensionless path resolves through PATHEXT"
+assert_eq "$(win_resolve "$WINBIN/$WINAGENT")" "$WINBIN/$WINAGENT.cmd"
+
+t "agent executables: a missing wrapper still fails"
+assert_eq "$(win_resolve no-such-agent-hub)" ""
+
+t "agent executables: a .cmd is not accepted off Windows"
+assert_eq "$(PATH="$WINBIN:/usr/bin:/bin" "$BASH_BIN" -c "
+  . '$ROOT/lib/common.sh'
+  is_windows_bash() { return 1; }
+  resolve_command_path '$WINBIN/$WINAGENT.cmd'" 2>/dev/null)" ""
+
+if [[ "$OSTYPE" == msys* || "$OSTYPE" == cygwin* || "$OSTYPE" == win32* ]]; then
+  t "agent executables: run.sh accepts a bare Windows wrapper override"
+  WIN_RUN_OUT=$(PATH="$WINBIN:$PATH" bash "$ROOT/run.sh" 1 --repo o/n \
+    --codex-bin "$WINAGENT" --claude-bin "$WINAGENT" --print-config 2>&1) || true
+  assert_no_substr <(printf '%s\n' "$WIN_RUN_OUT") 'missing required command'
+
+  t "agent executables: run.sh accepts an explicit Windows wrapper path"
+  WIN_RUN_OUT=$(bash "$ROOT/run.sh" 1 --repo o/n \
+    --codex-bin "$WINBIN/$WINAGENT.cmd" --claude-bin "$WINBIN/$WINAGENT.cmd" \
+    --print-config 2>&1) || true
+  assert_no_substr <(printf '%s\n' "$WIN_RUN_OUT") 'missing required command'
+fi
+
+# --- monitoring lease ------------------------------------------------------
+
+GUARD_DIR="$WORK/agent-guard"
+mkdir -p "$GUARD_DIR"
+GUARD_HEARTBEAT="$GUARD_DIR/heartbeat"
+# Mimics run.sh's signal contract: SIGTERM only detaches the front-end and
+# leaves the supervisor reviewing, so only the stop sentinel ends the run.
+cat > "$GUARD_DIR/fake_run.sh" <<'FAKERUN'
+#!/usr/bin/env bash
+D="$1"; shift
+for a in "$@"; do
+  if [[ "$a" == "--stop" ]]; then
+    : > "$D/stop"
+    printf 'stop-called\n' >> "$D/events"
+    exit 0
+  fi
+done
+trap 'printf "detached\n" >> "$D/events"' TERM
+printf 'started\n' >> "$D/events"
+while [[ ! -e "$D/stop" ]]; do sleep 1; done
+printf 'stopped-by-sentinel\n' >> "$D/events"
+exit 0
+FAKERUN
+
+t "agent_guard: an expired lease stops the review through the --stop contract"
 AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=1 \
 AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS=1 \
+AI_PR_LOOP_AGENT_GUARD_STOP_GRACE_SECONDS=20 \
   bash "$ROOT/agent_guard.sh" "$GUARD_HEARTBEAT" 1 -- \
-    bash -c 'trap '"'"'printf stopped > "$1"; exit 0'"'"' TERM; while :; do sleep 1; done' \
-    _ "$GUARD_STOPPED" >/dev/null 2>&1
+    bash "$GUARD_DIR/fake_run.sh" "$GUARD_DIR" >/dev/null 2>&1
 GUARD_RC=$?
-if [[ "$GUARD_RC" -eq 124 && -s "$GUARD_STOPPED" ]]; then ok
-else bad "guard rc=$GUARD_RC stopped=$(test -s "$GUARD_STOPPED" && echo yes || echo no)"; fi
+if [[ "$GUARD_RC" -eq 124 ]]; then ok; else bad "guard rc=$GUARD_RC"; fi
+assert_substr "$GUARD_DIR/events" 'stop-called'
+assert_substr "$GUARD_DIR/events" 'stopped-by-sentinel'
+if [[ -e "$GUARD_DIR/stop" ]]; then ok
+else bad "the stop sentinel was never written"; fi
+
+# An unsupervised run reads no stop sentinel and traps no SIGTERM, so --stop
+# cannot reach it. The guard must still take down the agent it started.
+t "agent_guard: an unsupervised run and its agent are both stopped"
+GUARD_INLINE="$WORK/agent-guard-inline"
+mkdir -p "$GUARD_INLINE"
+cat > "$GUARD_INLINE/inline_run.sh" <<'INLINERUN'
+#!/usr/bin/env bash
+D="$1"; shift
+for a in "$@"; do
+  [[ "$a" == "--stop" ]] && exit 0     # no supervisor to signal, nothing else
+done
+bash -c 'while :; do sleep 1; done' &   # the agent CLI; no trap, like run.sh
+printf '%s\n' "$!" > "$D/agent.pid"
+wait
+INLINERUN
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=1 \
+AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS=1 \
+AI_PR_LOOP_AGENT_GUARD_STOP_GRACE_SECONDS=10 \
+  bash "$ROOT/agent_guard.sh" "$GUARD_INLINE/heartbeat" 1 -- \
+    bash "$GUARD_INLINE/inline_run.sh" "$GUARD_INLINE" >/dev/null 2>&1
+GUARD_INLINE_RC=$?
+if [[ "$GUARD_INLINE_RC" -eq 124 ]]; then ok
+else bad "guard rc=$GUARD_INLINE_RC"; fi
+GUARD_INLINE_AGENT=$(cat "$GUARD_INLINE/agent.pid" 2>/dev/null || echo 0)
+if [[ "$GUARD_INLINE_AGENT" != 0 ]] && ! kill -0 "$GUARD_INLINE_AGENT" 2>/dev/null
+then ok
+else
+  kill -9 "$GUARD_INLINE_AGENT" 2>/dev/null || true
+  bad "the unsupervised run's agent (pid $GUARD_INLINE_AGENT) survived"
+fi
+
+# `stat -c` is GNU-only. Reading mtime 0 from a BSD/macOS stat used to expire
+# a heartbeat that had just been written.
+t "agent_guard: a fresh lease survives a host without GNU stat"
+GUARD_BSD="$WORK/agent-guard-bsd"
+mkdir -p "$GUARD_BSD/bin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "stat: illegal option\n" >&2' 'exit 1' \
+  > "$GUARD_BSD/bin/stat"
+chmod +x "$GUARD_BSD/bin/stat"
+PATH="$GUARD_BSD/bin:$PATH" \
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=60 \
+AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS=1 \
+  bash "$ROOT/agent_guard.sh" "$GUARD_BSD/heartbeat" 60 -- \
+    bash -c 'sleep 3' >/dev/null 2>&1
+GUARD_BSD_RC=$?
+if [[ "$GUARD_BSD_RC" -eq 0 ]]; then ok
+else bad "a fresh lease expired without GNU stat (rc=$GUARD_BSD_RC)"; fi
+
+# The lease is also carried by the file's mtime, so a controller that renews
+# it with `touch` (rather than through agent_status.sh) keeps its review.
+t "agent_guard: a touch-only renewal holds the lease"
+GUARD_TOUCH="$WORK/agent-guard-touch"
+mkdir -p "$GUARD_TOUCH"
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=3 \
+AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS=1 \
+  bash "$ROOT/agent_guard.sh" "$GUARD_TOUCH/heartbeat" 3 -- \
+    bash -c 'for _ in 1 2 3 4 5 6; do printf "no-epoch-here\n" > "$1/heartbeat"; sleep 1; done' \
+    _ "$GUARD_TOUCH" >/dev/null 2>&1
+GUARD_TOUCH_RC=$?
+if [[ "$GUARD_TOUCH_RC" -eq 0 ]]; then ok
+else bad "an mtime-only lease expired (rc=$GUARD_TOUCH_RC)"; fi
+
+# --- keyring-only GitHub authentication ------------------------------------
+
+t "preflight: a keyring-backed gh session needs no token in the environment"
+KEYRING_BIN="$WORK/keyring-bin"
+mkdir -p "$KEYRING_BIN"
+printf '%s\n' '#!/usr/bin/env bash' \
+  '[[ "$1" == "auth" && "$2" == "token" ]] && { printf "gho_keyring_token\n"; exit 0; }' \
+  '[[ "$1" == "api" ]] && { printf "keyring-user\n"; exit 0; }' \
+  'exit 1' > "$KEYRING_BIN/gh"
+chmod +x "$KEYRING_BIN/gh"
+KEYRING_OUT=$(env -u GH_TOKEN -u GITHUB_TOKEN PATH="$KEYRING_BIN:$PATH" \
+  "$BASH_BIN" -c "
+    . '$ROOT/lib/common.sh'
+    CODEX_BIN=git; CLAUDE_BIN=git; LOCAL_SCOPE=''; FORGE=github
+    preflight >/dev/null 2>&1 || { printf 'PREFLIGHT-FAILED\n'; exit 1; }
+    printf '%s %s\n' \"\$GH_TOKEN\" \"\$GH_USER\"")
+assert_eq "$KEYRING_OUT" 'gho_keyring_token keyring-user'
 
 if [[ "${AI_PR_LOOP_TEST_CONTRACT_ONLY:-0}" == "1" ]]; then
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
@@ -706,6 +965,11 @@ if (( CLAUDE_ATTEMPT == 1 )); then
   fi
 fi
 case "$*" in
+  # No stored keyring session unless a case asks for one, so the token tests
+  # still reach preflight's "not set" death.
+  *"auth token"*)
+    [[ -n "${STUB_GH_KEYRING_TOKEN:-}" ]] || exit 1
+    printf '%s\n' "$STUB_GH_KEYRING_TOKEN"; exit 0 ;;
   *" user"*)
     printf '%s\n' "$TR"; exit 0 ;;
   *"/issues/"*"/comments"*)
