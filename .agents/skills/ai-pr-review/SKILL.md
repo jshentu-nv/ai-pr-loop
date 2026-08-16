@@ -449,6 +449,10 @@ rm -f "$HEARTBEAT" "$HEARTBEAT.exit" "$HEARTBEAT.guard-pid" "$CURSOR"
   "$CURSOR" 55 "$HEARTBEAT" "$OUT"
 ```
 
+A `--local` branch review names its state leaf `branch-<slug>`, not `pr-<N>`.
+Pass the leaf the run actually created, or the poller looks for each round's
+saved report at a path that does not exist and relays none of them.
+
 Always pass `$OUT` as the fifth argument. It is the one log that covers
 every mode: a run without a supervisor (`--no-auto-resume`, or
 `auto-resume: disabled` on a host with no session primitive) writes no

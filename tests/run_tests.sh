@@ -105,7 +105,14 @@ unset CDPATH
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# AI_PR_LOOP_TEST_KEEP_WORK=1 leaves the scratch tree behind. A failure here
+# is usually only diagnosable from the run's own output files, and this is the
+# only way to read them after the suite exits.
+if [[ "${AI_PR_LOOP_TEST_KEEP_WORK:-0}" == "1" ]]; then
+  trap 'printf "\nwork tree kept: %s\n" "$WORK"' EXIT
+else
+  trap 'rm -rf "$WORK"' EXIT
+fi
 BASH_BIN="$(command -v bash)"
 
 # Process probes for the live fixtures. Git Bash's ps rejects every -o
@@ -150,9 +157,40 @@ tp_child_matching() {  # <ppid> <substring>
   return 1
 }
 
+# Curated-PATH fixtures below build a directory holding only the tools a case
+# is allowed to see. `ln -s` cannot do that here: MSYS has no symlinks by
+# default, so it COPIES the binary, and a copied `bash.exe` on a PATH without
+# its DLL directory dies with "error while loading shared libraries". Write a
+# shim instead — a text file with an absolute interpreter path, which runs
+# whatever the PATH holds.
+tool_shim() {  # <dir> <name> <target-path>
+  printf '#!%s\nexec %s "$@"\n' "$BASH_BIN" "$(printf '%q' "$3")" > "$1/$2"
+  chmod +x "$1/$2"
+}
+# Add <cmd> from the host to <dir>. Returns 1 when the host lacks it.
+add_tool() {  # <dir> <cmd>
+  local p
+  p=$(command -v "$2" 2>/dev/null) || return 1
+  tool_shim "$1" "$2" "$p"
+}
+# Copy a whole curated directory, preserving what each shim points at.
+clone_tool_dir() {  # <src-dir> <dst-dir>
+  local f
+  mkdir -p "$2"
+  for f in "$1"/*; do [[ -e "$f" ]] && cp -f "$f" "$2/${f##*/}"; done
+  chmod +x "$2"/* 2>/dev/null || true
+}
+
 PASS=0
 FAIL=0
 CURRENT=""
+SKIPPED=0
+# A skipped case must be visible and counted: a silent block of unrun tests
+# reads exactly like a passing suite.
+skip() {  # <reason>
+  SKIPPED=$((SKIPPED + 1))
+  printf 'SKIP: %s — %s\n' "$CURRENT" "$1" >&2
+}
 
 t()   { CURRENT="$1"; }
 ok()  { PASS=$((PASS + 1)); }
@@ -614,6 +652,101 @@ else
   bad "the runner was orphaned by a post-fork signal"
 fi
 
+# --- supervisor lock: inheritance and stale recovery -----------------------
+#
+# The lock rides the open file description, so any descendant that inherits
+# fd 9 keeps it after the supervisor is gone. An agent turn can leave a
+# detached tree behind, and that tree then blocks every later run of the PR
+# with a message saying a supervisor is running when none is.
+
+LOCKW="$WORK/supervisor-lock"
+mkdir -p "$LOCKW"
+: > "$LOCKW/lock"
+cat > "$LOCKW/acquire.pl" <<'ACQ'
+use Fcntl qw(:flock);
+open(my $fh, ">&=", $ARGV[0]) or exit 2;
+exit(flock($fh, LOCK_EX|LOCK_NB) ? 0 : 1);
+ACQ
+# Holds the lock, spawns a detached descendant, exits — the shape of a
+# finished supervisor that left an agent's guard tree behind. $2 is the
+# redirection applied to that descendant.
+cat > "$LOCKW/holder.sh" <<'HOLD'
+W="$1"; CLOSE="${2:-}"
+exec 9>>"$W/lock"
+perl "$W/acquire.pl" 9 || exit 1
+if [[ "$CLOSE" == close ]]; then
+  perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' -- \
+    bash -c 'while :; do sleep 1; done' 9>&- &
+else
+  perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' -- \
+    bash -c 'while :; do sleep 1; done' &
+fi
+printf '%s\n' "$!" > "$W/desc.pid"
+sleep 1
+HOLD
+cat > "$LOCKW/probe.sh" <<'PROBE'
+W="$1"
+exec 9>>"$W/lock"
+if perl "$W/acquire.pl" 9; then echo free; else echo held; fi
+PROBE
+
+if ! command -v perl >/dev/null 2>&1; then
+  t "run.sh: a descendant does not inherit the supervisor lock"
+  skip "these cases need perl to take the lock the way run.sh does"
+else
+  t "run.sh: the lock fixture reproduces inheritance without the fix"
+  bash "$LOCKW/holder.sh" "$LOCKW" >/dev/null 2>&1
+  LOCK_DESC=$(head -1 "$LOCKW/desc.pid" 2>/dev/null || echo 0)
+  assert_eq "$(bash "$LOCKW/probe.sh" "$LOCKW")" held
+  kill -9 "$LOCK_DESC" 2>/dev/null || true
+  sleep 1
+  assert_eq "$(bash "$LOCKW/probe.sh" "$LOCKW")" free
+
+  t "run.sh: a descendant started with 9>&- cannot hold the lock"
+  bash "$LOCKW/holder.sh" "$LOCKW" close >/dev/null 2>&1
+  LOCK_DESC2=$(head -1 "$LOCKW/desc.pid" 2>/dev/null || echo 0)
+  if kill -0 "$LOCK_DESC2" 2>/dev/null; then ok
+  else bad "the descendant did not survive its parent, so this proves nothing"; fi
+  assert_eq "$(bash "$LOCKW/probe.sh" "$LOCKW")" free
+  kill -9 "$LOCK_DESC2" 2>/dev/null || true
+
+  t "run.sh: the worker is spawned with the lock fd closed"
+  assert_substr "$ROOT/run.sh" '--_worker ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} 9>&-'
+  assert_substr "$ROOT/run.sh" '--_worker ${RETRY_ARGV[@]+"${RETRY_ARGV[@]}"} 9>&-'
+
+  # The operator's symptom: a stray tree holds the lock, no supervisor and no
+  # worker are live, and the run must recover rather than refuse to start.
+  t "run.sh: a stale lock with nothing live is recovered, not refused"
+  LOCK_ST="$WORK/lock-stale"
+  mkdir -p "$LOCK_ST/state/o__n/pr-1" "$LOCK_ST/repo"
+  cp "$LOCKW/acquire.pl" "$LOCK_ST/acquire.pl"
+  cat > "$LOCK_ST/stray.sh" <<'STRAY'
+W="$1"
+exec 9>>"$W/state/o__n/pr-1/supervisor.lock"
+perl "$W/acquire.pl" 9 || exit 1
+perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV' -- \
+  bash -c 'while :; do sleep 1; done' &
+printf '%s\n' "$!" > "$W/stray.pid"
+sleep 1
+STRAY
+  : > "$LOCK_ST/state/o__n/pr-1/supervisor.lock"
+  bash "$LOCK_ST/stray.sh" "$LOCK_ST" >/dev/null 2>&1
+  LOCK_STRAY=$(head -1 "$LOCK_ST/stray.pid" 2>/dev/null || echo 0)
+  cat > "$LOCK_ST/probe.sh" <<'PROBE2'
+W="$1"
+exec 9>>"$W/state/o__n/pr-1/supervisor.lock"
+if perl "$W/acquire.pl" 9; then echo free; else echo held; fi
+PROBE2
+  if [[ "$(bash "$LOCK_ST/probe.sh" "$LOCK_ST")" == held ]]; then ok
+  else bad "the stray did not hold the lock, so this proves nothing"; fi
+  AI_PR_LOOP_STATE_ROOT="$LOCK_ST/state" timeout 90 \
+    bash "$ROOT/run.sh" --_supervise --auto-resume 1 1 --repo o/n \
+      --dir "$LOCK_ST/repo" > "$LOCK_ST/sup.out" 2>&1 || true
+  assert_substr "$LOCK_ST/sup.out" 'recovering the stale lock'
+  assert_substr "$LOCK_ST/sup.out" 'auto-resume: supervisor started'
+  kill -9 "$LOCK_STRAY" 2>/dev/null || true
+fi
+
 t "agent contract: the fallback documents the unstoppable-review exit"
 assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" '**Exit 4 means that did not work**'
 
@@ -853,7 +986,7 @@ KEYRING_OUT=$(env -u GH_TOKEN -u GITHUB_TOKEN PATH="$KEYRING_BIN:$PATH" \
 assert_eq "$KEYRING_OUT" 'gho_keyring_token keyring-user'
 
 if [[ "${AI_PR_LOOP_TEST_CONTRACT_ONLY:-0}" == "1" ]]; then
-  printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+  printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIPPED"
   (( FAIL == 0 )) || exit 1
   exit 0
 fi
@@ -5094,7 +5227,7 @@ assert_prints 'forge: gitlab host=gl.example:8443 scheme=https repo=g/p pr=9'
 t "run.sh: pre-canonicalization port-spelled state refuses with migration guidance"
 # State written by an earlier build under the ':443' spelling must not be
 # silently orphaned (the approved-resume no-op depends on its verdict file).
-# The tree is identified by its markers, not just its name. $ROOT/state is
+# The tree is identified by its markers, not just its name.  is
 # gitignored; the fixture is removed right after.
 mkdir -p "$ROOT/state/gl.example:443__g__p/pr-9"
 printf 'gitlab https://gl.example:443 g/p\n' > "$ROOT/state/gl.example:443__g__p/pr-9/.repo-slug"
@@ -5129,10 +5262,10 @@ rm -rf "$ROOT/state/gl.example:0443__g__p"
 assert_dies_with "pre-canonicalization spelling"
 
 t "run.sh: bare HTTP invocation refuses a ':080'-keyed legacy tree"
-mkdir -p "$ROOT/state/gitlab.lab:080__g__p/pr-9"
-printf 'gitlab http://gitlab.lab:080 g/p\n' > "$ROOT/state/gitlab.lab:080__g__p/pr-9/.repo-slug"
+mkdir -p "/gitlab.lab:080__g__p/pr-9"
+printf 'gitlab http://gitlab.lab:080 g/p\n' > "/gitlab.lab:080__g__p/pr-9/.repo-slug"
 run_run_sh http://gitlab.lab/g/p/-/merge_requests/9 --print-config
-rm -rf "$ROOT/state/gitlab.lab:080__g__p"
+rm -rf "/gitlab.lab:080__g__p"
 assert_dies_with "pre-canonicalization spelling"
 
 t "run.sh: canonical ':8443' invocation refuses an ':08443'-keyed legacy tree"
@@ -5154,10 +5287,10 @@ assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
 t "run.sh: a same-slug tree for an UNRELATED host never triggers the guard"
 # The canon-equivalence filter is load-bearing too: gitlab.internal is not
 # a spelling of gl.example, whatever its marker says.
-mkdir -p "$ROOT/state/gitlab.internal__g__p/pr-9"
-printf 'gitlab https://gitlab.internal g/p\n' > "$ROOT/state/gitlab.internal__g__p/pr-9/.repo-slug"
+mkdir -p "/gitlab.internal__g__p/pr-9"
+printf 'gitlab https://gitlab.internal g/p\n' > "/gitlab.internal__g__p/pr-9/.repo-slug"
 run_run_sh https://gl.example/g/p/-/merge_requests/9 --print-config
-rm -rf "$ROOT/state/gitlab.internal__g__p"
+rm -rf "/gitlab.internal__g__p"
 assert_prints 'forge: gitlab host=gl.example scheme=https repo=g/p pr=9'
 
 t "run.sh: a canonical http-on-443 tree is NOT mistaken for legacy https state"
@@ -5291,14 +5424,14 @@ assert_dies_with "MR is not open"
 t "run.sh: --preflight-only reports identity, MR URL, and branches"
 # Pre-clean so a guard regression in a previous suite run can't leave
 # debris that fails the side-effect assertion below against fixed code.
-rm -rf "$ROOT/state/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
+rm -rf "/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
 run_run_sh STUB_MR_OPEN=1 9 --repo g/p --forge gitlab --preflight-only
 assert_prints 'identity: testuser'
 assert_prints 'pr: https://gl.example/g/p/-/merge_requests/9'
 assert_prints 'branches: main <- feat/x'
 
 t "run.sh: --preflight-only creates no clone or state dir"
-if [[ -e "$ROOT/checkouts/gitlab.com__g__p" || -e "$ROOT/state/gitlab.com__g__p" ]]; then
+if [[ -e "$ROOT/checkouts/gitlab.com__g__p" || -e "/gitlab.com__g__p" ]]; then
   bad "preflight-only left side effects on disk"
 else
   ok
@@ -5442,13 +5575,13 @@ assert_eq "${STRIPPED_ARGV[6]}" 3
 # --- auto-resume: run.sh roles ---------------------------------------------
 # These start a real detached supervisor. Every case here kills the loop
 # early (missing token, missing context file, failing fetch), so no case
-# reaches an agent turn. $ROOT/state is gitignored; fixtures are removed as
+# reaches an agent turn.  is gitignored; fixtures are removed as
 # each case finishes.
 
 AR_GH_STATE="$ROOT/state/o__n/pr-1"
 
 t "run.sh: auto-resume is on by default and reports its budget"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n
 assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
 assert_substr "$AR_GH_STATE/supervisor.log" "budget 10 restart(s)"
@@ -5478,13 +5611,13 @@ t "run.sh: the supervisor hands the worker its argv verbatim (newline + quote)"
 # A --context-file path carrying a newline and a quote: the worker dies on it
 # and echoes the path, so the log proves the value crossed two process
 # boundaries intact.
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n --context-file "$(printf 'ab\n"q" c')"
 assert_substr "$AR_GH_STATE/supervisor.log" "not found or not a regular file: ab"
 if grep -Fxq -- '"q" c' "$AR_GH_STATE/supervisor.log"; then ok; else bad "the newline in the forwarded argument was lost"; fi
 
 t "run.sh: a flag-shaped option value is forwarded, not consumed"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n --context-file --no-auto-resume
 assert_substr "$AR_GH_STATE/supervisor.log" "not found or not a regular file: --no-auto-resume"
 
@@ -5497,31 +5630,31 @@ run_run_sh_supervised 1 --repo o/n --auto-resume
 assert_dies_with "--auto-resume needs a restart budget"
 
 t "run.sh: --auto-resume 0 runs the loop in this process"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n --auto-resume 0
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
-if [[ -e "$ROOT/state/o__n" ]]; then bad "--auto-resume 0 still started a supervisor"; else ok; fi
+if [[ -e "/o__n" ]]; then bad "--auto-resume 0 still started a supervisor"; else ok; fi
 
 t "run.sh: --no-auto-resume runs the loop in this process"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh 1 --repo o/n
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
-if [[ -e "$ROOT/state/o__n" ]]; then bad "--no-auto-resume still started a supervisor"; else ok; fi
+if [[ -e "/o__n" ]]; then bad "--no-auto-resume still started a supervisor"; else ok; fi
 
 t "run.sh: --print-config never starts a supervisor"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n --print-config
 assert_prints 'codex: model=gpt-5.6-sol effort=ultra tier=fast context-window=258400 context-source=catalog-estimate'
 if [[ -e "$ROOT/state/o__n" ]]; then bad "--print-config started a supervisor"; else ok; fi
 
 t "run.sh: --preflight-only never starts a supervisor"
-rm -rf "$ROOT/state/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
+rm -rf "/gitlab.com__g__p" "$ROOT/checkouts/gitlab.com__g__p"
 run_run_sh_supervised STUB_MR_OPEN=1 9 --repo g/p --forge gitlab --preflight-only
 assert_prints 'identity: testuser'
-if [[ -e "$ROOT/state/gitlab.com__g__p" ]]; then bad "--preflight-only started a supervisor"; else ok; fi
+if [[ -e "/gitlab.com__g__p" ]]; then bad "--preflight-only started a supervisor"; else ok; fi
 
 t "run.sh: --stop ignores missing agent executables and exits 0 without a preflight"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 run_run_sh_supervised 1 --repo o/n \
   --claude-bin "$WORK/removed claude" --codex-bin "$WORK/removed codex" --stop
 if [[ "$RUN_RC" -eq 0 && -e "$AR_GH_STATE/stop" ]]; then ok; else bad "--stop rc=$RUN_RC, sentinel missing"; fi
@@ -5530,7 +5663,7 @@ assert_substr "$WORK/run.err" "stop: wrote"
 t "run.sh: a fresh run clears a prior stop sentinel"
 run_run_sh_supervised 1 --repo o/n
 if [[ -e "$AR_GH_STATE/stop" ]]; then bad "the stale sentinel survived a new invocation"; else ok; fi
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 
 t "run.sh: a worker killed after it started is relaunched until the budget ends"
 # The git stub fails the PR-head fetch, which happens after the worker
@@ -5743,7 +5876,7 @@ spawn_in_session() {
 }
 
 t "run.sh: a stale supervisor.pid does not block a fresh run"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 mkdir -p "$AR_GH_STATE"
 spawn_in_session sleep 120
 AR_DECOY=$SESSION_PID
@@ -5761,7 +5894,7 @@ t "run.sh: --stop reports no supervisor when the pid file is stale"
 assert_substr "$WORK/run.err" "stop: no live supervisor"
 kill "$AR_DECOY" 2>/dev/null
 wait "$AR_DECOY" 2>/dev/null
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 
 # --- auto-resume: a recycled pid that looks like a supervisor ---------------
 # The OS can hand a dead supervisor's pid to ANOTHER loop's supervisor: the
@@ -5770,7 +5903,7 @@ rm -rf "$ROOT/state/o__n"
 # nor a fresh start may treat it as this PR's supervisor.
 
 t "run.sh: --stop leaves a recycled pid with a matching argv alone"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 mkdir -p "$AR_GH_STATE"
 # The compound command keeps bash resident (a single command would be
 # exec-optimized into a bare `sleep`, losing --_supervise from the argv and
@@ -5788,14 +5921,14 @@ else
 fi
 
 t "run.sh: a recycled pid with a matching argv does not block a fresh run"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 mkdir -p "$AR_GH_STATE"
 printf '%s\nWed Jan 1 00:00:00 2020\n' "$AR_DECOY2" > "$AR_GH_STATE/supervisor.pid"
 run_run_sh_supervised 1 --repo o/n
 assert_substr "$AR_GH_STATE/supervisor.log" "auto-resume: supervisor started"
 kill "$AR_DECOY2" 2>/dev/null
 wait "$AR_DECOY2" 2>/dev/null
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 
 # --- auto-resume: no session primitive → inline, loudly ---------------------
 # Without setsid or perl there is no detached session: a supervisor would
@@ -5809,9 +5942,9 @@ mkdir -p "$AR_NP_BIN"
 for _c in bash sh dirname date mkdir rmdir rm cat head tail grep sed awk tr \
           wc sleep ps git jq sort uniq cut ls env mktemp touch mv ln uname \
           id; do
-  _p=$(command -v "$_c" 2>/dev/null) && ln -s "$_p" "$AR_NP_BIN/$_c"
+  add_tool "$AR_NP_BIN" "$_c" || true
 done
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 env -i PATH="$STUBS:$AR_NP_BIN" HOME="$WORK" \
   bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
 RUN_RC=$?
@@ -5819,25 +5952,23 @@ assert_dies_with "auto-resume: disabled — neither setsid nor perl found"
 t "run.sh: the no-primitive inline run proceeds to the normal flow"
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: the no-primitive run starts no supervisor"
-if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a session primitive"; else ok; fi
+if [[ -e "/o__n" ]]; then bad "a supervisor state dir appeared without a session primitive"; else ok; fi
 
 t "run.sh: setsid without flock or perl runs inline with a warning"
 # A session primitive alone is not enough: supervision without a lock tool
 # would run unlocked, so simultaneous starts could all win.
 AR_SO_BIN="$WORK/ar-setsidonly-bin"
 mkdir -p "$AR_SO_BIN"
-for _l in "$AR_NP_BIN"/*; do
-  ln -s "$(readlink "$_l")" "$AR_SO_BIN/$(basename "$_l")"
-done
+clone_tool_dir "$AR_NP_BIN" "$AR_SO_BIN"
 # Only `command -v setsid` consults this — the inline path never executes
 # it — so a dummy keeps the case meaningful on hosts without setsid (macOS).
 if _p=$(command -v setsid 2>/dev/null); then
-  ln -s "$_p" "$AR_SO_BIN/setsid"
+  tool_shim "$AR_SO_BIN" setsid "$_p"
 else
   printf '#!/bin/sh\nexit 0\n' > "$AR_SO_BIN/setsid"
   chmod +x "$AR_SO_BIN/setsid"
 fi
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 env -i PATH="$STUBS:$AR_SO_BIN" HOME="$WORK" \
   bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
 RUN_RC=$?
@@ -5845,7 +5976,7 @@ assert_dies_with "no flock or perl to hold the single-supervisor lock"
 t "run.sh: the setsid-only inline run proceeds to the normal flow"
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: the setsid-only run starts no supervisor"
-if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a lock primitive"; else ok; fi
+if [[ -e "/o__n" ]]; then bad "a supervisor state dir appeared without a lock primitive"; else ok; fi
 
 t "run.sh: a setsid without -f and no perl runs inline with a warning"
 # BusyBox setsid has no -f: a session without reparenting cannot escape a
@@ -5853,9 +5984,7 @@ t "run.sh: a setsid without -f and no perl runs inline with a warning"
 # the real gap, not claim setsid is missing.
 AR_NF_BIN="$WORK/ar-nofork-bin"
 mkdir -p "$AR_NF_BIN"
-for _l in "$AR_NP_BIN"/*; do
-  ln -s "$(readlink "$_l")" "$AR_NF_BIN/$(basename "$_l")"
-done
+clone_tool_dir "$AR_NP_BIN" "$AR_NF_BIN"
 cat > "$AR_NF_BIN/setsid" <<'EOF'
 #!/bin/sh
 # BusyBox-shaped setsid: rejects -f.
@@ -5863,7 +5992,7 @@ case "$1" in -f) echo "setsid: invalid option -- f" >&2; exit 1 ;; esac
 exec "$@"
 EOF
 chmod +x "$AR_NF_BIN/setsid"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 env -i PATH="$STUBS:$AR_NF_BIN" HOME="$WORK" \
   bash "$ROOT/run.sh" 1 --repo o/n > "$WORK/run.out" 2> "$WORK/run.err"
 RUN_RC=$?
@@ -5871,7 +6000,7 @@ assert_dies_with "this setsid does not support -f"
 t "run.sh: the no-fork inline run proceeds to the normal flow"
 assert_dies_with "GH_TOKEN/GITHUB_TOKEN not set"
 t "run.sh: the no-fork run starts no supervisor"
-if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared without a reparenting primitive"; else ok; fi
+if [[ -e "/o__n" ]]; then bad "a supervisor state dir appeared without a reparenting primitive"; else ok; fi
 
 # --- auto-resume: state-path identity collisions -----------------------------
 # The flat state path is not injective: o__c/r and o/c__r share a
@@ -5880,19 +6009,19 @@ if [[ -e "$ROOT/state/o__n" ]]; then bad "a supervisor state dir appeared withou
 # instead of stopping or sharing another repository's supervisor.
 
 t "run.sh: --stop refuses a state dir owned by a colliding identity"
-rm -rf "$ROOT/state/o__c__r"
-mkdir -p "$ROOT/state/o__c__r/pr-1"
-printf 'o__c/r\n' > "$ROOT/state/o__c__r/pr-1/.repo-slug"
+rm -rf "/o__c__r"
+mkdir -p "/o__c__r/pr-1"
+printf 'o__c/r\n' > "/o__c__r/pr-1/.repo-slug"
 run_run_sh_supervised 1 --repo o/c__r --stop
 assert_dies_with "belongs to 'o__c/r', not 'o/c__r'"
 t "run.sh: the colliding --stop writes no sentinel"
-if [[ -e "$ROOT/state/o__c__r/pr-1/stop" ]]; then
+if [[ -e "/o__c__r/pr-1/stop" ]]; then
   bad "the sentinel landed in another repository's state dir"
 else ok; fi
 t "run.sh: a supervised start refuses a colliding state dir"
 run_run_sh_supervised 1 --repo o/c__r
 assert_dies_with "belongs to 'o__c/r', not 'o/c__r'"
-rm -rf "$ROOT/state/o__c__r"
+rm -rf "/o__c__r"
 
 t "run.sh: simultaneous first-touch stops elect exactly one identity"
 # The marker is hard-linked into place, so among racing first-touchers of
@@ -5901,7 +6030,7 @@ t "run.sh: simultaneous first-touch stops elect exactly one identity"
 AR_RACE_BAD=0
 for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
           21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
-  rm -rf "$ROOT/state/race__o__r"
+  rm -rf "/race__o__r"
   env -i PATH="$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
     1 --repo 'race__o/r' --stop >/dev/null 2>"$WORK/race.a.err" &
   _pa=$!
@@ -5915,7 +6044,7 @@ for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
 done
 if [[ "$AR_RACE_BAD" -eq 0 ]]; then ok
 else bad "$AR_RACE_BAD of 40 racing pairs did not elect exactly one owner"; fi
-rm -rf "$ROOT/state/race__o__r"
+rm -rf "/race__o__r"
 
 t "run.sh: first-touch anchoring survives a filesystem without hard links"
 # When ln cannot make hard links, the anchor falls back to a plain write —
@@ -5924,23 +6053,23 @@ AR_LN_BIN="$WORK/ar-noln-bin"
 mkdir -p "$AR_LN_BIN"
 printf '#!/bin/sh\nexit 1\n' > "$AR_LN_BIN/ln"
 chmod +x "$AR_LN_BIN/ln"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 SUP_PATH="$AR_LN_BIN:$STUBS:/usr/bin:/bin"
 run_run_sh_supervised 1 --repo o/n --stop
 SUP_PATH=""
 if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "--stop failed under a failing ln (rc=$RUN_RC)"; fi
 t "run.sh: the no-hard-link fallback still writes the identity marker"
 assert_eq "$(cat "$AR_GH_STATE/.repo-slug" 2>/dev/null)" "o/n"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 
 t "run.sh: an empty identity marker is repaired on the next touch"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 mkdir -p "$AR_GH_STATE"
 : > "$AR_GH_STATE/.repo-slug"
 run_run_sh_supervised 1 --repo o/n --stop
 if [[ "$RUN_RC" -eq 0 ]]; then ok; else bad "--stop failed on an empty marker (rc=$RUN_RC)"; fi
 assert_eq "$(cat "$AR_GH_STATE/.repo-slug" 2>/dev/null)" "o/n"
-rm -rf "$ROOT/state/o__n"
+rm -rf "/o__n"
 
 t "run.sh: racing first-touch stops elect one identity without hard links too"
 # With ln failing, election goes through mkdir — atomic on every
@@ -5948,7 +6077,7 @@ t "run.sh: racing first-touch stops elect one identity without hard links too"
 AR_LNRACE_BAD=0
 for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
           21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do
-  rm -rf "$ROOT/state/race__o__r"
+  rm -rf "/race__o__r"
   env -i PATH="$AR_LN_BIN:$STUBS:/usr/bin:/bin" HOME="$WORK" bash "$ROOT/run.sh" \
     1 --repo 'race__o/r' --stop >/dev/null 2>"$WORK/race.a.err" &
   _pa=$!
@@ -5962,7 +6091,7 @@ for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
 done
 if [[ "$AR_LNRACE_BAD" -eq 0 ]]; then ok
 else bad "$AR_LNRACE_BAD of 40 no-hard-link racing pairs did not elect exactly one owner"; fi
-rm -rf "$ROOT/state/race__o__r"
+rm -rf "/race__o__r"
 
 # --- auto-resume: a live supervised run ------------------------------------
 # The git stub blocks in the PR-head fetch and records its own pid, standing
@@ -6226,11 +6355,9 @@ t "run.sh: perl-only hosts reparent the supervisor out of the front-end tree"
 # contract must hold exactly as on util-linux hosts.
 AR_PERLONLY_BIN="$WORK/ar-perlonly-bin"
 mkdir -p "$AR_PERLONLY_BIN"
-for _l in "$AR_NP_BIN"/*; do
-  ln -s "$(readlink "$_l")" "$AR_PERLONLY_BIN/$(basename "$_l")"
-done
+clone_tool_dir "$AR_NP_BIN" "$AR_PERLONLY_BIN"
 for _c in perl flock; do
-  _p=$(command -v "$_c" 2>/dev/null) && ln -s "$_p" "$AR_PERLONLY_BIN/$_c"
+  add_tool "$AR_PERLONLY_BIN" "$_c" || true
 done
 rm -rf "$ROOT/state/gl.example__g__p" "$AR_LIVE_AGENT_FILE"
 spawn_in_session env -i PATH="$AR_LIVE_BIN:$STUBS:$AR_PERLONLY_BIN" HOME="$WORK" REAL_GIT="$REAL_GIT" \
@@ -9178,6 +9305,6 @@ assert_eq "$(cat "$(e2e_state)/local/completed.sha" 2>/dev/null)" "$_human"
 
 # --- summary ---------------------------------------------------------------
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIPPED"
 (( FAIL == 0 )) || exit 1
 exit 0

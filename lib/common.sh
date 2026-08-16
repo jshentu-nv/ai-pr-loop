@@ -3411,7 +3411,7 @@ claim_state_marker() {
 }
 
 ensure_state_dir() {
-  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/$(state_leaf_name)"
+  STATE_DIR="${STATE_ROOT:-$LOOP_HOME/state}/$(repo_ident_name)/$(state_leaf_name)"
   mkdir -p "$STATE_DIR"
   claim_state_marker "$STATE_DIR"
 }
@@ -3499,10 +3499,19 @@ normalize_codex_cwd() {
 }
 
 codex_cwd_matches() {
-  local recorded="$1" expected="$2"
+  local recorded="$1" expected="$2" rn en
   [[ -n "$recorded" && -n "$expected" ]] || return 1
-  [[ "$(normalize_codex_cwd "$recorded")" == \
-     "$(normalize_codex_cwd "$expected")" ]]
+  rn=$(normalize_codex_cwd "$recorded")
+  en=$(normalize_codex_cwd "$expected")
+  [[ "$rn" == "$en" ]] && return 0
+  # A Windows-recorded cwd keeps whatever casing the caller typed, and the
+  # filesystem it names is case-insensitive, so `D:\Src\Repo` and `/d/src/repo`
+  # are the same checkout. Fold case only when the recording was Windows
+  # shaped; an ordinary POSIX path stays an exact comparison.
+  [[ "$recorded" =~ ^[A-Za-z]:[\\/] ]] || return 1
+  rn=$(printf '%s' "$rn" | tr '[:upper:]' '[:lower:]')
+  en=$(printf '%s' "$en" | tr '[:upper:]' '[:lower:]')
+  [[ "$rn" == "$en" ]]
 }
 
 discover_new_codex_session_id() {

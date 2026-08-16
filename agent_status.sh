@@ -203,9 +203,14 @@ STOP_GRACE_SECONDS="${AI_PR_LOOP_AGENT_STATUS_STOP_GRACE_SECONDS:-20}"
 # Signal the recorded runner's whole process group. The guard starts it under
 # job control, so the group reaches the agent CLI below it.
 signal_recorded_runner() {  # <signal>
-  local pid
+  local pid token=''
   pid=$(record_pid "$RUNNER_PID_FILE") || return 1
   record_is_live "$RUNNER_PID_FILE" || return 1
+  # This signals a whole process group, so the pid must be provably the one
+  # the guard recorded. An empty token identifies nothing; without it, refuse
+  # rather than risk signalling whatever else now holds that pid.
+  { read -r _ || true; read -r token || token=''; } < "$RUNNER_PID_FILE"
+  [[ -n "${token//[[:space:]]/}" ]] || return 1
   kill -"$1" -- "-$pid" 2>/dev/null || kill -"$1" "$pid" 2>/dev/null || true
 }
 
