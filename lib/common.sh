@@ -1117,7 +1117,9 @@ windows_exec_exts() {
   local raw ext found=0 parts
   IFS=';' read -r -a parts <<<"${PATHEXT:-.COM;.EXE;.BAT;.CMD}"
   for raw in ${parts[@]+"${parts[@]}"}; do
-    ext="${raw,,}"
+    # tr, not ${raw,,}: bash 3.2 (stock macOS) has no case-conversion
+    # expansion, as the authority helper below also notes.
+    ext=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
     ext="${ext#"${ext%%[![:space:]]*}"}"
     ext="${ext%"${ext##*[![:space:]]}"}"
     case "$ext" in
@@ -1130,12 +1132,13 @@ windows_exec_exts() {
 # True when this path names something we can run: a regular file that either
 # carries the execute bit or is a Windows wrapper the loader will run.
 is_executable_file() {  # <path>
-  local p="$1"
+  local p="$1" lower
   [[ -f "$p" ]] || return 1
   [[ -x "$p" ]] && return 0
   is_windows_bash || return 1
   [[ -r "$p" ]] || return 1
-  case "${p,,}" in *.com|*.exe|*.bat|*.cmd) return 0 ;; esac
+  lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in *.com|*.exe|*.bat|*.cmd) return 0 ;; esac
   return 1
 }
 
@@ -1175,6 +1178,58 @@ resolve_command_path() {  # <value>
     done <<<"$exts"
   done < <(printf '%s\n' "${PATH//:/$'\n'}")
   return 1
+}
+
+# --- Process introspection -----------------------------------------------------
+#
+# `ps -o` is POSIX, but MSYS/Git Bash rejects every -o probe. There the pid
+# identity checks silently answered "not live", so --stop could neither
+# recognise nor signal its own supervisor and the review survived every stop.
+#
+# ps stays the first source on every host. Its output is what the recorded
+# start-time tokens have always been derived from, and a token written by an
+# earlier run must still compare equal. /proc is the fallback, and Git Bash
+# provides the three files these helpers need.
+
+# Process group id of $1.
+proc_pgid() {  # <pid>
+  local pid="$1" v=''
+  v=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || v=''
+  if [[ -z "$v" && -r "/proc/$pid/pgid" ]]; then
+    read -r v < "/proc/$pid/pgid" || v=''
+    v="${v//[[:space:]]/}"
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$v"
+}
+
+# Command line of $1 on one line, arguments separated by spaces.
+proc_argv() {  # <pid>
+  local pid="$1" v=''
+  v=$(ps -o args= -p "$pid" 2>/dev/null) || v=''
+  # Same emptiness test as the return below: ps printing only whitespace must
+  # reach /proc, not be judged a live argv here and rejected there.
+  if [[ -z "${v//[[:space:]]/}" && -r "/proc/$pid/cmdline" ]]; then
+    v=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || v=''
+  fi
+  [[ -n "${v//[[:space:]]/}" ]] || return 1
+  printf '%s\n' "$v"
+}
+
+# Kernel start time of $1, in clock ticks since boot.
+proc_stat_starttime() {  # <pid>
+  local pid="$1" line rest
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  read -r line < "/proc/$pid/stat" || return 1
+  # Field 22 is the start time. The comm field holds the executable name in
+  # parentheses and may itself contain spaces and parentheses, so cut at the
+  # LAST ') ' — every field after it is numeric.
+  rest="${line##*) }"
+  [[ "$rest" != "$line" ]] || return 1
+  # shellcheck disable=SC2086
+  set -- $rest              # $1 is field 3, so field 22 is $20
+  [[ "${20:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${20}"
 }
 
 # --- Pre-flight ---------------------------------------------------------------
@@ -1291,6 +1346,11 @@ preflight() {
       # hostname is explicit: `gh auth token` alone answers for gh's default
       # host, which may be an enterprise instance, and only github.com reaches
       # this code.
+      # Pin the host for every gh call, this one and the agents'. An ambient
+      # GH_HOST (normal for someone whose default is an enterprise instance)
+      # would otherwise send a github.com credential to that other host, and
+      # only github.com reaches this code at all.
+      export GH_HOST=github.com
       if [[ -n "${GH_TOKEN:-}" ]]; then
         export GH_TOKEN
       elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
@@ -3410,7 +3470,10 @@ normalize_codex_cwd() {
   # checkout as `/d/path`. Normalize only that unambiguous drive-path shape;
   # leave ordinary POSIX paths untouched so Unix ownership checks stay exact.
   if [[ "$p" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
-    drive="${BASH_REMATCH[1],,}"
+    # tr, not ${...,,}: bash 3.2 (stock macOS) has no case-conversion
+    # expansion, and a Windows-shaped cwd can reach a macOS host through a
+    # copied CODEX_HOME.
+    drive=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
     rest="${BASH_REMATCH[2]//\\//}"
     p="/${drive}/${rest}"
   fi

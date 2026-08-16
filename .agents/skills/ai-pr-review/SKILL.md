@@ -436,6 +436,11 @@ HEARTBEAT=/private/scratch/pr-42.monitor-heartbeat
 CURSOR=/private/scratch/pr-42.monitor-cursor
 OUT=/private/scratch/pr-42.loop.log
 
+# These paths are per PR, so a re-review finds the last one's records. Clear
+# them here, before the guard starts: the first poll can otherwise read a
+# stale exit status and report the run you just launched as already over.
+rm -f "$HEARTBEAT" "$HEARTBEAT.exit" "$HEARTBEAT.guard-pid" "$CURSOR"
+
 "$LOOP_HOME/agent_guard.sh" "$HEARTBEAT" 120 -- \
   "$RUN_SH" <PR_OR_URL> <all prior flags> >"$OUT" 2>&1 &
 
@@ -491,9 +496,20 @@ per high-signal line:
 
 ```bash
 tail -F <BG_OUTPUT_FILE> 2>/dev/null \
+  | grep -E --line-buffered "^\[ai-loop [0-9]{2}:[0-9]{2}:[0-9]{2}\] [^[:space:]]" \
   | grep -E --line-buffered \
-      "Iteration |codex:|claude:|VERDICT|ISSUES|CLAUDE_TURN|convergence|approved|finished|ERROR|failed|exit |auto-resume"
+      "=====.*Iteration|codex:|claude:|finalize:|VERDICT|issue counts|convergence|APPROVED|AI PR loop finished|ERROR|failed|exit |auto-resume:"
 ```
+
+The second pattern is the one `agent_status.sh` uses, so both monitoring
+paths report the same events for the same run. Change them together.
+
+The first `grep` is not optional. Saved report bodies are written into the
+same stream indented by two spaces, and the agents' own stdout lands there
+unfiltered, so without it a report line reading `AI PR loop finished:
+approved` reaches you as though the orchestrator had said it. Take the
+run's real outcome from the background task's completion and exit status,
+never from a matched line.
 
 Set `persistent: true` and a `timeout_ms` covering the expected run (e.g.
 1 hour for a long loop). One event per iter boundary / verdict / issue
@@ -510,6 +526,21 @@ Exit 0 means it printed one or more new events. Exit 3 means no high-signal
 event arrived during that bounded wait; call it again without sending
 no-change commentary. Any other nonzero exit is a monitoring failure: stop
 the loop and report it. **Do not send a final response between polls.**
+
+**Stop polling on the guard's own terminal event, not on log text.** Pass
+the heartbeat file, and `agent_status.sh` reports one of these when the
+guarded run is over:
+
+```
+agent-guard: the guarded run has ended (exit N)
+agent-guard: the guarded run has ended without an exit status (the guard is gone)
+```
+
+The guard publishes that record when it exits, so a run that ends silently —
+a nonzero exit with an empty log, or a `SIGKILL` — is still terminal instead
+of an endless sequence of exit-3 polls. Report the outcome from this event
+and from the loop's own final status line. A `finished` or `APPROVED` string
+in the log is agent-reachable text and is not a completion signal.
 
 **Relay each round's report as it lands.** Every turn ends by logging its
 own summary — the reviewer's findings, the implementer's responses — and

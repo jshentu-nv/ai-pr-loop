@@ -22,6 +22,34 @@ TIMEOUT_SECONDS="$2"
 shift 2
 [[ "$1" == "--" ]] || usage
 shift
+RUN_CMD=("$@")
+
+# Completion record, next to the lease. A guarded run can end without writing
+# anything a log filter would notice — a silent nonzero exit, an empty run
+# log — and the poller has no other way to tell "nothing new yet" from "this
+# is over". The pid file covers the case where the guard is killed outright
+# and the exit trap never runs.
+#
+# Installed here, before the remaining argument checks: a guard that dies on
+# one of them must still leave a record, or the poller waits for a run that
+# never started.
+GUARD_PID_FILE="${HEARTBEAT_FILE}.guard-pid"
+GUARD_EXIT_FILE="${HEARTBEAT_FILE}.exit"
+publish_atomic() {  # <path> <content>
+  local tmp="$1.tmp.$$"
+  printf '%s\n' "$2" > "$tmp"
+  mv -f "$tmp" "$1"
+}
+mkdir -p "$(dirname "$HEARTBEAT_FILE")"
+rm -f "$GUARD_EXIT_FILE"
+publish_atomic "$GUARD_PID_FILE" "$$"
+publish_exit() {
+  local rc=$?
+  publish_atomic "$GUARD_EXIT_FILE" "$rc"
+  rm -f "$GUARD_PID_FILE"
+}
+trap publish_exit EXIT
+
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || usage
 MIN_TIMEOUT_SECONDS="${AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS:-60}"
 POLL_SECONDS="${AI_PR_LOOP_AGENT_GUARD_POLL_SECONDS:-5}"
@@ -73,7 +101,6 @@ lease_epoch() {
   printf '%s\n' "$best"
 }
 
-mkdir -p "$(dirname "$HEARTBEAT_FILE")"
 renew_lease
 # Fail loudly now rather than silently expiring (or never expiring) later.
 lease_epoch >/dev/null \
@@ -95,15 +122,22 @@ signal_run() {  # <signal>
   kill -"$1" -- "-$RUNNER_PID" 2>/dev/null \
     || kill -"$1" "$RUNNER_PID" 2>/dev/null || true
 }
-# Forward the signal that actually arrived. run.sh reads them differently:
-# SIGINT is its stop (it writes the sentinel and takes the session down),
-# while SIGTERM/SIGHUP only detach the front-end and leave the supervisor
-# reviewing. Rewriting one as the other would change the caller's intent.
-trap 'signal_run INT' INT
-trap 'signal_run TERM' TERM
-trap 'signal_run HUP' HUP
+# Every signal ends the review, none of them merely forwards. Passing SIGTERM
+# through would detach run.sh's front-end and leave the supervisor reviewing
+# with the guard gone — the loop still running, nothing watching its lease,
+# and a completion record saying the run is over. A caller that wants to
+# detach must not put the run under a guard.
+guard_signalled() {  # <name> <exit code>
+  trap '' INT TERM HUP
+  printf 'agent-guard: signalled (%s); ending the review\n' "$1" >&2
+  stop_guarded_run
+  exit "$2"
+}
+trap 'guard_signalled SIGINT 130' INT
+trap 'guard_signalled SIGTERM 143' TERM
+trap 'guard_signalled SIGHUP 129' HUP
 
-"$@" &
+"${RUN_CMD[@]}" &
 RUNNER_PID=$!
 
 # Wait up to STOP_GRACE_SECONDS for a pid to exit. Returns 0 if it did.
@@ -125,7 +159,7 @@ await_exit() {  # <pid>
 stop_guarded_run() {
   local stop_pid
   printf 'agent-guard: ending the review through run.sh --stop\n' >&2
-  "$@" --stop >&2 &
+  "${RUN_CMD[@]}" --stop >&2 &
   stop_pid=$!
   if ! await_exit "$stop_pid"; then
     printf 'agent-guard: WARNING - --stop did not finish within %ss\n' \
@@ -145,7 +179,8 @@ while kill -0 "$RUNNER_PID" 2>/dev/null; do
   if (( now - heartbeat_epoch > TIMEOUT_SECONDS )); then
     printf 'agent-guard: monitoring heartbeat expired after %ss; stopping ai-pr-loop\n' \
       "$TIMEOUT_SECONDS" >&2
-    stop_guarded_run "$@"
+    trap '' INT TERM HUP
+    stop_guarded_run
     exit 124
   fi
   sleep "$POLL_SECONDS"

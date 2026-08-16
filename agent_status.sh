@@ -89,7 +89,20 @@ save_cursor() {
   mv -f "$tmp" "$CURSOR_FILE"
 }
 
-HIGH_SIGNAL='(=====.*Iteration|codex:|claude:|VERDICT|issue[[:space:]]counts|convergence|APPROVED|AI[[:space:]]PR[[:space:]]loop[[:space:]]finished|ERROR|failed|exit[[:space:]]|auto-resume:)'
+# Only the orchestrator's own log lines can raise an event. Saved report
+# bodies are written into this same log indented by two spaces, and the
+# agents' stdout lands there unfiltered, so a report line reading `AI PR loop
+# finished: approved` must not read as the controller saying it. Terminal
+# status is not taken from log text at all — see the guard exit record below.
+CONTROLLER_LINE='^\[ai-loop [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] [^[:space:]]'
+# The guard writes to the same captured log and its lines are always events.
+GUARD_LINE='^agent-guard: '
+HIGH_SIGNAL='(=====.*Iteration|codex:|claude:|finalize:|VERDICT|issue[[:space:]]counts|convergence|APPROVED|AI[[:space:]]PR[[:space:]]loop[[:space:]]finished|ERROR|failed|exit[[:space:]]|auto-resume:)'
+# The one sentence that tells the controller to stop polling. The agents can
+# write anything into this log — a failing turn's stderr is tailed into it
+# verbatim — so no log line is allowed to carry it. It reaches stdout only
+# from the guard's own exit record below.
+TERMINAL_TEXT='the guarded run has ended'
 # The one line the orchestrator prints when a round report is saved, anchored
 # to its whole shape: `[ai-loop HH:MM:SS] codex: iter 1 report (27 lines) -> …`.
 # Report bodies are logged into the same file (indented by two spaces) and the
@@ -115,10 +128,53 @@ emit_saved_report() {  # <codex|claude> <iter>
   fi
 }
 
+# The guard's completion record, published next to the lease. Checked BEFORE
+# the log is drained: once the guard is gone the log is final, so a flag read
+# first and acted on last cannot cut off the run's closing lines.
+GUARD_EXIT_FILE=''
+GUARD_PID_FILE=''
+if [[ -n "$HEARTBEAT_FILE" ]]; then
+  GUARD_EXIT_FILE="${HEARTBEAT_FILE}.exit"
+  GUARD_PID_FILE="${HEARTBEAT_FILE}.guard-pid"
+fi
+
+# Print the terminal event when the guarded run is over, else fail.
+guard_terminal_event() {
+  local rc='' pid=''
+  [[ -n "$GUARD_EXIT_FILE" ]] || return 1
+  # A live guard settles it first. These records sit at a path the controller
+  # reuses per PR, so a previous review's exit status can still be on disk
+  # when this one starts: the guard removes it, but the first poll can run
+  # before the guard gets that far.
+  if [[ -s "$GUARD_PID_FILE" ]]; then
+    read -r pid < "$GUARD_PID_FILE" || pid=''
+    # A recycled pid reads as alive and only delays this, which is the safe
+    # direction: the poller keeps watching instead of calling a live run over.
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+  fi
+  if [[ -s "$GUARD_EXIT_FILE" ]]; then
+    read -r rc < "$GUARD_EXIT_FILE" || rc=''
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=unknown
+    printf 'agent-guard: %s (exit %s)\n' "$TERMINAL_TEXT" "$rc"
+    return 0
+  fi
+  if [[ -s "$GUARD_PID_FILE" ]]; then
+    printf 'agent-guard: %s without an exit status (the guard is gone)\n' \
+      "$TERMINAL_TEXT"
+    return 0
+  fi
+  return 1
+}
+
 deadline=$(( $(date +%s) + WAIT_SECONDS ))
 
 while :; do
   renew_lease
+
+  TERMINAL_EVENT=''
+  TERMINAL_EVENT=$(guard_terminal_event) || TERMINAL_EVENT=''
 
   TOTAL_LINES=$(line_count "$LOG_FILE")
   # A truncated or replaced log restarts the cursor rather than skipping to
@@ -128,7 +184,12 @@ while :; do
   EMITTED=0
   if (( TOTAL_LINES > LAST_LINE )); then
     while IFS= read -r line; do
-      if [[ "$line" =~ $HIGH_SIGNAL ]]; then
+      if [[ "$line" == *"$TERMINAL_TEXT"* ]]; then
+        continue
+      fi
+      if [[ "$line" =~ $GUARD_LINE ]] \
+         || { [[ "$line" =~ $CONTROLLER_LINE ]] && [[ "$line" =~ $HIGH_SIGNAL ]]; }
+      then
         printf '%s\n' "$line"
         EMITTED=1
       fi
@@ -143,6 +204,10 @@ while :; do
     CURSOR_SEEDED=1
   fi
 
+  if [[ -n "$TERMINAL_EVENT" ]]; then
+    printf '%s\n' "$TERMINAL_EVENT"
+    exit 0
+  fi
   (( EMITTED == 1 )) && exit 0
   (( $(date +%s) >= deadline )) && exit 3
   sleep 1

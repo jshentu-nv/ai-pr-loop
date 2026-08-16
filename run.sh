@@ -772,7 +772,7 @@ PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
 # unrelated processes, so signal the pid alone and let its own trap forward.
 signal_supervisor() {
   local pid="$1" pgid
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=''
+  pgid=$(proc_pgid "$pid") || pgid=''
   if [[ "$pgid" == "$pid" ]]; then
     kill -TERM -- "-$pid" 2>/dev/null || true
   else
@@ -785,10 +785,13 @@ signal_supervisor() {
 # processes can share a recycled pid, but not a pid AND a start time.
 # TZ/LC_ALL are pinned because ps renders lstart in the caller's timezone
 # and locale — a --stop run from another environment must still match the
-# token the supervisor wrote.
+# token the supervisor wrote. Where ps has no -o support the token comes from
+# /proc instead, which is a different spelling of the same fact; both ends of
+# a comparison run this same function on the same host.
 proc_start_token() {
   local t
   t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || t=''
+  [[ -n "${t//[[:space:]]/}" ]] || t=$(proc_stat_starttime "$1") || t=''
   # shellcheck disable=SC2086
   set -- $t
   printf '%s\n' "$*"
@@ -804,7 +807,7 @@ recorded_pid_is_live() {
   local pid="${1:-}" token="${2:-}" argmark="$3"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -o args= -p "$pid" 2>/dev/null | grep -q -- "$argmark" || return 1
+  proc_argv "$pid" 2>/dev/null | grep -q -- "$argmark" || return 1
   [[ "$(proc_start_token "$pid")" == "$token" ]]
 }
 
@@ -951,8 +954,8 @@ if (( STOP_ONLY == 1 )); then
     # never our own group.
     read_pid_record "$PR_STATE_DIR/worker.pid"
     if worker_is_live "$REC_PID" "$REC_TOKEN"; then
-      W_PGID=$(ps -o pgid= -p "$REC_PID" 2>/dev/null | tr -d ' ') || W_PGID=''
-      MY_PGID=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || MY_PGID=''
+      W_PGID=$(proc_pgid "$REC_PID") || W_PGID=''
+      MY_PGID=$(proc_pgid "$$") || MY_PGID=''
       if [[ -n "$W_PGID" && "$W_PGID" != "$MY_PGID" ]]; then
         kill -TERM -- "-$W_PGID" 2>/dev/null || true
         log "stop: no live supervisor — signalled the orphaned worker group $W_PGID (worker pid $REC_PID)"
@@ -1155,7 +1158,7 @@ if [[ "$ROLE" == "supervise" ]]; then
   # the signal alone there.
   kill_worker_tree() {
     local pgid
-    pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || pgid=''
+    pgid=$(proc_pgid "$$") || pgid=''
     if [[ "$pgid" == "$$" ]]; then
       trap '' TERM
       kill -TERM -- "-$$" 2>/dev/null || true
