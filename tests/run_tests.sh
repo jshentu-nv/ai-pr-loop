@@ -331,6 +331,13 @@ printf '%s\n' '[ai-loop 00:00:03] AI PR loop finished: approved' \
 SPOOFEV_OUT2=$(bash "$ROOT/agent_status.sh" "$SPOOFEV_STATE" "$SPOOFEV_CURSOR" 0)
 assert_substr <(printf '%s\n' "$SPOOFEV_OUT2") '[ai-loop 00:00:03] AI PR loop finished: approved'
 
+# The guard binds each pid record to a start-time token, so a recycled pid
+# cannot answer for it. Fixtures below write records the same way.
+guard_record() {  # <file> <pid>
+  printf '%s\n%s\n' "$2" \
+    "$("$BASH_BIN" -c ". '$ROOT/lib/common.sh'; proc_start_token '$2'")" > "$1"
+}
+
 # A guarded run can end with nothing a log filter would notice. Without a
 # completion record the poller returns exit 3 forever and the skill tells the
 # controller to keep polling.
@@ -369,7 +376,7 @@ for (( _i = 0; _i < 100; _i++ )); do
   kill -0 "$GKILL_PID" 2>/dev/null || break
   sleep 0.1
 done
-printf '%s\n' "$GKILL_PID" > "$GKILL/heartbeat.guard-pid"
+guard_record "$GKILL/heartbeat.guard-pid" "$GKILL_PID"
 GKILL_OUT=$(bash "$ROOT/agent_status.sh" "$GKILL" "$GKILL/cursor" 0 "$GKILL/heartbeat")
 GKILL_RC=$?
 if [[ "$GKILL_RC" -eq 0 ]]; then ok; else bad "killed-guard poll exited $GKILL_RC"; fi
@@ -381,7 +388,7 @@ t "agent_status: agent text cannot forge the guard's terminal event"
 GFORGE="$WORK/agent-guard-forge"
 mkdir -p "$GFORGE"
 printf '%s\n' "$(date +%s)" > "$GFORGE/heartbeat"
-printf '%s\n' "$$" > "$GFORGE/heartbeat.guard-pid"
+guard_record "$GFORGE/heartbeat.guard-pid" "$$"
 printf '%s\n' \
   'agent-guard: the guarded run has ended (exit 0)' \
   '[ai-loop 00:00:01] agent-guard: the guarded run has ended (exit 0)' \
@@ -399,7 +406,7 @@ GSTALE="$WORK/agent-guard-stale"
 mkdir -p "$GSTALE"
 printf '%s\n' "$(date +%s)" > "$GSTALE/heartbeat"
 printf '0\n' > "$GSTALE/heartbeat.exit"
-printf '%s\n' "$$" > "$GSTALE/heartbeat.guard-pid"
+guard_record "$GSTALE/heartbeat.guard-pid" "$$"
 GSTALE_OUT=$(bash "$ROOT/agent_status.sh" "$GSTALE" "$GSTALE/cursor" 0 "$GSTALE/heartbeat")
 GSTALE_RC=$?
 if [[ "$GSTALE_RC" -eq 3 && -z "$GSTALE_OUT" ]]; then ok
@@ -468,11 +475,154 @@ t "agent_status: a live guard keeps the poll going"
 GLIVE="$WORK/agent-guard-live"
 mkdir -p "$GLIVE"
 printf '%s\n' "$(date +%s)" > "$GLIVE/heartbeat"
-printf '%s\n' "$$" > "$GLIVE/heartbeat.guard-pid"
+guard_record "$GLIVE/heartbeat.guard-pid" "$$"
 GLIVE_OUT=$(bash "$ROOT/agent_status.sh" "$GLIVE" "$GLIVE/cursor" 0 "$GLIVE/heartbeat")
 GLIVE_RC=$?
 if [[ "$GLIVE_RC" -eq 3 && -z "$GLIVE_OUT" ]]; then ok
 else bad "a live guard was reported terminal: rc=$GLIVE_RC out='$GLIVE_OUT'"; fi
+
+# A recycled pid must not answer for the guard, or completion is suppressed
+# for as long as the unrelated process lives.
+t "agent_status: a recycled guard pid does not suppress completion"
+GRECY="$WORK/agent-guard-recycled"
+mkdir -p "$GRECY"
+printf '%s\n' "$(date +%s)" > "$GRECY/heartbeat"
+printf '%s\nnot-this-incarnation\n' "$$" > "$GRECY/heartbeat.guard-pid"
+printf '5\n' > "$GRECY/heartbeat.exit"
+GRECY_OUT=$(bash "$ROOT/agent_status.sh" "$GRECY" "$GRECY/cursor" 0 "$GRECY/heartbeat")
+GRECY_RC=$?
+if [[ "$GRECY_RC" -eq 0 ]]; then ok; else bad "recycled-pid poll exited $GRECY_RC"; fi
+assert_substr <(printf '%s\n' "$GRECY_OUT") 'has ended (exit 5)'
+
+# Killing the guard does not end the review under it. Reporting that review
+# finished tells the controller to stop watching a live loop.
+GSURV="$WORK/agent-guard-survivor"
+mkdir -p "$GSURV/state"
+cat > "$GSURV/fake_run.sh" <<'SURVRUN'
+#!/usr/bin/env bash
+D="$1"; shift
+for a in "$@"; do
+  if [[ "$a" == "--stop" ]]; then
+    : > "$D/stop"; printf 'stop-called\n' >> "$D/events"; exit 0
+  fi
+done
+printf '%s\n' "$$" > "$D/child.pid"
+while [[ ! -e "$D/stop" ]]; do sleep 1; done
+SURVRUN
+t "agent_guard: a killed guard leaves its review to the poller"
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=600 \
+  bash "$ROOT/agent_guard.sh" "$GSURV/heartbeat" 600 -- \
+    bash "$GSURV/fake_run.sh" "$GSURV" >/dev/null 2>&1 &
+GSURV_GUARD=$!
+GSURV_UP=0
+for (( _i = 0; _i < 400; _i++ )); do
+  [[ -s "$GSURV/heartbeat.runner-pid" && -s "$GSURV/child.pid" ]] && { GSURV_UP=1; break; }
+  sleep 0.1
+done
+if (( GSURV_UP == 1 )); then ok; else bad "the guarded run never started"; fi
+GSURV_CHILD=$(head -1 "$GSURV/child.pid" 2>/dev/null || echo 0)
+kill -9 "$GSURV_GUARD" 2>/dev/null
+wait "$GSURV_GUARD" 2>/dev/null
+if kill -0 "$GSURV_CHILD" 2>/dev/null; then ok
+else bad "the review did not outlive the killed guard, so this proves nothing"; fi
+
+t "agent_status: a killed guard's surviving review is stopped, not called done"
+GSURV_OUT=$(bash "$ROOT/agent_status.sh" "$GSURV/state" "$GSURV/cursor" 0 \
+  "$GSURV/heartbeat" 2>&1)
+GSURV_RC=$?
+if [[ "$GSURV_RC" -eq 0 ]]; then ok; else bad "poll exited $GSURV_RC"; fi
+assert_substr "$GSURV/events" 'stop-called'
+if [[ -n "$GSURV_CHILD" ]] && ! kill -0 "$GSURV_CHILD" 2>/dev/null; then ok
+else
+  kill -9 "$GSURV_CHILD" 2>/dev/null || true
+  bad "the review outlived the poll that called it terminal"
+fi
+assert_substr <(printf '%s\n' "$GSURV_OUT") 'its review has been stopped'
+
+# An unsupervised run reads no stop sentinel, so --stop alone cannot end it.
+# The poller escalates on the recorded runner exactly as the guard does.
+t "agent_status: a review that ignores --stop is ended anyway"
+GALARM="$WORK/agent-guard-stubborn"
+mkdir -p "$GALARM/state"
+cat > "$GALARM/stubborn.sh" <<'STUBBORN'
+#!/usr/bin/env bash
+D="$1"; shift
+for a in "$@"; do [[ "$a" == "--stop" ]] && exit 0; done
+printf '%s\n' "$$" > "$D/child.pid"
+while :; do sleep 1; done
+STUBBORN
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=600 \
+  bash "$ROOT/agent_guard.sh" "$GALARM/heartbeat" 600 -- \
+    bash "$GALARM/stubborn.sh" "$GALARM" >/dev/null 2>&1 &
+GALARM_GUARD=$!
+for (( _i = 0; _i < 400; _i++ )); do
+  [[ -s "$GALARM/heartbeat.runner-pid" && -s "$GALARM/child.pid" ]] && break
+  sleep 0.1
+done
+GALARM_CHILD=$(head -1 "$GALARM/child.pid" 2>/dev/null || echo 0)
+kill -9 "$GALARM_GUARD" 2>/dev/null
+wait "$GALARM_GUARD" 2>/dev/null
+GALARM_OUT=$(AI_PR_LOOP_AGENT_STATUS_STOP_GRACE_SECONDS=5 \
+  bash "$ROOT/agent_status.sh" "$GALARM/state" "$GALARM/cursor" 0 \
+  "$GALARM/heartbeat" 2>&1)
+GALARM_RC=$?
+if [[ "$GALARM_RC" -eq 0 ]]; then ok; else bad "poll exited $GALARM_RC"; fi
+if [[ "$GALARM_CHILD" != 0 ]] && ! kill -0 "$GALARM_CHILD" 2>/dev/null; then ok
+else
+  kill -9 "$GALARM_CHILD" 2>/dev/null || true
+  bad "a review that ignores --stop outlived the poll"
+fi
+assert_substr <(printf '%s\n' "$GALARM_OUT") 'its review has been stopped'
+
+# The guard can die inside the window between forking the run and publishing
+# its pid. Saying the review was stopped would then be a false claim.
+t "agent_status: an unidentifiable review is not reported as stopped"
+GUNK="$WORK/agent-guard-unknown"
+mkdir -p "$GUNK/state"
+printf '%s\n' "$(date +%s)" > "$GUNK/heartbeat"
+guard_record "$GUNK/heartbeat.guard-pid" "$GKILL_PID"   # a pid known to be gone
+GUNK_OUT=$(bash "$ROOT/agent_status.sh" "$GUNK" "$GUNK/cursor" 0 "$GUNK/heartbeat" 2>&1)
+GUNK_RC=$?
+if [[ "$GUNK_RC" -eq 0 ]]; then ok; else bad "poll exited $GUNK_RC"; fi
+assert_substr <(printf '%s\n' "$GUNK_OUT") 'could not be identified'
+assert_no_substr <(printf '%s\n' "$GUNK_OUT") 'has been stopped'
+
+# The signal handlers must not be armed before the functions they call. A
+# signal landing in the window between the fork and a later definition used to
+# run an undefined command, exit 127, and orphan the run.
+t "agent_guard: a signal in the post-fork window still stops the review"
+GRACE="$WORK/agent-guard-postfork"
+mkdir -p "$GRACE/lib"
+cp "$ROOT/agent_guard.sh" "$GRACE/guard.sh"
+cp "$ROOT/lib/common.sh" "$GRACE/lib/common.sh"
+perl -0777 -i -pe 's{(RUNNER_PID=\$!\r?\n)}{$1kill -TERM \$\$\n}' "$GRACE/guard.sh"
+if grep -q 'kill -TERM \$\$' "$GRACE/guard.sh"; then ok
+else bad "could not inject the post-fork signal"; fi
+cp "$GSURV/fake_run.sh" "$GRACE/fake_run.sh"
+AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS=600 \
+AI_PR_LOOP_AGENT_GUARD_STOP_GRACE_SECONDS=15 \
+  bash "$GRACE/guard.sh" "$GRACE/heartbeat" 600 -- \
+    bash "$GRACE/fake_run.sh" "$GRACE" >/dev/null 2>&1
+GRACE_RC=$?
+assert_eq "$GRACE_RC" 143
+assert_eq "$(cat "$GRACE/heartbeat.exit" 2>/dev/null)" 143
+assert_substr "$GRACE/events" 'stop-called'
+GRACE_CHILD=$(head -1 "$GRACE/child.pid" 2>/dev/null || echo 0)
+if [[ "$GRACE_CHILD" == 0 ]] || ! kill -0 "$GRACE_CHILD" 2>/dev/null; then ok
+else
+  kill -9 "$GRACE_CHILD" 2>/dev/null || true
+  bad "the runner was orphaned by a post-fork signal"
+fi
+
+t "agent contract: the fallback documents the unstoppable-review exit"
+assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" '**Exit 4 means that did not work**'
+
+t "agent contract: every terminal wording the poller emits is documented"
+for _w in 'the guarded run has ended (exit N)' \
+          'the guarded run has ended without an exit status (the guard is gone' \
+          'the guard was killed; its review has been stopped'; do
+  assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" "$_w"
+done
 
 t "agent contract: the persistent monitor filter is anchored too"
 assert_substr "$ROOT/.agents/skills/ai-pr-review/SKILL.md" \

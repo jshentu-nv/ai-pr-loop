@@ -534,13 +534,24 @@ guarded run is over:
 ```
 agent-guard: the guarded run has ended (exit N)
 agent-guard: the guarded run has ended without an exit status (the guard is gone)
+agent-guard: the guarded run has ended without an exit status (the guard was killed; its review has been stopped)
 ```
 
 The guard publishes that record when it exits, so a run that ends silently —
-a nonzero exit with an empty log, or a `SIGKILL` — is still terminal instead
-of an endless sequence of exit-3 polls. Report the outcome from this event
-and from the loop's own final status line. A `finished` or `APPROVED` string
-in the log is agent-reachable text and is not a completion signal.
+a nonzero exit with an empty log — is still terminal instead of an endless
+sequence of exit-3 polls. Report the outcome from this event and from the
+loop's own final status line. A `finished` or `APPROVED` string in the log is
+agent-reachable text and is not a completion signal.
+
+A guard killed outright writes no exit status, and killing the guard does not
+end the review below it. The poller therefore checks whether that review
+outlived its guard, and ends it — the recorded `--stop`, then the run's own
+process group — before calling anything terminal. When it cannot identify the
+review, it says so rather than claiming it stopped one.
+
+**Exit 4 means that did not work**: the guard is gone, the review survived
+both the stop and the signals, and nothing is enforcing the lease. Stop it by
+hand with `run.sh <pr> --repo <slug> --stop`, tell the user, and stop polling.
 
 **Relay each round's report as it lands.** Every turn ends by logging its
 own summary — the reviewer's findings, the implementer's responses — and

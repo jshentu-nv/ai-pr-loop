@@ -780,22 +780,9 @@ signal_supervisor() {
   fi
 }
 
-# Start-time token for pid $1, whitespace-squeezed; empty when unknown.
-# Written next to the pid in supervisor.pid and compared on every read: two
-# processes can share a recycled pid, but not a pid AND a start time.
-# TZ/LC_ALL are pinned because ps renders lstart in the caller's timezone
-# and locale — a --stop run from another environment must still match the
-# token the supervisor wrote. Where ps has no -o support the token comes from
-# /proc instead, which is a different spelling of the same fact; both ends of
-# a comparison run this same function on the same host.
-proc_start_token() {
-  local t
-  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || t=''
-  [[ -n "${t//[[:space:]]/}" ]] || t=$(proc_stat_starttime "$1") || t=''
-  # shellcheck disable=SC2086
-  set -- $t
-  printf '%s\n' "$*"
-}
+# proc_start_token lives in lib/common.sh. agent_guard.sh writes those tokens
+# into its own pid records and agent_status.sh compares them, so one spelling
+# has to serve all three or the two ends drift apart.
 
 # True when pid $1 is a live process of this loop whose argv carries $3 and
 # whose start-time token matches $2. A process killed with SIGKILL leaves

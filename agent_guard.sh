@@ -20,35 +20,67 @@ EOF
 HEARTBEAT_FILE="$1"
 TIMEOUT_SECONDS="$2"
 shift 2
-[[ "$1" == "--" ]] || usage
-shift
-RUN_CMD=("$@")
 
-# Completion record, next to the lease. A guarded run can end without writing
-# anything a log filter would notice — a silent nonzero exit, an empty run
-# log — and the poller has no other way to tell "nothing new yet" from "this
-# is over". The pid file covers the case where the guard is killed outright
-# and the exit trap never runs.
+# proc_start_token, shared with run.sh and agent_status.sh. The poller
+# compares the tokens written below, so both ends must derive them the same
+# way; a second spelling would drift.
+GUARD_HOME="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ -r "$GUARD_HOME/lib/common.sh" ]] || {
+  printf 'agent-guard: run this from its checkout: %s/lib/common.sh is missing\n' \
+    "$GUARD_HOME" >&2
+  exit 2
+}
+# shellcheck source=lib/common.sh
+. "$GUARD_HOME/lib/common.sh"
+
+# Records kept next to the lease, all removed on a clean exit:
 #
-# Installed here, before the remaining argument checks: a guard that dies on
-# one of them must still leave a record, or the poller waits for a run that
-# never started.
+#   .guard-pid   this guard's pid and start-time token
+#   .runner-pid  the guarded run's pid and token, written after the fork
+#   .stop-cmd    the argv to re-run with --stop, NUL separated
+#   .exit        the guard's exit status
+#
+# A guarded run can end without writing anything a log filter would notice — a
+# silent nonzero exit, an empty run log — so .exit is what tells the poller
+# "this is over". The other three exist for the guard dying without running
+# its exit trap: the poller can then tell whether the review outlived the
+# guard, and end it through the same authoritative stop the guard would have
+# used. The start-time tokens matter because a bare pid is reused, and an
+# unrelated process holding this guard's old pid would otherwise look alive
+# for as long as it ran.
+#
+# Written as soon as the heartbeat path is known, before any argument check
+# that can exit: a guard that dies on one of them must still leave a record,
+# or the poller waits for a run that never started.
 GUARD_PID_FILE="${HEARTBEAT_FILE}.guard-pid"
 GUARD_EXIT_FILE="${HEARTBEAT_FILE}.exit"
+RUNNER_PID_FILE="${HEARTBEAT_FILE}.runner-pid"
+STOP_CMD_FILE="${HEARTBEAT_FILE}.stop-cmd"
 publish_atomic() {  # <path> <content>
   local tmp="$1.tmp.$$"
   printf '%s\n' "$2" > "$tmp"
   mv -f "$tmp" "$1"
 }
-mkdir -p "$(dirname "$HEARTBEAT_FILE")"
-rm -f "$GUARD_EXIT_FILE"
-publish_atomic "$GUARD_PID_FILE" "$$"
+publish_pid_record() {  # <path> <pid>
+  publish_atomic "$1" "$2
+$(proc_start_token "$2")"
+}
 publish_exit() {
   local rc=$?
   publish_atomic "$GUARD_EXIT_FILE" "$rc"
-  rm -f "$GUARD_PID_FILE"
+  rm -f "$GUARD_PID_FILE" "$RUNNER_PID_FILE" "$STOP_CMD_FILE" \
+        "$GUARD_PID_FILE.tmp.$$" "$RUNNER_PID_FILE.tmp.$$" "$STOP_CMD_FILE.tmp.$$"
 }
+mkdir -p "$(dirname "$HEARTBEAT_FILE")"
+rm -f "$GUARD_EXIT_FILE" "$RUNNER_PID_FILE" "$STOP_CMD_FILE"
 trap publish_exit EXIT
+publish_pid_record "$GUARD_PID_FILE" "$$"
+
+[[ "$1" == "--" ]] || usage
+shift
+RUN_CMD=("$@")
+printf '%s\0' "${RUN_CMD[@]}" > "$STOP_CMD_FILE.tmp.$$"
+mv -f "$STOP_CMD_FILE.tmp.$$" "$STOP_CMD_FILE"
 
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || usage
 MIN_TIMEOUT_SECONDS="${AI_PR_LOOP_AGENT_GUARD_MIN_TIMEOUT_SECONDS:-60}"
@@ -113,36 +145,17 @@ lease_epoch >/dev/null \
 # runs the loop itself, and signalling only its pid leaves the agent running.
 set -m
 
-# Armed before the fork: a signal arriving in the window between starting the
-# run and installing the traps would otherwise kill the guard by default
-# action and leave the run going with nothing watching its lease.
 RUNNER_PID=''
 signal_run() {  # <signal>
   [[ -n "$RUNNER_PID" ]] || return 0
   kill -"$1" -- "-$RUNNER_PID" 2>/dev/null \
     || kill -"$1" "$RUNNER_PID" 2>/dev/null || true
 }
-# Every signal ends the review, none of them merely forwards. Passing SIGTERM
-# through would detach run.sh's front-end and leave the supervisor reviewing
-# with the guard gone — the loop still running, nothing watching its lease,
-# and a completion record saying the run is over. A caller that wants to
-# detach must not put the run under a guard.
-guard_signalled() {  # <name> <exit code>
-  trap '' INT TERM HUP
-  printf 'agent-guard: signalled (%s); ending the review\n' "$1" >&2
-  stop_guarded_run
-  exit "$2"
-}
-trap 'guard_signalled SIGINT 130' INT
-trap 'guard_signalled SIGTERM 143' TERM
-trap 'guard_signalled SIGHUP 129' HUP
-
-"${RUN_CMD[@]}" &
-RUNNER_PID=$!
 
 # Wait up to STOP_GRACE_SECONDS for a pid to exit. Returns 0 if it did.
 await_exit() {  # <pid>
-  local pid="$1" waited=0
+  local pid="${1:-}" waited=0
+  [[ -n "$pid" ]] || return 0
   while kill -0 "$pid" 2>/dev/null; do
     (( waited < STOP_GRACE_SECONDS )) || return 1
     sleep 1
@@ -168,10 +181,35 @@ stop_guarded_run() {
   fi
   wait "$stop_pid" 2>/dev/null || true
 
+  [[ -n "$RUNNER_PID" ]] || return 0
   signal_run TERM
   await_exit "$RUNNER_PID" || signal_run KILL
   wait "$RUNNER_PID" 2>/dev/null || true
 }
+
+# Every signal ends the review, none of them merely forwards. Passing SIGTERM
+# through would detach run.sh's front-end and leave the supervisor reviewing
+# with the guard gone — the loop still running, nothing watching its lease,
+# and a completion record saying the run is over. A caller that wants to
+# detach must not put the run under a guard.
+guard_signalled() {  # <name> <exit code>
+  trap '' INT TERM HUP
+  printf 'agent-guard: signalled (%s); ending the review\n' "$1" >&2
+  stop_guarded_run
+  exit "$2"
+}
+# Armed only here. Every function a handler reaches is defined above and the
+# fork is below, so no signal can land on a name that does not exist yet: that
+# would run an undefined command, exit 127 under set -e, and orphan the run.
+trap 'guard_signalled SIGINT 130' INT
+trap 'guard_signalled SIGTERM 143' TERM
+trap 'guard_signalled SIGHUP 129' HUP
+
+"${RUN_CMD[@]}" &
+RUNNER_PID=$!
+# What lets the poller tell "the guard finished" from "the guard was killed
+# and its review is still running".
+publish_pid_record "$RUNNER_PID_FILE" "$RUNNER_PID"
 
 while kill -0 "$RUNNER_PID" 2>/dev/null; do
   now=$(date +%s)

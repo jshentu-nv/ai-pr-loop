@@ -7,9 +7,15 @@ allowed-tools: Bash, Read, Monitor
 
 # AI PR Review
 
-The canonical, cross-agent instructions are in:
+The canonical, cross-agent instructions are in the `ai-pr-loop` checkout, at:
 
-`../../../.agents/skills/ai-pr-review/SKILL.md`
+`.agents/skills/ai-pr-review/SKILL.md`
+
+Relative to this file that is `../../../.agents/skills/ai-pr-review/SKILL.md`.
+This file is normally reached through a symlink from `~/.claude/skills`, so
+resolve the path against the checkout, not against the link: try
+`$AI_PR_LOOP_HOME`, then `~/ai-pr-loop`, then wherever the user says the
+checkout is.
 
 Read that file completely before taking any action. Do not launch, resume,
 monitor, stop, or report an AI PR loop from this pointer alone. If the
