@@ -8,6 +8,10 @@ set -euo pipefail
 HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
+trap _runtime_rpc_stop_if_active EXIT
+trap '_runtime_rpc_exit_on_signal 129' HUP
+trap '_runtime_rpc_exit_on_signal 130' INT
+trap '_runtime_rpc_exit_on_signal 143' TERM
 
 ID=$(iter_dir "$ITER")
 mkdir -p "$ID"
@@ -80,22 +84,28 @@ if [[ "$LOCAL_MODE" == "1" ]]; then
   SCOPE_NOTE="**Review-created diff.** Read \`${SCOPE_FILE}\` before editing. It separates the original change from paths changed by this review and flags paths newly brought into scope. Your response must justify every path you change."
 fi
 
-# Resolve the pure model/effort metadata before prompt rendering.  The full
-# claude_prepare_cli call stays below because it also creates session state and
-# may probe permission mode; both paths reuse these exact resolved values.
-claude_resolve_model_effort
+# Resolve the exact CLI argv and run Claude's control-only metadata handshake
+# before prompt rendering. The session argument matters: a resumed session can
+# retain a different model than today's CLI/config default.
+claude_prepare_cli
 if [[ "$LOCAL_MODE" == "1" ]]; then
   CLAUDE_CONTEXT_WINDOW_RESOLVED=unknown
-elif [[ -z "${CLAUDE_CONTEXT_WINDOW_RESOLVED:-}" ]]; then
-  CLAUDE_CONTEXT_WINDOW_RESOLVED=$(resolve_claude_context_window \
-    "$CLAUDE_MODEL_RESOLVED" "${CLAUDE_CONTEXT_WINDOW:-auto}")
+  CLAUDE_CONTEXT_WINDOW_SOURCE=unknown
+else
+  [[ "$CLAUDE_MODEL_ACTUAL" != "unknown" ]] \
+    || die "Claude did not report its effective model; refusing to render forge comments with guessed metadata"
+  [[ "$CLAUDE_EFFORT_ACTUAL" != "unknown" ]] \
+    || die "Claude did not report its effective effort; choose an explicit --claude-effort for the first forge turn"
+  [[ "$CLAUDE_CONTEXT_WINDOW_RESOLVED" =~ ^[1-9][0-9]*$ ]] \
+    || die "Claude did not report an effective context window; set --claude-context-window for this CLI/provider"
 fi
-CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
-  "${CLAUDE_CONTEXT_WINDOW:-auto}" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
 AI_COMMENT_SIGNATURE=$(ai_comment_signature \
-  "$(ai_model_display "$CLAUDE_MODEL_RESOLVED")" \
-  "$(claude_effort_display "$CLAUDE_EFFORT_RESOLVED")" \
+  "$CLAUDE_MODEL_ACTUAL" \
+  "$CLAUDE_EFFORT_ACTUAL" \
   "$CLAUDE_CONTEXT_WINDOW_RESOLVED" "$CLAUDE_CONTEXT_WINDOW_SOURCE")
+export AI_COMMENT_SIGNATURE
+AI_COMMENT_BOT=claude
+export AI_COMMENT_BOT
 AI_COMMENT_SIGNATURE_SED=$(prompt_sed_replacement "$AI_COMMENT_SIGNATURE")
 log "claude: context window = ${CLAUDE_CONTEXT_WINDOW_RESOLVED}"
 
@@ -143,12 +153,16 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{AI_COMMENT_SIGNATURE}}|${AI_COMMENT_SIGNATURE_SED}|g" \
   > "$PROMPT_FILE"
 
+if [[ "$LOCAL_MODE" != "1" ]]; then
+  record_ai_signature_attempt claude "$ITER" "$AI_COMMENT_SIGNATURE" "$THREAD_FILE" \
+    || die "could not record the Claude signature attempt manifest"
+fi
+
 log "claude: iter $ITER — running"
 
-# Resolve the CLI knobs (session, model, effort, permissions) and run this
-# iteration's prompt. Both live in lib/common.sh so the finalize turn of a
-# local review runs with exactly the same setup.
-claude_prepare_cli
+# Run this iteration with the exact argv whose runtime metadata was signed
+# above. CLI preparation lives in lib/common.sh so local finalize uses the same
+# setup as an implementer turn.
 set +e
 claude_run_prompt "$PROMPT_FILE" "$ID/claude.stdout" "$ID/claude.stderr"
 RC=$?

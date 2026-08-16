@@ -45,7 +45,9 @@ Requirements on the host:
   another name/path with `--codex-bin` or `CODEX_BIN`).
 - Claude CLI installed and logged in (executable `claude` by default; select
   another name/path with `--claude-bin` or `CLAUDE_BIN`).
-- `git`, `jq` available on `$PATH`.
+- `git`, `jq`, and either `setsid` or `perl` available on `$PATH`. The latter
+  contains each metadata-control subprocess and its descendants so a killed
+  or restarted turn cannot leave a CLI running in the checkout.
 
 No NVIDIA / org-specific config — works on any GitHub/GitLab repo the
 authenticated user can comment on and push to.
@@ -256,7 +258,9 @@ always treated as exactly one executable—not split or evaluated as shell—so
 use a wrapper script if the command needs fixed extra arguments. A bare name
 beginning with `-` must be spelled as a path (for example,
 `/opt/bin/-claude`). Alternate executables must implement the corresponding
-Claude Code or Codex CLI/session interface.
+Claude Code or Codex CLI/session interface, including Claude's stream-json
+control requests or Codex's app-server/config and active-model-catalog
+commands when runtime signatures are enabled.
 
 Both agents run on a pinned model at high reasoning effort by default; you
 can dial each one. Every knob is passed explicitly on every turn (fresh and
@@ -276,12 +280,15 @@ apply in `-p` mode). Dial with:
 - `--claude-model MODEL` — passed as `--model`. Default `fable`; `off`
   leaves the CLI/settings default untouched.
 - `--claude-context-window TOKENS|auto` — context-window size reported in
-  Claude's forge-comment signature. `auto` (default) reports `1000000`
-  tokens as the model default paired with `fable`; other aliases, custom
-  model names, and `--claude-model off` report `unknown` unless you supply
-  an explicit token count. Host policy/provider settings can override a
-  model default. This is labeled display metadata only; it does not change
-  the Claude CLI's context allocation.
+  Claude's forge-comment signature. `auto` (default) runs a control-only
+  stream-json handshake with the exact executable, session, model, effort,
+  permission, and settings arguments for that turn. `get_settings` supplies
+  the applied model, effort, and ultracode state; `get_context_usage` supplies
+  the effective window. This includes aliases, host defaults, and resumed
+  sessions, sends no user message, and starts no model request. An explicit
+  token count skips only the context query for wrapper/custom CLIs that still
+  implement `get_settings`; it is a display override and does not change
+  Claude's context allocation.
 - `--claude-effort LEVEL` — one of `ultracode` (default), `low`, `medium`,
   `high`, `xhigh`, `max`, or `off`.
 - `--claude-perms MODE` — permission handling for the headless turns. `auto`
@@ -290,13 +297,11 @@ apply in `-p` mode). Dial with:
   where bypass is policy-disabled. Auto mode isn't available on every
   account/provider (Pro and Bedrock/Vertex/Foundry are excluded;
   Team/Enterprise needs admin enablement), and ineligible hosts silently
-  downgrade it to default mode — so the first turn for each PR, Claude
-  executable, and model combination runs a deterministic preflight probe
-  that reads the CLI-reported effective mode (cached in the PR's state dir;
-  delete `claude.automode.effective` to re-probe after changing enablement)
-  and switches to the same settings safety net `bypass` uses when auto
-  doesn't stick. A CLI that hard-rejects the flag at startup instead
-  triggers a single retry with that net.
+  downgrade it to default mode. The same control-only runtime handshake reads
+  the CLI-reported effective mode before every turn and switches to the
+  settings safety net `bypass` uses when auto does not stick. A CLI that
+  hard-rejects the flag is queried once more without auto before the real turn
+  starts, so fallback never duplicates model work.
   `bypass`: `--dangerously-skip-permissions`
   plus a settings safety net (auto-accepted edits + allowed
   Bash/WebFetch/WebSearch) for hosts that silently downgrade bypass (managed
@@ -317,14 +322,18 @@ unattended. Dial with:
 - `--codex-model MODEL` — passed as `-m`. Default `gpt-5.6-sol`; `off`
   leaves the host's codex config untouched.
 - `--codex-context-window TOKENS|auto` — context-window size reported in
-  Codex's forge-comment signature. `auto` (default) looks up the selected
-  model in Codex's bundled model catalog and reports its effective context
-  window (the catalog window adjusted by its effective-window percentage).
-  The signature labels this a `bundled default`: host
-  `model_context_window`, custom-catalog, and provider settings can override
-  it. If the model cannot be resolved, the signature reports `unknown`; an
-  explicit token count is labeled `configured`. This is display metadata only
-  and does not change Codex's context allocation.
+  Codex's forge-comment signature. `auto` (default) asks Codex app-server for
+  effective layered config plus the default model/effort. For a resumed CLI
+  session it issues the same control-only `thread/resume` shape as `codex exec
+  resume` and reads the response's actual model and effort, rather than stale
+  rollout metadata. It then looks up that actual model in `codex debug models`
+  without `--bundled`. This honors the active provider/catalog and configured
+  context override before applying the effective-window percentage. These
+  metadata calls start no turn or inference request; probing a resume only
+  loads the existing thread in the short-lived app-server. An explicit token
+  count is labeled `configured` and remains display-only. If the CLI cannot
+  report the effective model, effort, or a catalog/context size, the forge
+  turn fails before posting a guessed signature.
 - `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
   model is gpt-5.6-sol/-terra (the only models that support it); for any
@@ -366,9 +375,13 @@ distinguishes their forge comments with these signals:
 | Git commit author (Claude only) | — | `claude-implementer (ai-bot) <claude-implementer+bot@users.noreply.github.com>` |
 
 The runtime signature immediately follows each visible AI header in new
-forge comments and replies. Window sources are explicit: `bundled default`,
-`model default`, or `configured`; an unresolved size is rendered as
-`Context window: <code>unknown</code>`. Local review artifacts are unchanged.
+forge comments and replies. Window sources are explicit: `effective` for a
+CLI-reported runtime value or `configured` for a numeric operator override.
+A forge turn refuses to publish if model, effort, or window cannot be resolved,
+and its post-turn completion check requires the exact signature on the summary.
+Offline `--print-config` and local artifacts can still show `unknown`; an
+offline Codex catalog-only size is labeled `catalog-estimate`. Local review
+artifacts otherwise remain unchanged.
 Summary detection deliberately still keys on the hidden marker and the
 legacy alert/banner lines, so summaries posted by older versions remain
 valid resume points.

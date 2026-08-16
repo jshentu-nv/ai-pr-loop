@@ -142,23 +142,22 @@
 #                 approves task-aligned actions headlessly and works on hosts
 #                 where bypass is policy-disabled. Auto mode is not available
 #                 on every account/provider, and ineligible hosts silently
-#                 downgrade it; a deterministic preflight probe reads the
-#                 CLI-reported effective mode (cached per PR, executable,
-#                 and model) and uses the settings safety net when auto does
-#                 not stick. A CLI that
-#                 hard-rejects the flag at startup instead triggers a single
-#                 retry with the same net. bypass: --dangerously-skip-permissions plus a
+#                 downgrade it; a control-only probe reads the CLI-reported
+#                 effective mode before every turn and uses the settings
+#                 safety net when auto does not stick. A CLI that hard-rejects
+#                 the flag gets one metadata-only retry without auto before
+#                 the single real turn. bypass: --dangerously-skip-permissions plus a
 #                 settings safety net (auto-accepted edits + allowed
 #                 Bash/WebFetch/WebSearch) for hosts that silently downgrade
 #                 bypass. off: leave the host's CLI/settings default
 #                 untouched.
 #   --claude-context-window TOKENS|auto
 #                 Context-window metadata reported in Claude's public
-#                 comment signature. Default: auto — the 1000000-token model
-#                 default paired with `fable`; unknown for other aliases,
-#                 custom providers, or model=off. Host policy can override a
-#                 model default. Supply a positive integer to sign configured
-#                 metadata for the selected executable/provider.
+#                 comment signature. Default: auto — query get_settings for
+#                 applied model/effort and get_context_usage for the effective
+#                 window before each turn (no model request is made). A
+#                 positive integer skips only the window query and signs that
+#                 configured size; the CLI must still implement get_settings.
 #   --codex-bin EXECUTABLE
 #                 Codex CLI executable name on PATH, or an absolute/relative
 #                 path. Default: $CODEX_BIN when set, otherwise `codex`.
@@ -185,15 +184,17 @@
 #                 leave the host's codex config untouched.
 #   --codex-context-window TOKENS|auto
 #                 Context-window metadata reported in Codex's public
-#                 comment signature. Default: auto — exact-match the selected
-#                 model in `$CODEX_BIN debug models --bundled` and apply its
-#                 effective-window percentage. The signature labels that value
-#                 as a bundled default because host config can override it.
-#                 Supply a positive integer for custom providers/catalogs;
-#                 unresolved values report unknown.
+#                 comment signature. Default: auto — read effective layered
+#                 config/model defaults through app-server, then resolve the
+#                 model in `$CODEX_BIN debug models` (the active catalog, not
+#                 bundled defaults) and apply its effective-window percentage.
+#                 Supply a positive integer for a custom provider that exposes
+#                 no catalog metadata. A forge turn refuses to post if its
+#                 effective model, effort, or context remains unresolved.
 #   --print-config
 #                 Print the resolved executable/model/effort/tier knobs plus
-#                 context metadata and its source (after adaptive defaults),
+#                 offline context metadata and its source (after adaptive
+#                 defaults; catalog-only Codex values are estimates),
 #                 then exit without contacting GitHub; the PR number is
 #                 optional in this mode. Used by tests/run_tests.sh to observe
 #                 the resolution.
@@ -638,6 +639,12 @@ CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
   "$CLAUDE_CONTEXT_WINDOW" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
 CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
   "$CODEX_CONTEXT_WINDOW" "$CODEX_CONTEXT_WINDOW_RESOLVED")
+if (( PRINT_CONFIG == 1 )) && [[ "$CODEX_CONTEXT_WINDOW_SOURCE" == runtime ]]; then
+  # This early, forge-free command consults only the selected executable's
+  # active catalog. Layered target-cwd config is resolved later by app-server
+  # in real turns, so do not present the offline number as runtime-effective.
+  CODEX_CONTEXT_WINDOW_SOURCE=catalog
+fi
 
 # Default checkout location when --dir not given: one managed clone per repo
 # identity, shared across PRs of that repo. (Concurrent loops on the same
@@ -1269,22 +1276,6 @@ done
 REPO_OWNER="${REPO_SLUG%%/*}"
 REPO_NAME="${REPO_SLUG##*/}"
 
-# Only a worker (or an unsupervised/preflight front-end) reaches this point.
-# Resolve forge-comment metadata only when a turn can actually post it. Local
-# mode strips every forge recipe, and preflight exits before any turn, so a
-# custom executable must not pay for or be required to implement catalog
-# discovery on those paths. --print-config is the explicit exception above.
-if (( LOCAL_MODE == 0 && PREFLIGHT_ONLY == 0 )); then
-  CLAUDE_CONTEXT_WINDOW_RESOLVED=$(resolve_claude_context_window \
-    "$CLAUDE_MODEL" "$CLAUDE_CONTEXT_WINDOW")
-  CODEX_CONTEXT_WINDOW_RESOLVED=$(resolve_codex_context_window \
-    "$CODEX_MODEL" "$CODEX_CONTEXT_WINDOW")
-  CLAUDE_CONTEXT_WINDOW_SOURCE=$(context_window_source claude \
-    "$CLAUDE_CONTEXT_WINDOW" "$CLAUDE_CONTEXT_WINDOW_RESOLVED")
-  CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
-    "$CODEX_CONTEXT_WINDOW" "$CODEX_CONTEXT_WINDOW_RESOLVED")
-fi
-
 export FORGE FORGE_HOST FORGE_SCHEME REPO_SLUG \
        REPO_OWNER REPO_NAME PR_NUMBER REPO_DIR MAX_ITER LOOP_HOME REVIEW_ONLY \
        LOCAL_MODE LOCAL_SCOPE NO_PUSH MANAGED_CLONE REPO_DIR_CANON \
@@ -1455,8 +1446,8 @@ if (( LOCAL_MODE == 1 )); then
   log "  local: review exchanged on disk; local rounds squash into one commit$( (( NO_PUSH == 1 )) && echo ' (--no-push: not pushed)' )"
 fi
 log "  ctx:   $( (( HAS_CONTEXT == 1 )) && echo "$CONTEXT_FILE" || echo 'none' )"
-log "  claude: bin=$CLAUDE_BIN model=$CLAUDE_MODEL effort=$CLAUDE_EFFORT perms=$CLAUDE_PERMS context-window=$CLAUDE_CONTEXT_WINDOW_RESOLVED context-source=$(context_window_source_display "$CLAUDE_CONTEXT_WINDOW_SOURCE")"
-log "  codex:  bin=$CODEX_BIN model=$CODEX_MODEL effort=$CODEX_EFFORT tier=$CODEX_TIER context-window=$CODEX_CONTEXT_WINDOW_RESOLVED context-source=$(context_window_source_display "$CODEX_CONTEXT_WINDOW_SOURCE")"
+log "  claude: bin=$CLAUDE_BIN model-request=$CLAUDE_MODEL effort-request=$CLAUDE_EFFORT perms=$CLAUDE_PERMS context-request=$CLAUDE_CONTEXT_WINDOW"
+log "  codex:  bin=$CODEX_BIN model-request=$CODEX_MODEL effort-request=$CODEX_EFFORT tier=$CODEX_TIER context-request=$CODEX_CONTEXT_WINDOW"
 log "  state: $STATE_DIR"
 log "------------------------------------------------------------"
 
