@@ -319,19 +319,21 @@ cat > "$STUBS/codex" <<'EOF'
 # Metadata-only app-server/config and active-catalog calls stay out of recorded
 # turn/session fixtures. Parse the -c overrides the probe passes so config/read
 # represents the same effective argv as the real turn.
-is_app_server=0; is_debug_models=0; is_session_probe=0; prev=''
+is_app_server=0; is_debug_models=0; probe_provider=''; prev=''
 stub_model="${STUB_CODEX_CONFIG_MODEL:-gpt-5.6-sol}"
 stub_effort="${STUB_CODEX_CONFIG_EFFORT:-xhigh}"
 for a in "$@"; do
   [[ "$a" == "app-server" ]] && is_app_server=1
   [[ "$prev" == "debug" && "$a" == "models" ]] && is_debug_models=1
-  [[ "$a" == *ai_pr_loop_metadata_probe* ]] && is_session_probe=1
   if [[ "$prev" == "-c" ]]; then
     case "$a" in
       model=*)
         raw=${a#model=}; stub_model=$(jq -r . <<<"$raw" 2>/dev/null || printf '%s' "$raw") ;;
       model_reasoning_effort=*)
         raw=${a#model_reasoning_effort=}; stub_effort=$(jq -r . <<<"$raw" 2>/dev/null || printf '%s' "$raw") ;;
+      model_provider=*)
+        raw=${a#model_provider=}; raw=$(jq -r . <<<"$raw" 2>/dev/null || printf '%s' "$raw")
+        [[ "$raw" == ai_pr_loop_metadata_probe_* ]] && probe_provider="$raw" ;;
     esac
   fi
   prev="$a"
@@ -348,7 +350,9 @@ fi
 # The session-start probe. Record the turn's resolved settings in a rollout
 # that carries the probe's own provider, then fail like a request to a closed
 # port. Stay out of the recorded turn fixtures.
-if (( is_session_probe == 1 )); then
+# STUB_CODEX_PEER_PROBE names another loop's provider: emit that rollout too,
+# sorting first, so cross-selection between simultaneous probes would show up.
+if [[ -n "$probe_provider" ]]; then
   if [[ -n "${ARGV_FILE:-}" ]]; then
     : > "${ARGV_FILE}.session-probe-argv"
     for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.session-probe-argv"; done
@@ -357,14 +361,21 @@ if (( is_session_probe == 1 )); then
   # can identify, so the turn must fail closed instead of guessing.
   [[ "${STUB_CODEX_NO_PROBE_SESSION:-0}" == "1" ]] && exit 1
   mkdir -p "$CODEX_HOME/sessions"
-  { jq -cn --arg cwd "$(pwd -P)" \
-      '{type:"session_meta",payload:{id:"stub-probe-uuid",cwd:$cwd,
-        model_provider:"ai_pr_loop_metadata_probe"}}'
-    jq -cn --arg model "$stub_model" --arg effort "$stub_effort" \
-      '{type:"turn_context",payload:{model:$model,effort:$effort}}'
-    jq -cn '{type:"event_msg",payload:{type:"task_started",
-      model_context_window:997500}}'
-  } > "$CODEX_HOME/sessions/rollout-metadata-probe.jsonl"
+  emit_probe_rollout() {  # <file> <id> <provider> <model> <effort> <window>
+    { jq -cn --arg cwd "$(pwd -P)" --arg id "$2" --arg provider "$3" \
+        '{type:"session_meta",payload:{id:$id,cwd:$cwd,model_provider:$provider}}'
+      jq -cn --arg model "$4" --arg effort "$5" \
+        '{type:"turn_context",payload:{model:$model,effort:$effort}}'
+      jq -cn --argjson window "$6" \
+        '{type:"event_msg",payload:{type:"task_started",model_context_window:$window}}'
+    } > "$1"
+  }
+  if [[ -n "${STUB_CODEX_PEER_PROBE:-}" ]]; then
+    emit_probe_rollout "$CODEX_HOME/sessions/rollout-aaaa-peer-probe.jsonl" \
+      stub-peer-probe-uuid "$STUB_CODEX_PEER_PROBE" peer-model low 111111
+  fi
+  emit_probe_rollout "$CODEX_HOME/sessions/rollout-metadata-probe.jsonl" \
+    stub-probe-uuid "$probe_provider" "$stub_model" "$stub_effort" 997500
   exit 1
 fi
 
@@ -1334,6 +1345,44 @@ else
   ok
 fi
 
+DISC4="$WORK/discover4"
+mkdir -p "$DISC4/sessions"
+: > "$DISC4/before-empty"
+printf '{"payload":{"id":"probe-uuid","cwd":"/checkout","source":"exec","model_provider":"ai_pr_loop_metadata_probe_cccc"}}\n' \
+  > "$DISC4/sessions/rollout-2026-01-01T00-00-01-probe.jsonl"
+printf '{"payload":{"id":"real-uuid","cwd":"/checkout","source":"exec"}}\n' \
+  > "$DISC4/sessions/rollout-2026-01-01T00-00-02-real.jsonl"
+
+t "discover: skips a metadata probe rollout that sorts first"
+assert_eq "$(CODEX_HOME="$DISC4" discover_new_codex_session_id "$DISC4/before-empty" /checkout)" real-uuid
+
+# --- _codex_metadata_probe_rollout -----------------------------------------
+# One managed clone serves every PR of a repo, so two loops can probe from the
+# same checkout at the same moment and both see both new rollouts. The peer
+# below shares this probe's cwd, leaving the nonce as the only discriminator.
+
+PROBE_SEL="$WORK/probe-select"
+mkdir -p "$PROBE_SEL/sessions"
+: > "$PROBE_SEL/before-empty"
+printf '{"payload":{"cwd":"/checkout","model_provider":"ai_pr_loop_metadata_probe_aaaa"}}\n' \
+  > "$PROBE_SEL/sessions/rollout-a-peer.jsonl"
+printf '{"payload":{"cwd":"/checkout","model_provider":"ai_pr_loop_metadata_probe_bbbb"}}\n' \
+  > "$PROBE_SEL/sessions/rollout-b-mine.jsonl"
+
+t "probe select: picks this probe's nonce over an earlier-sorting peer"
+assert_eq "$(CODEX_HOME="$PROBE_SEL" _codex_metadata_probe_rollout \
+  "$PROBE_SEL/before-empty" ai_pr_loop_metadata_probe_bbbb /checkout)" \
+  "$PROBE_SEL/sessions/rollout-b-mine.jsonl"
+
+t "probe select: rejects this probe's nonce recorded for another checkout"
+if CODEX_HOME="$PROBE_SEL" _codex_metadata_probe_rollout \
+     "$PROBE_SEL/before-empty" ai_pr_loop_metadata_probe_bbbb /elsewhere \
+     >/dev/null 2>&1; then
+  bad "selected a rollout recorded for a different checkout"
+else
+  ok
+fi
+
 # --- resolve_codex_root_session_id -----------------------------------------
 # Stored ids from older selectors may point at a sub-agent rollout (which
 # `codex exec resume` rejects) or another checkout's root; resolution must
@@ -1820,8 +1869,23 @@ assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
 
 t "codex: the session probe points its request at a closed loopback port"
 assert_line "$ARGV.session-probe-argv" exec
-assert_line "$ARGV.session-probe-argv" 'model_provider="ai_pr_loop_metadata_probe"'
+assert_substr "$ARGV.session-probe-argv" 'model_provider="ai_pr_loop_metadata_probe_'
 assert_substr "$ARGV.session-probe-argv" 'base_url="http://127.0.0.1:1/v1"'
+
+probe_provider_arg() {  # <session-probe argv file>
+  local raw
+  raw=$(grep -o 'model_provider="[^"]*"' "$1" | head -1) || return 1
+  raw=${raw#model_provider=\"}
+  printf '%s' "${raw%\"}"
+}
+
+t "codex: each session probe gets its own provider nonce"
+PROBE_PROVIDER_1=$(probe_provider_arg "$ARGV.session-probe-argv")
+if [[ "$PROBE_PROVIDER_1" == ai_pr_loop_metadata_probe_?* ]]; then
+  ok
+else
+  bad "probe provider carried no nonce (got: $PROBE_PROVIDER_1)"
+fi
 
 t "codex: the session probe removes its own rollout"
 if [[ -e "$CASE_DIR/codex-home/sessions/rollout-metadata-probe.jsonl" ]]; then
@@ -1832,6 +1896,35 @@ fi
 
 t "codex: the session probe does not become the resumable review session"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+# The peer's rollout appears after this probe's snapshot, shares its cwd, and
+# sorts first, so a selector that matched any probe returns the peer's numbers.
+t "codex: a simultaneous probe on another loop is not read"
+new_case codex-wrapper-concurrent-probe
+run_turn codex STUB_CODEX_REJECT_GLOBAL_FLAGS=1 \
+  CODEX_MODEL=off CODEX_EFFORT=off CODEX_TIER=off \
+  STUB_CODEX_PEER_PROBE=ai_pr_loop_metadata_probe_00000000000000000000000000000000
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>gpt-5.6-sol</code> · Effort: <code>xhigh</code> · Context window: <code>997500 tokens (effective)</code></sub>' 5
+
+t "codex: a simultaneous probe on another loop is not deleted"
+if [[ -e "$CASE_DIR/codex-home/sessions/rollout-aaaa-peer-probe.jsonl" ]]; then
+  ok
+else
+  bad "the metadata probe removed another loop's session"
+fi
+
+t "codex: a peer probe rollout cannot become the resumable review session"
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+t "codex: a probe nonce is not reused across turns"
+PROBE_PROVIDER_2=$(probe_provider_arg "$ARGV.session-probe-argv")
+if [[ -n "$PROBE_PROVIDER_2" && "$PROBE_PROVIDER_2" != "$PROBE_PROVIDER_1" ]]; then
+  ok
+else
+  bad "two probes shared the provider nonce $PROBE_PROVIDER_2"
+fi
 
 t "codex: a wrapper that refuses everything fails before posting a guess"
 new_case codex-wrapper-no-exec

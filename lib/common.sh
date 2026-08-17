@@ -836,18 +836,23 @@ resolve_claude_runtime_metadata() {
 #
 # The probe's rollout is deleted afterwards, so probe sessions do not
 # accumulate in the host-global sessions directory.
-CODEX_METADATA_PROBE_PROVIDER='ai_pr_loop_metadata_probe'
+#
+# The provider name carries a per-probe nonce, and the cwd recorded in the
+# rollout separates checkouts. One managed clone serves every PR of a repo, so
+# two loops can probe from the same checkout at the same moment and the cwd
+# alone cannot tell their sessions apart. The prefix alone marks a file as SOME
+# probe's, which is all session discovery needs.
+CODEX_METADATA_PROBE_PREFIX='ai_pr_loop_metadata_probe_'
 
-# The one rollout that appeared since <snapshot> and records the probe's own
-# provider. The whole host shares the sessions directory, so a concurrent codex
-# run in this same checkout also appears as a new rollout. Print only a session
-# this probe demonstrably created, because the caller deletes what it gets.
-_codex_metadata_probe_rollout() {  # <session snapshot>
-  local before="$1" f meta
+# The rollout that appeared since <snapshot> and records exactly this probe's
+# provider and cwd. The caller deletes what it gets.
+_codex_metadata_probe_rollout() {  # <session snapshot> <provider> <cwd>
+  local before="$1" provider="$2" want_cwd="$3" f meta
   while IFS= read -r f; do
     meta=$(head -1 "$f" 2>/dev/null) || continue
-    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
-       == "$CODEX_METADATA_PROBE_PROVIDER" ]] || continue
+    jq -e --arg provider "$provider" --arg cwd "$want_cwd" '
+      .payload.model_provider == $provider and .payload.cwd == $cwd
+    ' <<<"$meta" >/dev/null 2>&1 || continue
     printf '%s\n' "$f"
     return 0
   done < <(_codex_rollouts_since "$before")
@@ -856,18 +861,22 @@ _codex_metadata_probe_rollout() {  # <session snapshot>
 
 _codex_runtime_session_probe() {  # <cwd> [shared -c overrides...]
   local cwd="$1"; shift
-  local before rollout metadata
+  local before rollout metadata provider nonce
   CODEX_SESSION_PROBE_MODEL=''
   CODEX_SESSION_PROBE_EFFORT=''
   CODEX_SESSION_PROBE_WINDOW=''
+  # A TOML bare key, so keep the nonce to the hex digits of the uuid.
+  nonce=$(gen_uuid | tr -cd '0-9a-f') || return 1
+  [[ ${#nonce} -ge 16 ]] || return 1
+  provider="${CODEX_METADATA_PROBE_PREFIX}${nonce}"
   before=$(mktemp "${TMPDIR:-/tmp}/ai-pr-loop-codex-sessions.XXXXXX") || return 1
   snapshot_codex_sessions "$before"
   _runtime_capture_with_timeout "$cwd" 30 "$CODEX_BIN" ${1+"$@"} \
-    -c "model_providers.${CODEX_METADATA_PROBE_PROVIDER}={name=\"ai-pr-loop metadata probe\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",request_max_retries=0,stream_max_retries=0}" \
-    -c "model_provider=\"${CODEX_METADATA_PROBE_PROVIDER}\"" \
+    -c "model_providers.${provider}={name=\"ai-pr-loop metadata probe\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",request_max_retries=0,stream_max_retries=0}" \
+    -c "model_provider=\"${provider}\"" \
     exec --skip-git-repo-check --color never \
     'ai-pr-loop runtime metadata probe' >/dev/null 2>&1 || true
-  rollout=$(_codex_metadata_probe_rollout "$before") || rollout=''
+  rollout=$(_codex_metadata_probe_rollout "$before" "$provider" "$cwd") || rollout=''
   rm -f "$before"
   if [[ -z "$rollout" ]]; then
     log "WARNING: the codex session probe recorded no identifiable session"
@@ -3285,7 +3294,7 @@ discover_new_codex_session_id() {
     jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
       <<<"$meta" >/dev/null 2>&1 || continue
     [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
-       == "$CODEX_METADATA_PROBE_PROVIDER" ]] && continue
+       == "$CODEX_METADATA_PROBE_PREFIX"* ]] && continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
       [[ "$cwd" == "$want_cwd" ]] || continue
