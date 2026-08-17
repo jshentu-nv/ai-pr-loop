@@ -823,10 +823,74 @@ resolve_claude_runtime_metadata() {
   fi
 }
 
+# Codex takes runtime-only global flags such as `--profile` for `exec`, and
+# rejects them for `app-server` and `debug models`. A configured executable that
+# adds one of those flags — the documented way to wrap a CLI with fixed
+# arguments — can therefore never answer the control-only probe above.
+#
+# `exec` stays usable for every wrapper, and Codex records the resolved model,
+# effort, and effective context window in the session rollout before it sends
+# the turn's first request. Point that request at a closed loopback port: the
+# records are written, the request fails at once, and no prompt reaches a
+# provider.
+#
+# The probe's rollout is deleted afterwards, so probe sessions do not
+# accumulate in the host-global sessions directory.
+CODEX_METADATA_PROBE_PROVIDER='ai_pr_loop_metadata_probe'
+
+# The one rollout that appeared since <snapshot> and records the probe's own
+# provider. The whole host shares the sessions directory, so a concurrent codex
+# run in this same checkout also appears as a new rollout. Print only a session
+# this probe demonstrably created, because the caller deletes what it gets.
+_codex_metadata_probe_rollout() {  # <session snapshot>
+  local before="$1" f meta
+  while IFS= read -r f; do
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
+       == "$CODEX_METADATA_PROBE_PROVIDER" ]] || continue
+    printf '%s\n' "$f"
+    return 0
+  done < <(_codex_rollouts_since "$before")
+  return 1
+}
+
+_codex_runtime_session_probe() {  # <cwd> [shared -c overrides...]
+  local cwd="$1"; shift
+  local before rollout metadata
+  CODEX_SESSION_PROBE_MODEL=''
+  CODEX_SESSION_PROBE_EFFORT=''
+  CODEX_SESSION_PROBE_WINDOW=''
+  before=$(mktemp "${TMPDIR:-/tmp}/ai-pr-loop-codex-sessions.XXXXXX") || return 1
+  snapshot_codex_sessions "$before"
+  _runtime_capture_with_timeout "$cwd" 30 "$CODEX_BIN" ${1+"$@"} \
+    -c "model_providers.${CODEX_METADATA_PROBE_PROVIDER}={name=\"ai-pr-loop metadata probe\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",request_max_retries=0,stream_max_retries=0}" \
+    -c "model_provider=\"${CODEX_METADATA_PROBE_PROVIDER}\"" \
+    exec --skip-git-repo-check --color never \
+    'ai-pr-loop runtime metadata probe' >/dev/null 2>&1 || true
+  rollout=$(_codex_metadata_probe_rollout "$before") || rollout=''
+  rm -f "$before"
+  if [[ -z "$rollout" ]]; then
+    log "WARNING: the codex session probe recorded no identifiable session"
+    return 1
+  fi
+  metadata=$(codex_rollout_runtime_metadata "$rollout") || metadata=''
+  rm -f "$rollout" \
+    || log "WARNING: the codex session probe left $rollout behind"
+  [[ -n "$metadata" ]] || return 1
+  CODEX_SESSION_PROBE_MODEL=$(jq -r '.model // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_MODEL=''
+  CODEX_SESSION_PROBE_EFFORT=$(jq -r '.effort // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_EFFORT=''
+  CODEX_SESSION_PROBE_WINDOW=$(jq -r '.context_window // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_WINDOW=''
+  [[ -n "$CODEX_SESSION_PROBE_MODEL" ]]
+}
+
 resolve_codex_runtime_metadata() {
   local init_response config_response models_response resume_response resume_request
   local catalog selected effort provider config_context='' quoted tokens runtime_cwd
   local catalog_entry=''
+  local app_server_ready=0
   local config_args=()
   CODEX_MODEL_ACTUAL=unknown
   CODEX_EFFORT_ACTUAL=unknown
@@ -855,7 +919,10 @@ resolve_codex_runtime_metadata() {
     if _runtime_rpc_send \
         '{"method":"initialize","id":"codex-init","params":{"clientInfo":{"name":"ai_pr_loop","title":"ai-pr-loop metadata probe","version":"1"},"capabilities":{"experimentalApi":true}}}' \
        && init_response=$(_runtime_rpc_wait codex-init 20) \
-       && jq -e '.result != null and .error == null' <<<"$init_response" >/dev/null 2>&1 \
+       && jq -e '.result != null and .error == null' <<<"$init_response" >/dev/null 2>&1; then
+      app_server_ready=1
+    fi
+    if (( app_server_ready == 1 )) \
        && _runtime_rpc_send '{"method":"initialized","params":{}}' \
        && _runtime_rpc_send "$(jq -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
        && _runtime_rpc_send \
@@ -968,6 +1035,31 @@ resolve_codex_runtime_metadata() {
         CODEX_CONTEXT_WINDOW_RESOLVED="$tokens"
         CODEX_CONTEXT_WINDOW_SOURCE=runtime
       fi
+  fi
+
+  # An app-server that answered keeps its own result, its failures included: a
+  # CLI that talks and then refuses must not be papered over. Only a CLI that
+  # never completed the handshake — the wrapper case, where there is no
+  # evidence at all — falls through to the session probe. That probe reports a
+  # FRESH session, so a resumed thread pinned to another model is covered only
+  # while the loop passes its own model on every turn.
+  # Nothing above this point can have resolved a model without the handshake,
+  # so the probe fills model and effort outright. The window is the exception:
+  # a numeric --codex-context-window already set it, and that stays.
+  if (( app_server_ready == 0 )) \
+     && _codex_runtime_session_probe "$runtime_cwd" \
+          ${config_args[@]+"${config_args[@]}"}; then
+    CODEX_MODEL_ACTUAL="$CODEX_SESSION_PROBE_MODEL"
+    if [[ -n "$CODEX_SESSION_PROBE_EFFORT" ]]; then
+      CODEX_EFFORT_ACTUAL="$CODEX_SESSION_PROBE_EFFORT"
+    fi
+    # The rollout number is already the effective window, so no catalog
+    # percentage applies to it.
+    if [[ "$CODEX_CONTEXT_WINDOW_RESOLVED" == unknown \
+          && "$CODEX_SESSION_PROBE_WINDOW" =~ ^[1-9][0-9]*$ ]]; then
+      CODEX_CONTEXT_WINDOW_RESOLVED="$CODEX_SESSION_PROBE_WINDOW"
+      CODEX_CONTEXT_WINDOW_SOURCE=runtime
+    fi
   fi
 
   if [[ "$CODEX_MODEL_ACTUAL" == unknown ]]; then
@@ -3158,6 +3250,15 @@ snapshot_codex_sessions() {
     | sort > "$out"
 }
 
+# Every rollout that appeared since <snapshot>, in the same order and by the
+# same rule snapshot_codex_sessions used. The two must stay identical: any
+# difference makes comm report unrelated files as new.
+_codex_rollouts_since() {  # <snapshot file>
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
+    | sort | comm -23 - "$1"
+}
+
 # Diff the current session-file list against the snapshot and extract the new
 # ROOT session's UUID from its first JSONL line (session_meta). A gpt-5.6
 # review can spawn sub-agent threads mid-run, each with its own rollout file
@@ -3171,16 +3272,20 @@ snapshot_codex_sessions() {
 # rollout without a cwd (older codex) cannot prove ownership and is skipped —
 # the loop then starts fresh each iteration rather than risk capturing a
 # concurrent loop's session.
+# A runtime metadata probe runs in this same cwd and also leaves a new rollout
+# behind. It removes its own file, and this skip keeps a removal that failed
+# from handing the review's conversation to a session with no history.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
   local before="$1" want_cwd="${2:-}"
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
   local f meta id cwd
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     meta=$(head -1 "$f" 2>/dev/null) || continue
     jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
       <<<"$meta" >/dev/null 2>&1 || continue
+    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
+       == "$CODEX_METADATA_PROBE_PROVIDER" ]] && continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
       [[ "$cwd" == "$want_cwd" ]] || continue
@@ -3189,8 +3294,7 @@ discover_new_codex_session_id() {
     [[ -n "$id" ]] || continue
     printf '%s\n' "$id"
     return 0
-  done < <(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
-            | sort | comm -23 - "$before")
+  done < <(_codex_rollouts_since "$before")
   return 1
 }
 
@@ -3224,13 +3328,11 @@ codex_rollout_meta_for_id() {
   head -1 "$f" 2>/dev/null
 }
 
-# Latest actual turn settings recorded by a resumable root session. Codex
-# appends turn_context/task_started events to the root rollout on every resume.
-# Only the tail is needed (and avoids slurping multi-megabyte review histories).
-codex_session_runtime_metadata() {  # <root session id>
-  local f
-  f=$(codex_rollout_file_for_id "$1") || return 1
-  tail -n 10000 "$f" 2>/dev/null | jq -sc '
+# Latest actual turn settings recorded in a session rollout. Codex appends
+# turn_context/task_started events to the root rollout on every resume. Only the
+# tail is needed (and avoids slurping multi-megabyte review histories).
+codex_rollout_runtime_metadata() {  # <rollout file>
+  tail -n 10000 "$1" 2>/dev/null | jq -sc '
     reduce .[] as $event
       ({model:null, effort:null, context_window:null};
        if $event.type == "turn_context" then

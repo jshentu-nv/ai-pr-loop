@@ -260,7 +260,14 @@ beginning with `-` must be spelled as a path (for example,
 `/opt/bin/-claude`). Alternate executables must implement the corresponding
 Claude Code or Codex CLI/session interface, including Claude's stream-json
 control requests or Codex's app-server/config and active-model-catalog
-commands when runtime signatures are enabled.
+commands when runtime signatures are enabled. A Codex wrapper may add a global
+flag that Codex allows only for runtime commands — `--profile` is one — which
+makes those two commands unusable. The loop then starts one `codex exec`
+session whose provider is a closed loopback port: Codex records the resolved
+model, effort, and effective window before its first request, so the request
+fails at once and no prompt reaches a provider. That session file is removed
+again. Note that this reports a fresh session, so a resumed thread pinned to
+another model is covered only while the loop passes its own model every turn.
 
 Both agents run on a pinned model at high reasoning effort by default; you
 can dial each one. Every knob is passed explicitly on every turn (fresh and
@@ -330,10 +337,12 @@ unattended. Dial with:
   without `--bundled`. This honors the active provider/catalog and configured
   context override before applying the effective-window percentage. These
   metadata calls start no turn or inference request; probing a resume only
-  loads the existing thread in the short-lived app-server. An explicit token
-  count is labeled `configured` and remains display-only. If the CLI cannot
-  report the effective model, effort, or a catalog/context size, the forge
-  turn fails before posting a guessed signature.
+  loads the existing thread in the short-lived app-server. An executable that
+  refuses those two commands is read from a `codex exec` session start
+  instead, described above. An explicit token count is labeled `configured`
+  and remains display-only. If the CLI cannot report the effective model,
+  effort, or a catalog/context size, the forge turn fails before posting a
+  guessed signature.
 - `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
   model is gpt-5.6-sol/-terra (the only models that support it); for any

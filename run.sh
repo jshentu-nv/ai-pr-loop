@@ -188,6 +188,9 @@
 #                 config/model defaults through app-server, then resolve the
 #                 model in `$CODEX_BIN debug models` (the active catalog, not
 #                 bundled defaults) and apply its effective-window percentage.
+#                 An executable that refuses those two commands is read
+#                 instead from one `codex exec` session start aimed at a
+#                 closed loopback port, which reaches no provider.
 #                 Supply a positive integer for a custom provider that exposes
 #                 no catalog metadata. A forge turn refuses to post if its
 #                 effective model, effort, or context remains unresolved.

@@ -319,12 +319,13 @@ cat > "$STUBS/codex" <<'EOF'
 # Metadata-only app-server/config and active-catalog calls stay out of recorded
 # turn/session fixtures. Parse the -c overrides the probe passes so config/read
 # represents the same effective argv as the real turn.
-is_app_server=0; is_debug_models=0; prev=''
+is_app_server=0; is_debug_models=0; is_session_probe=0; prev=''
 stub_model="${STUB_CODEX_CONFIG_MODEL:-gpt-5.6-sol}"
 stub_effort="${STUB_CODEX_CONFIG_EFFORT:-xhigh}"
 for a in "$@"; do
   [[ "$a" == "app-server" ]] && is_app_server=1
   [[ "$prev" == "debug" && "$a" == "models" ]] && is_debug_models=1
+  [[ "$a" == *ai_pr_loop_metadata_probe* ]] && is_session_probe=1
   if [[ "$prev" == "-c" ]]; then
     case "$a" in
       model=*)
@@ -335,6 +336,37 @@ for a in "$@"; do
   fi
   prev="$a"
 done
+
+# A wrapper that adds a runtime-only global flag, as codex-hub adds --profile:
+# `exec` still runs, and every metadata subcommand is refused.
+if [[ "${STUB_CODEX_REJECT_GLOBAL_FLAGS:-0}" == "1" ]] \
+   && (( is_app_server == 1 || is_debug_models == 1 )); then
+  printf 'Error: --profile only applies to runtime commands and `codex mcp`\n' >&2
+  exit 1
+fi
+
+# The session-start probe. Record the turn's resolved settings in a rollout
+# that carries the probe's own provider, then fail like a request to a closed
+# port. Stay out of the recorded turn fixtures.
+if (( is_session_probe == 1 )); then
+  if [[ -n "${ARGV_FILE:-}" ]]; then
+    : > "${ARGV_FILE}.session-probe-argv"
+    for a in "$@"; do printf '%s\n' "$a" >> "${ARGV_FILE}.session-probe-argv"; done
+  fi
+  # STUB_CODEX_NO_PROBE_SESSION=1: a CLI whose `exec` records nothing the probe
+  # can identify, so the turn must fail closed instead of guessing.
+  [[ "${STUB_CODEX_NO_PROBE_SESSION:-0}" == "1" ]] && exit 1
+  mkdir -p "$CODEX_HOME/sessions"
+  { jq -cn --arg cwd "$(pwd -P)" \
+      '{type:"session_meta",payload:{id:"stub-probe-uuid",cwd:$cwd,
+        model_provider:"ai_pr_loop_metadata_probe"}}'
+    jq -cn --arg model "$stub_model" --arg effort "$stub_effort" \
+      '{type:"turn_context",payload:{model:$model,effort:$effort}}'
+    jq -cn '{type:"event_msg",payload:{type:"task_started",
+      model_context_window:997500}}'
+  } > "$CODEX_HOME/sessions/rollout-metadata-probe.jsonl"
+  exit 1
+fi
 
 if (( is_app_server == 1 )); then
   [[ -z "${AGENT_EXE_LOG:-}" ]] \
@@ -1682,6 +1714,13 @@ fi
 t "codex: fresh run captures the session id from the rollout file"
 assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
 
+t "codex: working metadata subcommands start no session"
+if [[ -e "$ARGV.session-probe-argv" ]]; then
+  bad "the control-only probe still started a session"
+else
+  ok
+fi
+
 t "codex: executable override is used for a fresh turn"
 new_case codex-custom-bin
 run_turn codex CODEX_BIN="$ALT_CODEX"
@@ -1767,6 +1806,38 @@ if [[ -e "$ARGV" ]]; then
 else
   ok
 fi
+
+# A configured wrapper can add a global flag that codex accepts for `exec` and
+# refuses for app-server and `debug models` — codex-hub adds `--profile`. The
+# session-start probe then supplies the same three values from the rollout.
+t "codex: a wrapper that refuses the metadata subcommands still signs runtime metadata"
+new_case codex-wrapper-injection
+run_turn codex STUB_CODEX_REJECT_GLOBAL_FLAGS=1 \
+  CODEX_MODEL=off CODEX_EFFORT=off CODEX_TIER=off
+assert_rc0
+assert_count "$CASE_DIR/state/iter-01/codex.prompt.md" \
+  '<sub>Model: <code>gpt-5.6-sol</code> · Effort: <code>xhigh</code> · Context window: <code>997500 tokens (effective)</code></sub>' 5
+
+t "codex: the session probe points its request at a closed loopback port"
+assert_line "$ARGV.session-probe-argv" exec
+assert_line "$ARGV.session-probe-argv" 'model_provider="ai_pr_loop_metadata_probe"'
+assert_substr "$ARGV.session-probe-argv" 'base_url="http://127.0.0.1:1/v1"'
+
+t "codex: the session probe removes its own rollout"
+if [[ -e "$CASE_DIR/codex-home/sessions/rollout-metadata-probe.jsonl" ]]; then
+  bad "the metadata probe left its session behind"
+else
+  ok
+fi
+
+t "codex: the session probe does not become the resumable review session"
+assert_eq "$(cat "$CASE_DIR/state/codex.session.id" 2>/dev/null)" stub-session-uuid
+
+t "codex: a wrapper that refuses everything fails before posting a guess"
+new_case codex-wrapper-no-exec
+run_turn codex STUB_CODEX_REJECT_GLOBAL_FLAGS=1 STUB_CODEX_NO_PROBE_SESSION=1
+assert_eq "$TURN_RC" 1
+assert_substr "$CASE_DIR/turn.log" 'did not report its effective model'
 
 t "codex: explicit context window wins over bundled model metadata"
 new_case codex-context-explicit
