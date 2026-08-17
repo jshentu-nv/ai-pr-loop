@@ -846,6 +846,13 @@ CODEX_METADATA_PROBE_PREFIX='ai_pr_loop_metadata_probe_'
 
 # The rollout that appeared since <snapshot> and records exactly this probe's
 # provider and cwd. The caller deletes what it gets.
+# jq for arguments that must reach it verbatim. Git Bash rewrites a
+# POSIX-looking argument into a Windows path before native jq.exe sees it, so
+# `--arg cwd /tmp/x` arrives as `C:/Users/.../Temp/x`. Values that are compared
+# or handed to Codex have to survive as written, so turn that conversion off.
+# Harmless off Windows: both variables are unset there.
+jq_literal() { MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 jq "$@"; }
+
 _codex_metadata_probe_rollout() {  # <session snapshot> <provider> <cwd>
   local before="$1" provider="$2" want_cwd="$3" f meta recorded
   while IFS= read -r f; do
@@ -940,7 +947,7 @@ resolve_codex_runtime_metadata() {
     fi
     if (( app_server_ready == 1 )) \
        && _runtime_rpc_send '{"method":"initialized","params":{}}' \
-       && _runtime_rpc_send "$(jq -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
+       && _runtime_rpc_send "$(jq_literal -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
        && _runtime_rpc_send \
           '{"method":"model/list","id":"codex-models","params":{"limit":100,"includeHidden":true}}' \
        && config_response=$(_runtime_rpc_wait codex-config 20) \
@@ -972,7 +979,7 @@ resolve_codex_runtime_metadata() {
         # config model/provider/cwd into thread/resume. A bare resume restores
         # persisted model/effort and would therefore sign stale metadata when
         # host configuration changed since the previous turn.
-        resume_request=$(jq -cn \
+        resume_request=$(jq_literal -cn \
           --arg id "$CODEX_SESSION_ID" --arg cwd "$runtime_cwd" \
           --arg model "$selected" --arg provider "$provider" '
           {method:"thread/resume", id:"codex-resume",
@@ -2877,7 +2884,7 @@ ai_signed_attempt_complete() {  # <codex|claude> <iter> <snapshot> <manifest> [e
       | any($new[];
             is_summary_root($t; $a; $b; $it)
             and has_signature($attempt.signature))
-    ' "$snap" >/dev/null 2>&1
+    ' <"$snap" >/dev/null 2>&1
 }
 
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
@@ -2903,7 +2910,7 @@ latest_ai_comment_iter() {
     "$AI_SUMMARY_JQ_DEF"'
       [ .[] | select(is_summary_root($t; $a; $b; .iter)) | .iter ]
       | unique | sort | reverse | .[]
-    ' "$snap" 2>/dev/null) || candidates=''
+    ' <"$snap" 2>/dev/null) || candidates=''
   while IFS= read -r candidate; do
     [[ "$candidate" =~ ^[0-9]+$ ]] || continue
     manifest=$(ai_signature_manifest_path "$tag" "$candidate")
@@ -2954,8 +2961,7 @@ ai_summary_posted() {  # <codex|claude> <iter> <snapshot-file> [exact signature]
        any(.[];
          is_summary_root($t; $a; $b; $it)
          and ($s == "" or ((.body // "") | contains($s))))
-     ' \
-     "$snap" >/dev/null
+     ' <"$snap" >/dev/null
 }
 
 # Post-turn completion check with one short retry, absorbing forge
