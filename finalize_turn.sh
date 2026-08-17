@@ -25,6 +25,9 @@ set -euo pipefail
 HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
+trap '_runtime_rpc_exit_on_signal 129' HUP
+trap '_runtime_rpc_exit_on_signal 130' INT
+trap '_runtime_rpc_exit_on_signal 143' TERM
 
 [[ "$LOCAL_MODE" == "1" ]] || die "finalize_turn.sh runs only in local review mode"
 
@@ -114,7 +117,7 @@ PINNED_DEST=''
 [[ -s "$(local_origin_file)" ]] && PINNED_DEST=$(<"$(local_origin_file)")
 # Registered now, after the snapshot and before the entry sync, so every
 # later exit repairs a pin a filter may have poisoned.
-trap restore_pin_on_exit EXIT
+trap '_runtime_rpc_stop_if_active; restore_pin_on_exit' EXIT
 
 # The review turn that approved may have left build output in the worktree;
 # drop it, keeping every local round.

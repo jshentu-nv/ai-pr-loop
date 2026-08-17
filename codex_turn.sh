@@ -9,6 +9,10 @@ set -euo pipefail
 HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$HERE/lib/common.sh"
+trap _runtime_rpc_stop_if_active EXIT
+trap '_runtime_rpc_exit_on_signal 129' HUP
+trap '_runtime_rpc_exit_on_signal 130' INT
+trap '_runtime_rpc_exit_on_signal 143' TERM
 
 ID=$(iter_dir "$ITER")
 mkdir -p "$ID"
@@ -98,18 +102,59 @@ case "$CODEX_TIER_RESOLVED" in
 esac
 (( ${#CODEX_TIER_ARG[@]} > 0 )) && log "codex: service tier = ${CODEX_TIER_RESOLVED}"
 
+# Resolve the persisted session before runtime metadata so the control probe
+# can issue the same exec-shaped thread/resume request as the selected CLI and
+# read its authoritative current model/effort response.
+REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P)
+CODEX_SESSION_FILE="$STATE_DIR/codex.session.id"
+CAPTURE_NEW_SESSION=0
+CODEX_SUBCMD=()
+CODEX_SESSION_ID=''
+if [[ -s "$CODEX_SESSION_FILE" ]]; then
+  STORED_SESSION_ID=$(<"$CODEX_SESSION_FILE")
+  if CODEX_SESSION_ID=$(resolve_codex_root_session_id "$STORED_SESSION_ID" "$REPO_DIR_CANON"); then
+    if [[ "$CODEX_SESSION_ID" != "$STORED_SESSION_ID" ]]; then
+      log "codex: stored session $STORED_SESSION_ID is a sub-agent — migrated to root $CODEX_SESSION_ID"
+      printf '%s\n' "$CODEX_SESSION_ID" > "$CODEX_SESSION_FILE"
+    fi
+    log "codex: resuming session $CODEX_SESSION_ID"
+    CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
+  else
+    log "codex: stored session $STORED_SESSION_ID is not resumable for this checkout — starting fresh"
+    rm -f "$CODEX_SESSION_FILE"
+  fi
+fi
+if (( ${#CODEX_SUBCMD[@]} == 0 )); then
+  log "codex: starting new session"
+  CAPTURE_NEW_SESSION=1
+  SNAPSHOT_BEFORE="$ID/codex.sessions.before"
+  snapshot_codex_sessions "$SNAPSHOT_BEFORE"
+fi
+
 if [[ "$LOCAL_MODE" == "1" ]]; then
   CODEX_CONTEXT_WINDOW_RESOLVED=unknown
-elif [[ -z "${CODEX_CONTEXT_WINDOW_RESOLVED:-}" ]]; then
-  CODEX_CONTEXT_WINDOW_RESOLVED=$(resolve_codex_context_window \
-    "$CODEX_MODEL_RESOLVED" "${CODEX_CONTEXT_WINDOW:-auto}")
+  CODEX_CONTEXT_WINDOW_SOURCE=unknown
+  CODEX_MODEL_ACTUAL=$(ai_model_display "$CODEX_MODEL_RESOLVED")
+  CODEX_EFFORT_ACTUAL=$(codex_effort_display "$CODEX_EFFORT_RESOLVED")
+else
+  # app-server config/read + model/list resolve layered host defaults without
+  # starting a turn or inference; a resumed path only loads its existing
+  # thread. The active (non-bundled) catalog supplies the effective context.
+  resolve_codex_runtime_metadata
+  [[ "$CODEX_MODEL_ACTUAL" != "unknown" ]] \
+    || die "Codex did not report its effective model; refusing to render forge comments with guessed metadata"
+  [[ "$CODEX_EFFORT_ACTUAL" != "unknown" ]] \
+    || die "Codex did not report its effective effort; refusing to render forge comments with guessed metadata"
+  [[ "$CODEX_CONTEXT_WINDOW_RESOLVED" =~ ^[1-9][0-9]*$ ]] \
+    || die "Codex did not expose an effective context window; set --codex-context-window for this CLI/provider"
 fi
-CODEX_CONTEXT_WINDOW_SOURCE=$(context_window_source codex \
-  "${CODEX_CONTEXT_WINDOW:-auto}" "$CODEX_CONTEXT_WINDOW_RESOLVED")
 AI_COMMENT_SIGNATURE=$(ai_comment_signature \
-  "$(ai_model_display "$CODEX_MODEL_RESOLVED")" \
-  "$(codex_effort_display "$CODEX_EFFORT_RESOLVED")" \
+  "$CODEX_MODEL_ACTUAL" \
+  "$CODEX_EFFORT_ACTUAL" \
   "$CODEX_CONTEXT_WINDOW_RESOLVED" "$CODEX_CONTEXT_WINDOW_SOURCE")
+export AI_COMMENT_SIGNATURE
+AI_COMMENT_BOT=codex
+export AI_COMMENT_BOT
 AI_COMMENT_SIGNATURE_SED=$(prompt_sed_replacement "$AI_COMMENT_SIGNATURE")
 log "codex: context window = ${CODEX_CONTEXT_WINDOW_RESOLVED}"
 
@@ -159,44 +204,12 @@ render_forge_blocks "$PROMPT_TEMPLATE" "$(prompt_tags)" \
   -e "s|{{AI_COMMENT_SIGNATURE}}|${AI_COMMENT_SIGNATURE_SED}|g" \
   > "$PROMPT_FILE"
 
-log "codex: iter $ITER — running"
+if [[ "$LOCAL_MODE" != "1" ]]; then
+  record_ai_signature_attempt codex "$ITER" "$AI_COMMENT_SIGNATURE" "$THREAD_FILE" \
+    || die "could not record the Codex signature attempt manifest"
+fi
 
-# Persistent session: codex has no pre-pin flag like claude --session-id, so we
-# capture the session id from the filesystem after the first run, then resume
-# by id on subsequent iters. This gives Codex its own internal memory of the
-# whole review, on top of the public PR thread it re-reads from disk each turn.
-# Discovery and stored-id validation are bound to this checkout's canonical
-# path so concurrent loops on other checkouts can't cross-capture sessions.
-# CDPATH= guards the substitution: an inherited CDPATH makes a successful
-# relative `cd` print the destination, which would corrupt the captured path.
-REPO_DIR_CANON=$(CDPATH= cd -- "$REPO_DIR" && pwd -P)
-CODEX_SESSION_FILE="$STATE_DIR/codex.session.id"
-CAPTURE_NEW_SESSION=0
-CODEX_SUBCMD=()
-if [[ -s "$CODEX_SESSION_FILE" ]]; then
-  STORED_SESSION_ID=$(<"$CODEX_SESSION_FILE")
-  # State written by older selectors can hold a sub-agent id (which `codex
-  # exec resume` rejects) or another checkout's root (captured by the old
-  # unbound discovery under concurrent loops). Migrate to the root session or
-  # discard and start fresh instead of staying wedged.
-  if CODEX_SESSION_ID=$(resolve_codex_root_session_id "$STORED_SESSION_ID" "$REPO_DIR_CANON"); then
-    if [[ "$CODEX_SESSION_ID" != "$STORED_SESSION_ID" ]]; then
-      log "codex: stored session $STORED_SESSION_ID is a sub-agent — migrated to root $CODEX_SESSION_ID"
-      printf '%s\n' "$CODEX_SESSION_ID" > "$CODEX_SESSION_FILE"
-    fi
-    log "codex: resuming session $CODEX_SESSION_ID"
-    CODEX_SUBCMD=(resume "$CODEX_SESSION_ID")
-  else
-    log "codex: stored session $STORED_SESSION_ID is not resumable for this checkout — starting fresh"
-    rm -f "$CODEX_SESSION_FILE"
-  fi
-fi
-if (( ${#CODEX_SUBCMD[@]} == 0 )); then
-  log "codex: starting new session"
-  CAPTURE_NEW_SESSION=1
-  SNAPSHOT_BEFORE="$ID/codex.sessions.before"
-  snapshot_codex_sessions "$SNAPSHOT_BEFORE"
-fi
+log "codex: iter $ITER — running"
 
 # Codex must be able to run gh + git, hence --yolo (autorun: the alias for
 # --dangerously-bypass-approvals-and-sandbox). (User explicitly requested
@@ -213,10 +226,10 @@ rm -f "$ID/issue_counts.stdout" "$ID/verdict.stdout"
 
 set +e
 ( cd "$REPO_DIR" && NO_COLOR=1 "$CODEX_BIN" exec \
-    "${CODEX_SUBCMD[@]}" \
-    "${CODEX_MODEL_ARG[@]}" \
-    "${CODEX_EFFORT_ARG[@]}" \
-    "${CODEX_TIER_ARG[@]}" \
+    ${CODEX_SUBCMD[@]+"${CODEX_SUBCMD[@]}"} \
+    ${CODEX_MODEL_ARG[@]+"${CODEX_MODEL_ARG[@]}"} \
+    ${CODEX_EFFORT_ARG[@]+"${CODEX_EFFORT_ARG[@]}"} \
+    ${CODEX_TIER_ARG[@]+"${CODEX_TIER_ARG[@]}"} \
     --skip-git-repo-check \
     --yolo \
     - \

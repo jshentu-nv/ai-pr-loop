@@ -113,12 +113,16 @@ die()  { log "ERROR: $*"; exit 1; }
 # --- Public AI comment metadata -----------------------------------------------
 #
 # Every forge comment/reply carries one canonical, human-readable runtime
-# signature.  Model selectors are deliberately free-form (custom providers and
+# signature. Model selectors are deliberately free-form (custom providers and
 # wrapper CLIs use their own spellings), so values are HTML-escaped before they
 # enter a prompt and the finished line is escaped again before sed substitution.
-# Automatically discovered context windows are labeled as model/catalog
-# defaults. Host configuration and provider policy can override them; an
-# operator-supplied numeric value is labeled as configured metadata.
+#
+# A selector is not runtime metadata: `off` delegates to host configuration,
+# aliases can resolve to another model, resumed Claude sessions can retain a
+# different model, and Codex catalogs/config can replace bundled defaults. The
+# turn scripts therefore query each selected executable before rendering their
+# prompts. The small JSONL client below speaks only metadata/control methods; it
+# never starts an inference turn.
 
 ai_metadata_html_escape() {  # <arbitrary scalar>
   local value="$1"
@@ -147,8 +151,12 @@ prompt_sed_replacement() {  # <single-line replacement>
 }
 
 resolve_codex_context_window() {  # <model> [configured tokens|auto]
+  # Offline fallback used by --print-config and callers that do not have a
+  # running turn context. Runtime signatures use resolve_codex_runtime_metadata
+  # below, which also reads effective layered config.
   local model="$1" configured="${2:-auto}" catalog tokens
   local codex_exe="${CODEX_BIN:-codex}"
+  local runtime_cwd="${REPO_DIR_CANON:-${REPO_DIR:-.}}"
   if [[ "$configured" =~ ^[1-9][0-9]*$ ]]; then
     printf '%s\n' "$configured"
     return 0
@@ -158,16 +166,14 @@ resolve_codex_context_window() {  # <model> [configured tokens|auto]
     return 0
   }
 
-  # The selected executable is the source: alternate Codex builds can ship
-  # different bundled defaults for the same-looking slug. --bundled is
-  # deterministic and network-free. This is not a claim about the active host
-  # config: model_context_window, model_catalog_json, and provider settings can
-  # override it, so the public signature labels the result "bundled default".
-  if catalog=$(run_with_timeout 15 "$codex_exe" debug models --bundled 2>/dev/null); then
+  # Deliberately omit --bundled: `debug models` is the effective catalog for
+  # the selected executable/provider, including configured catalog overrides.
+  if catalog=$(_runtime_capture_with_timeout "$runtime_cwd" 15 \
+      "$codex_exe" debug models 2>/dev/null); then
     tokens=$(jq -er --arg model "$model" '
       first(.models[]? | select(.slug == $model))
-      | (.context_window // empty) as $window
-      | (.effective_context_window_percent // 100) as $percent
+      | (.context_window // .max_context_window // empty) as $window
+      | (.effective_context_window_percent // 95) as $percent
       | (($window * $percent / 100) | floor)
       | select(. > 0)
     ' <<<"$catalog" 2>/dev/null) || tokens=''
@@ -185,15 +191,10 @@ resolve_claude_context_window() {  # <model> [configured tokens|auto]
     printf '%s\n' "$configured"
     return 0
   fi
-  # Claude exposes no supported offline model catalog.  The loop owns one
-  # paired default: its `fable` default currently advertises a 1M-token Fable 5
-  # window. Every other alias, custom model/provider, and host-config default is
-  # intentionally unknown unless the operator supplies the numeric override.
-  if [[ "$configured" == "auto" && "$model" == "fable" ]]; then
-    printf '1000000\n'
-  else
-    printf 'unknown\n'
-  fi
+  # There is no truthful offline fallback. Runtime turns use Claude's
+  # get_context_usage control request, which resolves aliases and sessions.
+  : "$model"
+  printf 'unknown\n'
 }
 
 context_window_source() {  # <codex|claude> <configured tokens|auto> <resolved>
@@ -202,30 +203,28 @@ context_window_source() {  # <codex|claude> <configured tokens|auto> <resolved>
     printf 'unknown\n'
   elif [[ "$configured" != "auto" ]]; then
     printf 'configured\n'
-  elif [[ "$who" == "codex" ]]; then
-    printf 'bundled\n'
   else
-    printf 'model\n'
+    : "$who"
+    printf 'runtime\n'
   fi
 }
 
-context_window_source_display() {  # <configured|bundled|model|unknown>
+context_window_source_display() {  # <configured|runtime|catalog|unknown>
   case "$1" in
-    bundled) printf 'bundled-default\n' ;;
-    model)   printf 'model-default\n' ;;
+    runtime) printf 'runtime-effective\n' ;;
+    catalog) printf 'catalog-estimate\n' ;;
     *)       printf '%s\n' "$1" ;;
   esac
 }
 
-ai_comment_signature() {  # <model label> <effort label> <window> [configured|bundled|model]
+ai_comment_signature() {  # <model label> <effort label> <window> [configured|runtime]
   local model effort window source="${4:-configured}" window_label
   model=$(ai_metadata_html_escape "$1")
   effort=$(ai_metadata_html_escape "$2")
   window="$3"
   if [[ "$window" =~ ^[1-9][0-9]*$ ]]; then
     case "$source" in
-      bundled) window_label="$window tokens (bundled default)" ;;
-      model)   window_label="$window tokens (model default)" ;;
+      runtime) window_label="$window tokens (effective)" ;;
       *)       window_label="$window tokens (configured)" ;;
     esac
   else
@@ -238,14 +237,14 @@ ai_comment_signature() {  # <model label> <effort label> <window> [configured|bu
 
 ai_model_display() {  # <resolved selector>
   case "$1" in
-    off|'') printf 'CLI/config default\n' ;;
+    off|'') printf 'unknown\n' ;;
     *)      printf '%s\n' "$1" ;;
   esac
 }
 
 codex_effort_display() {  # <resolved effort>
   case "$1" in
-    off|'') printf 'CLI/config default\n' ;;
+    off|'') printf 'unknown\n' ;;
     *)      printf '%s\n' "$1" ;;
   esac
 }
@@ -253,9 +252,830 @@ codex_effort_display() {  # <resolved effort>
 claude_effort_display() {  # <resolved effort>
   case "$1" in
     ultracode) printf 'xhigh (ultracode)\n' ;;
-    off|'')   printf 'CLI/config default\n' ;;
+    off|'')   printf 'unknown\n' ;;
     *)        printf '%s\n' "$1" ;;
   esac
+}
+
+# Start a bidirectional JSONL subprocess on fd 7. Named pipes keep this
+# compatible with Bash 3.2 (stock macOS); coproc and dynamic file descriptors
+# are intentionally avoided. All paths are exact mktemp children and cleanup
+# removes files individually before rmdir.
+RUNTIME_RPC_ACTIVE=0
+RUNTIME_RPC_PID=''
+RUNTIME_RPC_GUARDIAN_PID=''
+RUNTIME_RPC_DIR=''
+RUNTIME_RPC_IN=''
+RUNTIME_RPC_OUT=''
+RUNTIME_RPC_ERR=''
+RUNTIME_RPC_READY=''
+RUNTIME_RPC_STATUS=''
+RUNTIME_RPC_GUARDIAN_READY=''
+RUNTIME_RPC_PID_FILE=''
+RUNTIME_RPC_GROUPED=0
+RUNTIME_RPC_LAUNCHER=''
+
+# The CLI gets its own process group so normal cleanup can reach wrappers and
+# descendants without signalling the turn shell. The guardian stays in the
+# worker's group and is the RPC's direct parent: there is therefore no instant
+# in which a detached subprocess exists without a process that can reap it.
+_runtime_rpc_process_token() {  # <pid>
+  local token
+  token=$(ps -o lstart= -p "$1" 2>/dev/null) || token=''
+  [[ -n "$token" ]] || return 1
+  printf '%s\n' "$token"
+}
+
+_runtime_rpc_guardian() {
+  local owner_pid="$1" owner_token="$2" cwd="$3" launcher="$4"
+  local in_file="$5" out_file="$6" err_file="$7" runtime_ready="$8"
+  local guardian_ready="$9"; shift 9
+  local pid_file="$1" status_file="$2" runtime_dir="$3"; shift 3
+  local rpc_pid='' wait_i current_token='' normal_stop=0 child_state=''
+  local leader_reaped=0
+
+  _runtime_rpc_guardian_owner_alive() {
+    kill -0 "$owner_pid" 2>/dev/null || return 1
+    if [[ -n "$owner_token" ]]; then
+      current_token=$(_runtime_rpc_process_token "$owner_pid") || return 1
+      [[ "$current_token" == "$owner_token" ]] || return 1
+    fi
+  }
+  _runtime_rpc_guardian_kill() {
+    [[ "$rpc_pid" =~ ^[1-9][0-9]*$ ]] || return 0
+    # Straddle the transition where the launcher becomes a session leader.
+    kill -KILL -- "-$rpc_pid" 2>/dev/null || true
+    (( leader_reaped == 1 )) || kill -KILL "$rpc_pid" 2>/dev/null || true
+    kill -KILL -- "-$rpc_pid" 2>/dev/null || true
+    if (( leader_reaped == 0 )); then
+      for wait_i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$rpc_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      wait "$rpc_pid" 2>/dev/null || true
+      leader_reaped=1
+    fi
+  }
+  _runtime_rpc_guardian_remove() {
+    rm -f "$in_file" "$out_file" "$err_file" "$runtime_ready" \
+      "$status_file" "$status_file.tmp" "$guardian_ready" \
+      "$pid_file" "$pid_file.tmp" "$pid_file.owner"
+    rmdir "$runtime_dir" 2>/dev/null || true
+  }
+  _runtime_rpc_guardian_cleanup() {
+    _runtime_rpc_guardian_kill
+    _runtime_rpc_guardian_remove
+  }
+  _runtime_rpc_guardian_child_running() {
+    kill -0 "$rpc_pid" 2>/dev/null || return 1
+    child_state=$(ps -o stat= -p "$rpc_pid" 2>/dev/null) || child_state=''
+    [[ -z "$child_state" || "$child_state" != *Z* ]]
+  }
+
+  # USR1 marks a normal EOF shutdown but deliberately does not wait in the
+  # signal handler. The loop must keep checking the owner: if it is SIGKILLed
+  # while the RPC is slow or ignores EOF, the guardian still owns cleanup.
+  trap 'normal_stop=1' USR1
+  trap '_runtime_rpc_guardian_cleanup; exit 0' HUP INT TERM
+  printf 'ready\n' > "$guardian_ready" || exit 1
+  if ! _runtime_rpc_guardian_owner_alive; then
+    _runtime_rpc_guardian_cleanup
+    return 1
+  fi
+
+  # Put redirections on the child subshell itself so it opens the FIFO before
+  # `cd`; a missing/raced cwd can fail after the owner connects instead of
+  # leaving the owner's writer-open blocked forever.
+  ( CDPATH= cd -- "$cwd" || exit
+    case "$launcher" in
+      setsid) exec setsid "${BASH:-bash}" -c '
+                ready=$1; status=$2; shift 2
+                printf "ready\n" > "$ready" || exit 1
+                set +e
+                "$@"
+                rc=$?
+                printf "%s\n" "$rc" > "$status.tmp" \
+                  && mv -f "$status.tmp" "$status"
+                exit "$rc"
+              ' ai-pr-loop-runtime "$runtime_ready" "$status_file" "$@" ;;
+      perl)   exec perl -MPOSIX -e \
+                'my $ready = shift @ARGV; my $status = shift @ARGV;
+                 POSIX::setsid() >= 0 or die "setsid: $!";
+                 open(my $fh, ">", $ready) or die "ready: $!";
+                 print {$fh} "ready\n"; close($fh);
+                 my $raw = system @ARGV;
+                 my $rc = $raw == -1 ? 127
+                   : (($raw & 127) ? 128 + ($raw & 127) : ($raw >> 8));
+                 open(my $sfh, ">", "$status.tmp") or die "status: $!";
+                 print {$sfh} "$rc\n"; close($sfh);
+                 rename("$status.tmp", $status) or die "status rename: $!";
+                 exit $rc' \
+                "$runtime_ready" "$status_file" "$@" ;;
+    esac ) < "$in_file" > "$out_file" 2> "$err_file" &
+  rpc_pid=$!
+  printf '%s\n' "$rpc_pid" > "$pid_file.tmp" \
+    && mv -f "$pid_file.tmp" "$pid_file" \
+    || { _runtime_rpc_guardian_cleanup; return 1; }
+
+  while _runtime_rpc_guardian_owner_alive; do
+    if (( normal_stop == 1 )); then
+      if (( leader_reaped == 0 )) && ! _runtime_rpc_guardian_child_running; then
+        wait "$rpc_pid" 2>/dev/null || true
+        leader_reaped=1
+      fi
+      # The wrapper can exit on EOF while a descendant that ignores TERM
+      # keeps the session group alive. Stay leased to the owner until the
+      # whole group is gone; owner death still takes the abnormal kill path.
+      if (( leader_reaped == 1 )) \
+         && ! kill -0 -- "-$rpc_pid" 2>/dev/null; then
+        _runtime_rpc_guardian_remove
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  _runtime_rpc_guardian_cleanup
+}
+
+_runtime_rpc_start() {  # <cwd> <executable> [args...]
+  local cwd="$1" ready_wait owner_pid='' owner_token='' discovered_pid=''; shift
+  _runtime_rpc_stop_if_active
+  RUNTIME_RPC_PID=''
+  RUNTIME_RPC_GUARDIAN_PID=''
+  RUNTIME_RPC_GROUPED=0
+  RUNTIME_RPC_LAUNCHER=''
+  RUNTIME_RPC_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ai-pr-loop-runtime.XXXXXX") \
+    || return 1
+  RUNTIME_RPC_ACTIVE=1
+  RUNTIME_RPC_IN="$RUNTIME_RPC_DIR/in"
+  RUNTIME_RPC_OUT="$RUNTIME_RPC_DIR/out"
+  RUNTIME_RPC_ERR="$RUNTIME_RPC_DIR/err"
+  RUNTIME_RPC_READY="$RUNTIME_RPC_DIR/ready"
+  RUNTIME_RPC_STATUS="$RUNTIME_RPC_DIR/status"
+  RUNTIME_RPC_GUARDIAN_READY="$RUNTIME_RPC_DIR/guardian-ready"
+  RUNTIME_RPC_PID_FILE="$RUNTIME_RPC_DIR/rpc.pid"
+  if command -v setsid >/dev/null 2>&1; then
+    RUNTIME_RPC_LAUNCHER=setsid
+    RUNTIME_RPC_GROUPED=1
+  elif command -v perl >/dev/null 2>&1; then
+    RUNTIME_RPC_LAUNCHER=perl
+    RUNTIME_RPC_GROUPED=1
+  else
+    log "WARNING: runtime metadata probe requires setsid or perl for process-tree containment"
+    _runtime_rpc_stop
+    return 1
+  fi
+  : > "$RUNTIME_RPC_OUT"
+  : > "$RUNTIME_RPC_ERR"
+  if ! mkfifo "$RUNTIME_RPC_IN"; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  # Bash 3.2 has no BASHPID, and $$ deliberately retains the parent shell's
+  # value inside command substitutions. A direct child writes its real PPID
+  # without another command substitution layer so the lease names this shell.
+  "${BASH:-bash}" -c 'printf "%s\n" "$PPID" > "$1"' \
+    ai-pr-loop-owner "$RUNTIME_RPC_PID_FILE.owner" || true
+  if [[ -s "$RUNTIME_RPC_PID_FILE.owner" ]]; then
+    IFS= read -r owner_pid < "$RUNTIME_RPC_PID_FILE.owner" || owner_pid=''
+  fi
+  rm -f "$RUNTIME_RPC_PID_FILE.owner"
+  [[ "$owner_pid" =~ ^[1-9][0-9]*$ ]] || {
+    _runtime_rpc_stop
+    return 1
+  }
+  owner_token=$(_runtime_rpc_process_token "$owner_pid") || owner_token=''
+  ( exec 7>&-
+    _runtime_rpc_guardian "$owner_pid" "$owner_token" "$cwd" "$RUNTIME_RPC_LAUNCHER" \
+      "$RUNTIME_RPC_IN" "$RUNTIME_RPC_OUT" "$RUNTIME_RPC_ERR" \
+      "$RUNTIME_RPC_READY" "$RUNTIME_RPC_GUARDIAN_READY" \
+      "$RUNTIME_RPC_PID_FILE" "$RUNTIME_RPC_STATUS" \
+      "$RUNTIME_RPC_DIR" "$@" ) \
+      </dev/null >/dev/null 2>&1 &
+  RUNTIME_RPC_GUARDIAN_PID=$!
+  # The guardian installs its traps before it creates the RPC. Wait for both
+  # that lease and the child pid before connecting the FIFO.
+  for ready_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+    if [[ -s "$RUNTIME_RPC_GUARDIAN_READY" && -s "$RUNTIME_RPC_PID_FILE" ]]; then
+      discovered_pid=$(<"$RUNTIME_RPC_PID_FILE")
+      [[ "$discovered_pid" =~ ^[1-9][0-9]*$ ]] && break
+    fi
+    kill -0 "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ ! "$discovered_pid" =~ ^[1-9][0-9]*$ ]]; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  RUNTIME_RPC_PID="$discovered_pid"
+  if ! exec 7> "$RUNTIME_RPC_IN"; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  for ready_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+    [[ -s "$RUNTIME_RPC_READY" ]] && break
+    kill -0 "$RUNTIME_RPC_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ ! -s "$RUNTIME_RPC_READY" ]]; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  return 0
+}
+
+_runtime_rpc_send() {
+  # A CLI/wrapper can exit between FIFO connect and a request. Ignore SIGPIPE
+  # only for this write so printf returns failure to the guarded caller instead
+  # of terminating the entire turn with rc 141.
+  ( trap '' PIPE; printf '%s\n' "$1" >&7 2>/dev/null )
+}
+
+_runtime_rpc_wait() {  # <request id> [seconds]
+  local request_id="$1" timeout_secs="${2:-20}" started=$SECONDS response
+  while (( SECONDS - started < timeout_secs )); do
+    response=$(jq -Rsce --arg id "$request_id" '
+      split("\n") | map(fromjson? // empty)
+      | first(.[] | select(
+          ((.id // "") | tostring) == $id
+          or ((.response.request_id // "") | tostring) == $id
+        )) // empty
+    ' "$RUNTIME_RPC_OUT" 2>/dev/null) && {
+      printf '%s\n' "$response"
+      return 0
+    }
+    # Give a process that just exited one final parse before failing.
+    if ! kill -0 "$RUNTIME_RPC_PID" 2>/dev/null; then
+      response=$(jq -Rsce --arg id "$request_id" '
+        split("\n") | map(fromjson? // empty)
+        | first(.[] | select(
+            ((.id // "") | tostring) == $id
+            or ((.response.request_id // "") | tostring) == $id
+          )) // empty
+      ' "$RUNTIME_RPC_OUT" 2>/dev/null) && {
+        printf '%s\n' "$response"
+        return 0
+      }
+      return 1
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_runtime_rpc_alive() {
+  kill -0 -- "-${RUNTIME_RPC_PID}" 2>/dev/null \
+    || kill -0 "$RUNTIME_RPC_PID" 2>/dev/null
+}
+
+_runtime_rpc_signal() {  # <TERM|KILL>
+  kill -"$1" -- "-${RUNTIME_RPC_PID}" 2>/dev/null \
+    || kill -"$1" "$RUNTIME_RPC_PID" 2>/dev/null \
+    || true
+}
+
+_runtime_rpc_pid_running() {  # <pid>; zombies are already terminal
+  local pid="$1" state=''
+  kill -0 "$pid" 2>/dev/null || return 1
+  state=$(ps -o stat= -p "$pid" 2>/dev/null) || state=''
+  [[ -z "$state" || "$state" != *Z* ]]
+}
+
+_runtime_rpc_stop() {
+  # Do not attach `2>/dev/null` to this exec: an exec with no command makes
+  # every redirection persistent, which would silence the rest of the turn.
+  local stop_wait discovered_pid=''
+  local old_hup old_int old_term
+  [[ "${RUNTIME_RPC_ACTIVE:-0}" == "1" ]] || return 0
+  old_hup=$(trap -p HUP); old_int=$(trap -p INT); old_term=$(trap -p TERM)
+  trap '' HUP INT TERM
+  RUNTIME_RPC_ACTIVE=0
+  exec 7>&-
+  if [[ ! "${RUNTIME_RPC_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    if [[ -s "${RUNTIME_RPC_PID_FILE:-}" ]]; then
+      discovered_pid=$(<"$RUNTIME_RPC_PID_FILE")
+    fi
+    [[ "$discovered_pid" =~ ^[1-9][0-9]*$ ]] \
+      && RUNTIME_RPC_PID="$discovered_pid"
+  fi
+  if [[ -n "${RUNTIME_RPC_GUARDIAN_PID:-}" \
+        && "${RUNTIME_RPC_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+    # Let the direct parent reap a normally exiting RPC while this process
+    # applies the bounded TERM/KILL policy below.
+    kill -USR1 "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${RUNTIME_RPC_PID:-}" ]]; then
+    # EOF is the protocol's normal shutdown. Give the CLI a short bounded
+    # chance to tear down plugins/session locks before escalating TERM/KILL.
+    for stop_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      _runtime_rpc_alive || break
+      sleep 0.1
+    done
+    if _runtime_rpc_alive; then
+      _runtime_rpc_signal TERM
+      for stop_wait in 1 2 3 4 5 6 7 8 9 10; do
+        _runtime_rpc_alive || break
+        sleep 0.1
+      done
+    fi
+    if _runtime_rpc_alive; then
+      _runtime_rpc_signal KILL
+    fi
+  fi
+  if [[ -n "${RUNTIME_RPC_GUARDIAN_PID:-}" ]]; then
+    if [[ ! "${RUNTIME_RPC_PID:-}" =~ ^[1-9][0-9]*$ ]]; then
+      # Startup failed before the pid handoff; ask the guardian to perform its
+      # abnormal child cleanup rather than exiting normally.
+      kill -TERM "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null || true
+    fi
+    for stop_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+      _runtime_rpc_pid_running "$RUNTIME_RPC_GUARDIAN_PID" || break
+      sleep 0.1
+    done
+    if _runtime_rpc_pid_running "$RUNTIME_RPC_GUARDIAN_PID"; then
+      kill -TERM "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null || true
+      for stop_wait in 1 2 3 4 5 6 7 8 9 10; do
+        _runtime_rpc_pid_running "$RUNTIME_RPC_GUARDIAN_PID" || break
+        sleep 0.1
+      done
+    fi
+    _runtime_rpc_pid_running "$RUNTIME_RPC_GUARDIAN_PID" \
+      && kill -KILL "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null \
+      || true
+    wait "$RUNTIME_RPC_GUARDIAN_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${RUNTIME_RPC_DIR:-}" ]]; then
+    rm -f "$RUNTIME_RPC_IN" "$RUNTIME_RPC_OUT" "$RUNTIME_RPC_ERR" \
+      "$RUNTIME_RPC_READY" "$RUNTIME_RPC_GUARDIAN_READY" \
+      "$RUNTIME_RPC_STATUS" "$RUNTIME_RPC_STATUS.tmp" \
+      "$RUNTIME_RPC_PID_FILE" "$RUNTIME_RPC_PID_FILE.tmp" \
+      "$RUNTIME_RPC_PID_FILE.owner"
+    rmdir "$RUNTIME_RPC_DIR" 2>/dev/null || true
+  fi
+  RUNTIME_RPC_PID=''
+  RUNTIME_RPC_GUARDIAN_PID=''
+  RUNTIME_RPC_DIR=''
+  RUNTIME_RPC_IN=''
+  RUNTIME_RPC_OUT=''
+  RUNTIME_RPC_ERR=''
+  RUNTIME_RPC_READY=''
+  RUNTIME_RPC_STATUS=''
+  RUNTIME_RPC_GUARDIAN_READY=''
+  RUNTIME_RPC_PID_FILE=''
+  RUNTIME_RPC_GROUPED=0
+  RUNTIME_RPC_LAUNCHER=''
+  if [[ -n "$old_hup" ]]; then eval "$old_hup"; else trap - HUP; fi
+  if [[ -n "$old_int" ]]; then eval "$old_int"; else trap - INT; fi
+  if [[ -n "$old_term" ]]; then eval "$old_term"; else trap - TERM; fi
+}
+
+_runtime_rpc_stop_if_active() {
+  [[ "${RUNTIME_RPC_ACTIVE:-0}" == "1" ]] && _runtime_rpc_stop
+  return 0
+}
+
+# Run a finite metadata command under the same direct-parent guardian and
+# process-group containment as the JSONL probes. Poll the leader rather than
+# the group: a completed leader remains a zombie until the guardian receives
+# the normal-stop signal, while any surviving descendants are still killed by
+# _runtime_rpc_stop after the output snapshot has been copied.
+_runtime_capture_with_timeout() {  # <cwd> <seconds> <executable> [args...]
+  local cwd="$1" timeout_secs="$2" started output_file child_rc='' cat_rc=0
+  local status_wait
+  shift 2
+  _runtime_rpc_start "$cwd" "$@" || return 1
+  exec 7>&-
+  started=$SECONDS
+  while _runtime_rpc_pid_running "$RUNTIME_RPC_PID"; do
+    if (( SECONDS - started >= timeout_secs )); then
+      _runtime_rpc_stop
+      return 124
+    fi
+    sleep 0.1
+  done
+  for status_wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [[ -s "$RUNTIME_RPC_STATUS" ]] && break
+    sleep 0.05
+  done
+  if [[ -s "$RUNTIME_RPC_STATUS" ]]; then
+    IFS= read -r child_rc < "$RUNTIME_RPC_STATUS" || child_rc=''
+  fi
+  if [[ ! "$child_rc" =~ ^[0-9]+$ ]] || (( child_rc > 255 )); then
+    _runtime_rpc_stop
+    return 1
+  fi
+  output_file="$RUNTIME_RPC_OUT"
+  command cat "$output_file" || cat_rc=$?
+  _runtime_rpc_stop
+  (( cat_rc == 0 )) || return "$cat_rc"
+  return "$child_rc"
+}
+
+_runtime_rpc_exit_on_signal() {  # <conventional exit code>
+  local signal_rc="$1"
+  trap '' HUP INT TERM
+  _runtime_rpc_stop_if_active
+  trap - HUP INT TERM
+  exit "$signal_rc"
+}
+
+_claude_runtime_probe_once() {  # <omit permission args: 0|1>
+  local omit_permissions="$1" init_response settings_response context_response
+  local probe_args=(-p --input-format stream-json --output-format stream-json
+                    --verbose --no-session-persistence --tools '')
+  probe_args+=( ${CLAUDE_SESSION_ARG[@]+"${CLAUDE_SESSION_ARG[@]}"} )
+  probe_args+=( ${CLAUDE_MODEL_ARG[@]+"${CLAUDE_MODEL_ARG[@]}"} )
+  probe_args+=( ${CLAUDE_EFFORT_ARG[@]+"${CLAUDE_EFFORT_ARG[@]}"} )
+  if [[ "$omit_permissions" != "1" ]]; then
+    probe_args+=( ${CLAUDE_PERMS_ARG[@]+"${CLAUDE_PERMS_ARG[@]}"} )
+  fi
+  probe_args+=( ${CLAUDE_SETTINGS_ARG[@]+"${CLAUDE_SETTINGS_ARG[@]}"} )
+
+  _runtime_rpc_start "$REPO_DIR" "$CLAUDE_BIN" \
+    ${probe_args[@]+"${probe_args[@]}"} || return 1
+  if ! _runtime_rpc_send \
+      '{"type":"control_request","request_id":"claude-init","request":{"subtype":"initialize","hooks":null}}' \
+     || ! init_response=$(_runtime_rpc_wait claude-init 30) \
+     || ! jq -e '.response.subtype == "success"' <<<"$init_response" >/dev/null 2>&1; then
+    if [[ "$omit_permissions" == "0" ]] \
+       && { grep -qiE 'auto[ -]mode (is )?(disabled by settings|unavailable for (your plan|this model)|requires CLAUDE_CODE_ENABLE_AUTO_MODE)' \
+              "$RUNTIME_RPC_ERR" 2>/dev/null \
+            || grep -qiE 'auto[ -]mode (is )?(disabled by settings|unavailable for (your plan|this model)|requires CLAUDE_CODE_ENABLE_AUTO_MODE)' \
+              <<<"${init_response:-}"; }; then
+      CLAUDE_RUNTIME_AUTO_REJECTED=1
+    fi
+    _runtime_rpc_stop
+    return 1
+  fi
+  # Preserve a definitive effective permission result even if the independent
+  # context request is unsupported or malformed.
+  CLAUDE_RUNTIME_INIT_RESPONSE="$init_response"
+  if [[ "${CLAUDE_RUNTIME_NEED_CONTEXT:-1}" == "0" ]]; then
+    _runtime_rpc_stop
+    return 0
+  fi
+  if ! _runtime_rpc_send \
+      '{"type":"control_request","request_id":"claude-settings","request":{"subtype":"get_settings"}}' \
+     || ! settings_response=$(_runtime_rpc_wait claude-settings 30) \
+     || ! jq -e '
+          .response.subtype == "success"
+          and (.response.response.applied | type == "object")
+        ' <<<"$settings_response" >/dev/null 2>&1; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  CLAUDE_RUNTIME_SETTINGS_RESPONSE="$settings_response"
+  # A numeric override exists specifically for wrappers/providers that cannot
+  # report context usage. Model and effort still come from get_settings.
+  if [[ "${CLAUDE_CONTEXT_WINDOW:-auto}" =~ ^[1-9][0-9]*$ ]]; then
+    _runtime_rpc_stop
+    return 0
+  fi
+  if ! _runtime_rpc_send \
+      '{"type":"control_request","request_id":"claude-context","request":{"subtype":"get_context_usage"}}' \
+     || ! context_response=$(_runtime_rpc_wait claude-context 30) \
+     || ! jq -e '.response.subtype == "success"' <<<"$context_response" >/dev/null 2>&1; then
+    _runtime_rpc_stop
+    return 1
+  fi
+  _runtime_rpc_stop
+  CLAUDE_RUNTIME_CONTEXT_RESPONSE="$context_response"
+}
+
+resolve_claude_runtime_metadata() {
+  local retried_without_auto=0 model window permission effort ultracode
+  CLAUDE_RUNTIME_INIT_RESPONSE=''
+  CLAUDE_RUNTIME_SETTINGS_RESPONSE=''
+  CLAUDE_RUNTIME_CONTEXT_RESPONSE=''
+  CLAUDE_RUNTIME_AUTO_REJECTED=0
+  CLAUDE_MODEL_ACTUAL=unknown
+  CLAUDE_EFFORT_ACTUAL=unknown
+  CLAUDE_CONTEXT_WINDOW_RESOLVED=unknown
+  CLAUDE_CONTEXT_WINDOW_SOURCE=unknown
+  CLAUDE_AUTO_MODE_EFFECTIVE=''
+
+  if ! _claude_runtime_probe_once 0; then
+    if [[ "${CLAUDE_PERMS_RESOLVED:-}" == "auto" \
+          && ${#CLAUDE_PERMS_ARG[@]} -gt 0 \
+          && "$CLAUDE_RUNTIME_AUTO_REJECTED" == "1" ]]; then
+      retried_without_auto=1
+      log "claude: control probe confirmed auto mode is unavailable — retrying metadata-only without it"
+      _claude_runtime_probe_once 1 || true
+    fi
+  fi
+
+  if [[ -n "${CLAUDE_RUNTIME_SETTINGS_RESPONSE:-}" ]]; then
+    model=$(jq -r '.response.response.applied.model // empty' \
+      <<<"$CLAUDE_RUNTIME_SETTINGS_RESPONSE" 2>/dev/null) || model=''
+    effort=$(jq -r '.response.response.applied.effort // empty' \
+      <<<"$CLAUDE_RUNTIME_SETTINGS_RESPONSE" 2>/dev/null) || effort=''
+    ultracode=$(jq -r '.response.response.applied.ultracode // false' \
+      <<<"$CLAUDE_RUNTIME_SETTINGS_RESPONSE" 2>/dev/null) || ultracode=false
+    [[ -n "$model" ]] && CLAUDE_MODEL_ACTUAL="$model"
+    if [[ -n "$effort" ]]; then
+      CLAUDE_EFFORT_ACTUAL="$effort"
+      [[ "$ultracode" == true ]] \
+        && CLAUDE_EFFORT_ACTUAL="$CLAUDE_EFFORT_ACTUAL (ultracode)"
+    fi
+  fi
+
+  if [[ -n "${CLAUDE_RUNTIME_CONTEXT_RESPONSE:-}" ]]; then
+    model=$(jq -r '.response.response.model // empty' \
+      <<<"$CLAUDE_RUNTIME_CONTEXT_RESPONSE" 2>/dev/null) || model=''
+    window=$(jq -r '.response.response.maxTokens // empty' \
+      <<<"$CLAUDE_RUNTIME_CONTEXT_RESPONSE" 2>/dev/null) || window=''
+    if [[ -n "$model" && "$CLAUDE_MODEL_ACTUAL" != unknown \
+          && "$model" != "$CLAUDE_MODEL_ACTUAL" ]]; then
+      log "WARNING: claude control responses disagreed on the applied model ($CLAUDE_MODEL_ACTUAL vs $model)"
+      CLAUDE_MODEL_ACTUAL=unknown
+    fi
+    if [[ "${CLAUDE_CONTEXT_WINDOW:-auto}" =~ ^[1-9][0-9]*$ ]]; then
+      CLAUDE_CONTEXT_WINDOW_RESOLVED="$CLAUDE_CONTEXT_WINDOW"
+      CLAUDE_CONTEXT_WINDOW_SOURCE=configured
+    elif [[ "$window" =~ ^[1-9][0-9]*$ ]]; then
+      CLAUDE_CONTEXT_WINDOW_RESOLVED="$window"
+      CLAUDE_CONTEXT_WINDOW_SOURCE=runtime
+    fi
+  elif [[ "${CLAUDE_CONTEXT_WINDOW:-auto}" =~ ^[1-9][0-9]*$ ]]; then
+    CLAUDE_CONTEXT_WINDOW_RESOLVED="$CLAUDE_CONTEXT_WINDOW"
+    CLAUDE_CONTEXT_WINDOW_SOURCE=configured
+  fi
+
+  if [[ -n "${CLAUDE_RUNTIME_INIT_RESPONSE:-}" ]]; then
+    permission=$(jq -r '.response.response.current_permission_mode // empty' \
+      <<<"$CLAUDE_RUNTIME_INIT_RESPONSE" 2>/dev/null) || permission=''
+    CLAUDE_AUTO_MODE_EFFECTIVE="$permission"
+  fi
+  if (( retried_without_auto == 1 )); then
+    # The requested auto process could not complete even its control
+    # handshake. Whatever the retry reports, do not use auto for the turn.
+    CLAUDE_AUTO_MODE_EFFECTIVE="${CLAUDE_AUTO_MODE_EFFECTIVE:-unavailable}"
+    [[ "$CLAUDE_AUTO_MODE_EFFECTIVE" == "auto" ]] \
+      && CLAUDE_AUTO_MODE_EFFECTIVE=unavailable
+  fi
+
+  if [[ "${CLAUDE_RUNTIME_NEED_CONTEXT:-1}" == "0" ]]; then
+    log "claude: effective permission=${CLAUDE_AUTO_MODE_EFFECTIVE:-unknown}"
+  elif [[ "$CLAUDE_MODEL_ACTUAL" == unknown ]]; then
+    log "WARNING: claude runtime metadata probe did not resolve a model"
+  else
+    log "claude: runtime model=$CLAUDE_MODEL_ACTUAL effort=$CLAUDE_EFFORT_ACTUAL context-window=$CLAUDE_CONTEXT_WINDOW_RESOLVED permission=${CLAUDE_AUTO_MODE_EFFECTIVE:-unknown}"
+  fi
+}
+
+# Codex takes runtime-only global flags such as `--profile` for `exec`, and
+# rejects them for `app-server` and `debug models`. A configured executable that
+# adds one of those flags — the documented way to wrap a CLI with fixed
+# arguments — can therefore never answer the control-only probe above.
+#
+# `exec` stays usable for every wrapper, and Codex records the resolved model,
+# effort, and effective context window in the session rollout before it sends
+# the turn's first request. Point that request at a closed loopback port: the
+# records are written, the request fails at once, and no prompt reaches a
+# provider.
+#
+# The probe's rollout is deleted afterwards, so probe sessions do not
+# accumulate in the host-global sessions directory.
+#
+# The provider name carries a per-probe nonce, and the cwd recorded in the
+# rollout separates checkouts. One managed clone serves every PR of a repo, so
+# two loops can probe from the same checkout at the same moment and the cwd
+# alone cannot tell their sessions apart. The prefix alone marks a file as SOME
+# probe's, which is all session discovery needs.
+CODEX_METADATA_PROBE_PREFIX='ai_pr_loop_metadata_probe_'
+
+# The rollout that appeared since <snapshot> and records exactly this probe's
+# provider and cwd. The caller deletes what it gets.
+_codex_metadata_probe_rollout() {  # <session snapshot> <provider> <cwd>
+  local before="$1" provider="$2" want_cwd="$3" f meta
+  while IFS= read -r f; do
+    meta=$(head -1 "$f" 2>/dev/null) || continue
+    jq -e --arg provider "$provider" --arg cwd "$want_cwd" '
+      .payload.model_provider == $provider and .payload.cwd == $cwd
+    ' <<<"$meta" >/dev/null 2>&1 || continue
+    printf '%s\n' "$f"
+    return 0
+  done < <(_codex_rollouts_since "$before")
+  return 1
+}
+
+_codex_runtime_session_probe() {  # <cwd> [shared -c overrides...]
+  local cwd="$1"; shift
+  local before rollout metadata provider nonce
+  CODEX_SESSION_PROBE_MODEL=''
+  CODEX_SESSION_PROBE_EFFORT=''
+  CODEX_SESSION_PROBE_WINDOW=''
+  # A TOML bare key, so keep the nonce to the hex digits of the uuid.
+  nonce=$(gen_uuid | tr -cd '0-9a-f') || return 1
+  [[ ${#nonce} -ge 16 ]] || return 1
+  provider="${CODEX_METADATA_PROBE_PREFIX}${nonce}"
+  before=$(mktemp "${TMPDIR:-/tmp}/ai-pr-loop-codex-sessions.XXXXXX") || return 1
+  snapshot_codex_sessions "$before"
+  _runtime_capture_with_timeout "$cwd" 30 "$CODEX_BIN" ${1+"$@"} \
+    -c "model_providers.${provider}={name=\"ai-pr-loop metadata probe\",base_url=\"http://127.0.0.1:1/v1\",wire_api=\"responses\",request_max_retries=0,stream_max_retries=0}" \
+    -c "model_provider=\"${provider}\"" \
+    exec --skip-git-repo-check --color never \
+    'ai-pr-loop runtime metadata probe' >/dev/null 2>&1 || true
+  rollout=$(_codex_metadata_probe_rollout "$before" "$provider" "$cwd") || rollout=''
+  rm -f "$before"
+  if [[ -z "$rollout" ]]; then
+    log "WARNING: the codex session probe recorded no identifiable session"
+    return 1
+  fi
+  metadata=$(codex_rollout_runtime_metadata "$rollout") || metadata=''
+  rm -f "$rollout" \
+    || log "WARNING: the codex session probe left $rollout behind"
+  [[ -n "$metadata" ]] || return 1
+  CODEX_SESSION_PROBE_MODEL=$(jq -r '.model // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_MODEL=''
+  CODEX_SESSION_PROBE_EFFORT=$(jq -r '.effort // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_EFFORT=''
+  CODEX_SESSION_PROBE_WINDOW=$(jq -r '.context_window // empty' <<<"$metadata" 2>/dev/null) \
+    || CODEX_SESSION_PROBE_WINDOW=''
+  [[ -n "$CODEX_SESSION_PROBE_MODEL" ]]
+}
+
+resolve_codex_runtime_metadata() {
+  local init_response config_response models_response resume_response resume_request
+  local catalog selected effort provider config_context='' quoted tokens runtime_cwd
+  local catalog_entry=''
+  local app_server_ready=0
+  local config_args=()
+  CODEX_MODEL_ACTUAL=unknown
+  CODEX_EFFORT_ACTUAL=unknown
+  CODEX_CONTEXT_WINDOW_RESOLVED=unknown
+  CODEX_CONTEXT_WINDOW_SOURCE=unknown
+  runtime_cwd="${REPO_DIR_CANON:-}"
+  if [[ -z "$runtime_cwd" ]]; then
+    runtime_cwd=$(CDPATH= cd -- "$REPO_DIR" && pwd -P) || return 1
+  fi
+
+  if [[ "$CODEX_MODEL_RESOLVED" != "off" && -n "$CODEX_MODEL_RESOLVED" ]]; then
+    quoted=$(jq -rn --arg value "$CODEX_MODEL_RESOLVED" '$value | @json')
+    config_args+=(-c "model=$quoted")
+  fi
+  if [[ "$CODEX_EFFORT_RESOLVED" != "off" && -n "$CODEX_EFFORT_RESOLVED" ]]; then
+    quoted=$(jq -rn --arg value "$CODEX_EFFORT_RESOLVED" '$value | @json')
+    config_args+=(-c "model_reasoning_effort=$quoted")
+  fi
+  if [[ "$CODEX_TIER_RESOLVED" != "off" && -n "$CODEX_TIER_RESOLVED" ]]; then
+    quoted=$(jq -rn --arg value "$CODEX_TIER_RESOLVED" '$value | @json')
+    config_args+=(-c "service_tier=$quoted")
+  fi
+
+  if _runtime_rpc_start "$runtime_cwd" "$CODEX_BIN" \
+      ${config_args[@]+"${config_args[@]}"} app-server; then
+    if _runtime_rpc_send \
+        '{"method":"initialize","id":"codex-init","params":{"clientInfo":{"name":"ai_pr_loop","title":"ai-pr-loop metadata probe","version":"1"},"capabilities":{"experimentalApi":true}}}' \
+       && init_response=$(_runtime_rpc_wait codex-init 20) \
+       && jq -e '.result != null and .error == null' <<<"$init_response" >/dev/null 2>&1; then
+      app_server_ready=1
+    fi
+    if (( app_server_ready == 1 )) \
+       && _runtime_rpc_send '{"method":"initialized","params":{}}' \
+       && _runtime_rpc_send "$(jq -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
+       && _runtime_rpc_send \
+          '{"method":"model/list","id":"codex-models","params":{"limit":100,"includeHidden":true}}' \
+       && config_response=$(_runtime_rpc_wait codex-config 20) \
+       && models_response=$(_runtime_rpc_wait codex-models 20) \
+       && jq -e '.error == null and (.result.config | type == "object")' \
+            <<<"$config_response" >/dev/null 2>&1 \
+       && jq -e '.error == null and (.result.data | type == "array")' \
+            <<<"$models_response" >/dev/null 2>&1; then
+      selected=$(jq -r '.result.config.model // empty' \
+        <<<"$config_response" 2>/dev/null) || selected=''
+      if [[ -z "$selected" ]]; then
+        selected=$(jq -r 'first(.result.data[]? | select(.isDefault == true) | .model) // empty' \
+          <<<"$models_response" 2>/dev/null) || selected=''
+      fi
+      effort=$(jq -r '.result.config.model_reasoning_effort // empty' \
+        <<<"$config_response" 2>/dev/null) || effort=''
+      if [[ -z "$effort" && -n "$selected" ]]; then
+        effort=$(jq -r --arg model "$selected" '
+          first(.result.data[]? | select(.model == $model) | .defaultReasoningEffort) // empty
+        ' <<<"$models_response" 2>/dev/null) || effort=''
+      fi
+      config_context=$(jq -r '.result.config.model_context_window // empty' \
+        <<<"$config_response" 2>/dev/null) || config_context=''
+      provider=$(jq -r '.result.config.model_provider // empty' \
+        <<<"$config_response" 2>/dev/null) || provider=''
+
+      if [[ -n "${CODEX_SESSION_ID:-}" && -n "$selected" ]]; then
+        # Match `codex exec resume`: it always passes the CURRENT effective
+        # config model/provider/cwd into thread/resume. A bare resume restores
+        # persisted model/effort and would therefore sign stale metadata when
+        # host configuration changed since the previous turn.
+        resume_request=$(jq -cn \
+          --arg id "$CODEX_SESSION_ID" --arg cwd "$runtime_cwd" \
+          --arg model "$selected" --arg provider "$provider" '
+          {method:"thread/resume", id:"codex-resume",
+           params:{threadId:$id, model:$model, cwd:$cwd, excludeTurns:true}}
+          | if $provider == "" then .
+            else .params.modelProvider = $provider end
+        ')
+        if _runtime_rpc_send "$resume_request" \
+           && resume_response=$(_runtime_rpc_wait codex-resume 20) \
+           && jq -e '
+                .error == null
+                and (.result.model | type == "string" and length > 0)
+                and ((.result.reasoningEffort == null)
+                     or (.result.reasoningEffort | type == "string"))
+              ' <<<"$resume_response" >/dev/null 2>&1; then
+          selected=$(jq -r '.result.model' <<<"$resume_response")
+          effort=$(jq -r '.result.reasoningEffort // empty' \
+            <<<"$resume_response")
+          CODEX_MODEL_ACTUAL="$selected"
+          [[ -n "$effort" ]] && CODEX_EFFORT_ACTUAL="$effort"
+        fi
+      else
+        [[ -n "$selected" ]] && CODEX_MODEL_ACTUAL="$selected"
+        [[ -n "$effort" ]] && CODEX_EFFORT_ACTUAL="$effort"
+      fi
+    fi
+    _runtime_rpc_stop
+  fi
+
+  # ModelInfo lookup mirrors Codex: longest slug prefix, with one optional
+  # simple provider namespace. Besides context metadata, this is the fallback
+  # source for a model's effective default reasoning level.
+  if [[ "$CODEX_MODEL_ACTUAL" != unknown \
+        && ( "$CODEX_EFFORT_ACTUAL" == unknown \
+             || "${CODEX_CONTEXT_WINDOW:-auto}" == auto ) ]]; then
+    catalog=$(_runtime_capture_with_timeout "$runtime_cwd" 20 "$CODEX_BIN" \
+      ${config_args[@]+"${config_args[@]}"} debug models 2>/dev/null) || catalog=''
+    if [[ -n "$catalog" ]]; then
+      catalog_entry=$(jq -cer --arg model "$CODEX_MODEL_ACTUAL" '
+        def best($name):
+          [ .models[]?
+            | select(.slug as $slug | $name | startswith($slug)) ]
+          | sort_by(.slug | length) | last;
+        def namespaced($name):
+          if ($name | test("^[A-Za-z0-9_-]+/[^/]+$"))
+          then ($name | split("/")[1]) else null end;
+        (best($model) // (namespaced($model) as $suffix
+                          | if $suffix == null then null else best($suffix) end))
+        | select(. != null)
+      ' <<<"$catalog" 2>/dev/null) || catalog_entry=''
+    fi
+  fi
+
+  if [[ "$CODEX_EFFORT_ACTUAL" == unknown && -n "$catalog_entry" ]]; then
+    effort=$(jq -r '.default_reasoning_level // empty' \
+      <<<"$catalog_entry" 2>/dev/null) || effort=''
+    [[ -n "$effort" ]] && CODEX_EFFORT_ACTUAL="$effort"
+  fi
+
+  if [[ "${CODEX_CONTEXT_WINDOW:-auto}" =~ ^[1-9][0-9]*$ ]]; then
+    CODEX_CONTEXT_WINDOW_RESOLVED="$CODEX_CONTEXT_WINDOW"
+    CODEX_CONTEXT_WINDOW_SOURCE=configured
+  elif [[ -n "$catalog_entry" ]]; then
+      tokens=$(jq -er --arg configured "$config_context" '
+        ($configured | try tonumber catch null) as $configured_window
+        | (if $configured_window != null then
+            (if ((.max_context_window // 0) > 0)
+             then [$configured_window, .max_context_window] | min
+             else $configured_window end)
+          else (.context_window // .max_context_window) end) as $window
+        | (.effective_context_window_percent // 95) as $percent
+        | (($window * $percent / 100) | floor)
+        | select(. > 0)
+      ' <<<"$catalog_entry" 2>/dev/null) || tokens=''
+      if [[ "$tokens" =~ ^[1-9][0-9]*$ ]]; then
+        CODEX_CONTEXT_WINDOW_RESOLVED="$tokens"
+        CODEX_CONTEXT_WINDOW_SOURCE=runtime
+      fi
+  fi
+
+  # An app-server that answered keeps its own result, its failures included: a
+  # CLI that talks and then refuses must not be papered over. Only a CLI that
+  # never completed the handshake — the wrapper case, where there is no
+  # evidence at all — falls through to the session probe. That probe reports a
+  # FRESH session, so a resumed thread pinned to another model is covered only
+  # while the loop passes its own model on every turn.
+  # Nothing above this point can have resolved a model without the handshake,
+  # so the probe fills model and effort outright. The window is the exception:
+  # a numeric --codex-context-window already set it, and that stays.
+  if (( app_server_ready == 0 )) \
+     && _codex_runtime_session_probe "$runtime_cwd" \
+          ${config_args[@]+"${config_args[@]}"}; then
+    CODEX_MODEL_ACTUAL="$CODEX_SESSION_PROBE_MODEL"
+    if [[ -n "$CODEX_SESSION_PROBE_EFFORT" ]]; then
+      CODEX_EFFORT_ACTUAL="$CODEX_SESSION_PROBE_EFFORT"
+    fi
+    # The rollout number is already the effective window, so no catalog
+    # percentage applies to it.
+    if [[ "$CODEX_CONTEXT_WINDOW_RESOLVED" == unknown \
+          && "$CODEX_SESSION_PROBE_WINDOW" =~ ^[1-9][0-9]*$ ]]; then
+      CODEX_CONTEXT_WINDOW_RESOLVED="$CODEX_SESSION_PROBE_WINDOW"
+      CODEX_CONTEXT_WINDOW_SOURCE=runtime
+    fi
+  fi
+
+  if [[ "$CODEX_MODEL_ACTUAL" == unknown ]]; then
+    log "WARNING: codex runtime metadata probe did not resolve a model"
+  else
+    log "codex: runtime model=$CODEX_MODEL_ACTUAL effort=$CODEX_EFFORT_ACTUAL context-window=$CODEX_CONTEXT_WINDOW_RESOLVED"
+  fi
 }
 
 # Every git command the ORCHESTRATOR runs against a checkout an agent turn
@@ -1631,7 +2451,7 @@ fetch_ai_thread() {
   esac
   mapped=$(jq -c '
       . as $c
-      | ($c.body | capture("<!-- (?<tag>ai-loop:[a-z-]+)\\s+iter=(?<iter>[0-9]+) -->") ) as $m
+      | ($c.body | capture("<!-- (?<tag>ai-loop:[a-z-]+)\\s+iter=(?<iter>[0-9]+) -->")) as $m
       | { tag: $m.tag, iter: ($m.iter|tonumber),
           surface: $c.surface, id: $c.id,
           discussion_id: ($c.discussion_id // null),
@@ -1741,21 +2561,29 @@ post_ai_comment() {
   case "$who" in
     codex)
       tag="$CODEX_MARKER_TAG"; label="$CODEX_LABEL"
-      model="${CODEX_MODEL:-gpt-5.6-sol}"
-      effort=$(resolve_codex_effort "$model" "${CODEX_EFFORT:-}")
-      window=$(resolve_codex_context_window "$model" "${CODEX_CONTEXT_WINDOW:-auto}")
-      source=$(context_window_source codex \
-        "${CODEX_CONTEXT_WINDOW:-auto}" "$window")
+      model="${CODEX_MODEL_ACTUAL:-${CODEX_MODEL:-gpt-5.6-sol}}"
+      effort="${CODEX_EFFORT_ACTUAL:-}"
+      [[ -n "$effort" ]] \
+        || effort=$(resolve_codex_effort "${CODEX_MODEL:-gpt-5.6-sol}" "${CODEX_EFFORT:-}")
+      window="${CODEX_CONTEXT_WINDOW_RESOLVED:-}"
+      [[ -n "$window" ]] \
+        || window=$(resolve_codex_context_window "$model" "${CODEX_CONTEXT_WINDOW:-auto}")
+      source="${CODEX_CONTEXT_WINDOW_SOURCE:-}"
+      [[ -n "$source" ]] \
+        || source=$(context_window_source codex "${CODEX_CONTEXT_WINDOW:-auto}" "$window")
       signature=$(ai_comment_signature \
         "$(ai_model_display "$model")" "$(codex_effort_display "$effort")" "$window" "$source")
       ;;
     claude)
       tag="$CLAUDE_MARKER_TAG"; label="$CLAUDE_LABEL"
-      model="${CLAUDE_MODEL:-fable}"
-      effort="${CLAUDE_EFFORT:-ultracode}"
-      window=$(resolve_claude_context_window "$model" "${CLAUDE_CONTEXT_WINDOW:-auto}")
-      source=$(context_window_source claude \
-        "${CLAUDE_CONTEXT_WINDOW:-auto}" "$window")
+      model="${CLAUDE_MODEL_ACTUAL:-${CLAUDE_MODEL:-fable}}"
+      effort="${CLAUDE_EFFORT_ACTUAL:-${CLAUDE_EFFORT:-ultracode}}"
+      window="${CLAUDE_CONTEXT_WINDOW_RESOLVED:-}"
+      [[ -n "$window" ]] \
+        || window=$(resolve_claude_context_window "$model" "${CLAUDE_CONTEXT_WINDOW:-auto}")
+      source="${CLAUDE_CONTEXT_WINDOW_SOURCE:-}"
+      [[ -n "$source" ]] \
+        || source=$(context_window_source claude "${CLAUDE_CONTEXT_WINDOW:-auto}" "$window")
       signature=$(ai_comment_signature \
         "$(ai_model_display "$model")" "$(claude_effort_display "$effort")" "$window" "$source")
       ;;
@@ -1791,6 +2619,68 @@ ai_marker_fields() {  # <codex|claude>
   esac
 }
 
+ai_signature_manifest_path() {  # <codex|claude> <iter>
+  printf '%s/%s-signature-attempt.json\n' "$(iter_dir "$2")" "$1"
+}
+
+# Atomically pin the signature and already-public summaries immediately before
+# a forge turn starts. A retry advances past a failed attempt, so the newly
+# posted, correctly signed summary is the completion candidate for this run.
+record_ai_signature_attempt() {  # <codex|claude> <iter> <signature> <baseline thread>
+  local who="$1" iter="$2" signature="$3" baseline_file="$4"
+  local fields marker _alert _banner baseline manifest
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\x1f' read -r marker _alert _banner <<<"$fields"
+  baseline=$(jq -sc --arg t "$marker" --argjson it "$iter" '
+    [ .[]
+      | select(.tag == $t and .iter == $it)
+      | ((.surface // "") + "|" + ((.id // "") | tostring)) ]
+    | unique
+  ' "$baseline_file" 2>/dev/null) || return 1
+  manifest=$(jq -cn --arg signature "$signature" --argjson baseline "$baseline" \
+    '{version:1, signature:$signature, baseline:$baseline}') || return 1
+  write_state_atomic "$(ai_signature_manifest_path "$who" "$iter")" "$manifest"
+}
+
+# Validate the manifested attempt's completion contract: a NEW structural
+# summary whose metadata line exactly matches the runtime signature pinned
+# before the turn. Inline/reply recipes carry the same signature requirement
+# in the prompt; the summary alone is the atomic resume boundary because forge
+# comment surfaces are independently eventually consistent.
+ai_signed_attempt_complete() {  # <codex|claude> <iter> <snapshot> <manifest> [expected]
+  local who="$1" iter="$2" snap="$3" manifest="$4" expected="${5:-}"
+  local fields marker alert banner
+  fields=$(ai_marker_fields "$who") || return 1
+  IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  jq -es --slurpfile attempt "$manifest" \
+    --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+    --arg expected "$expected" --argjson it "$iter" \
+    "$AI_SUMMARY_JQ_DEF"'
+      def comment_key:
+        (.surface // "") + "|" + ((.id // "") | tostring);
+      def visible_lines:
+        ((.body // "") | gsub("\r"; "") | split("\n")
+         | map(sub("[[:space:]]+$"; ""))) as $lines
+        | [ $lines[1:][] | select(. != "") ];
+      def has_signature($sig):
+        visible_lines as $visible
+        | $visible[2] == ("> " + $sig);
+      ($attempt[0] // null) as $attempt
+      | select($attempt.version == 1
+               and ($attempt.signature | type == "string")
+               and ($attempt.signature | length) > 0
+               and ($attempt.baseline | type == "array")
+               and ($expected == "" or $attempt.signature == $expected))
+      | [ .[]
+          | select(.tag == $t and .iter == $it)
+          | comment_key as $key
+          | select(($attempt.baseline | index($key)) == null) ] as $new
+      | any($new[];
+            is_summary_root($t; $a; $b; $it)
+            and has_signature($attempt.signature))
+    ' "$snap" >/dev/null 2>&1
+}
+
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
 # A summary is an issue-surface thread ROOT whose body opens with the bot's
 # structural summary wrapper for its own iteration (is_summary above): the
@@ -1802,13 +2692,35 @@ ai_marker_fields() {  # <codex|claude>
 # incomplete review (and claude would have no summary to answer).
 latest_ai_comment_iter() {
   local tag="$1"  # codex|claude
-  local fields marker alert banner
+  local fields marker alert banner snap candidates candidate manifest highest=''
   fields=$(ai_marker_fields "$tag") || return 1
   IFS=$'\x1f' read -r marker alert banner <<<"$fields"
-  fetch_ai_thread \
-    | jq -r --arg t "$marker" --arg a "$alert" --arg b "$banner" \
-        "$AI_SUMMARY_JQ_DEF"'select(is_summary_root($t; $a; $b; .iter)) | .iter' \
-    | sort -n | tail -1
+  snap=$(mktemp "${TMPDIR:-/tmp}/ai-pr-loop-thread.XXXXXX") || return 1
+  if ! fetch_ai_thread > "$snap"; then
+    rm -f "$snap"
+    return 1
+  fi
+  candidates=$(jq -rs --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+    "$AI_SUMMARY_JQ_DEF"'
+      [ .[] | select(is_summary_root($t; $a; $b; .iter)) | .iter ]
+      | unique | sort | reverse | .[]
+    ' "$snap" 2>/dev/null) || candidates=''
+  while IFS= read -r candidate; do
+    [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+    manifest=$(ai_signature_manifest_path "$tag" "$candidate")
+    if [[ -s "$manifest" ]]; then
+      if ai_signed_attempt_complete "$tag" "$candidate" "$snap" "$manifest"; then
+        highest="$candidate"
+        break
+      fi
+    else
+      highest="$candidate"
+      break
+    fi
+  done <<<"$candidates"
+  rm -f "$snap"
+  if [[ -n "$highest" ]]; then printf '%s\n' "$highest"; fi
+  return 0
 }
 
 # True iff the bot's iteration-$2 summary comment exists on the PR right now
@@ -1820,25 +2732,40 @@ latest_ai_comment_iter() {
 # $3 names the snapshot file the fetched thread lands in, so the caller
 # that needs the verified data afterwards (emit_round_report) reads what
 # this check was made against instead of fetching again.
-ai_summary_posted() {  # <codex|claude> <iter> <snapshot-file>
-  local who="$1" iter="$2" snap="$3" fields marker alert banner
+ai_summary_posted() {  # <codex|claude> <iter> <snapshot-file> [exact signature]
+  local who="$1" iter="$2" snap="$3" signature="${4:-}"
+  local fields marker alert banner manifest
   fields=$(ai_marker_fields "$who") || return 1
   IFS=$'\x1f' read -r marker alert banner <<<"$fields"
   # Fetch stderr stays on the turn's stderr: an auth or API failure here
   # must reach the log, or 'summary not found' hides the real cause.
   fetch_ai_thread > "$snap" || { rm -f "$snap"; return 1; }
-  jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" --argjson it "$iter" \
-     "$AI_SUMMARY_JQ_DEF"'any(.[]; is_summary_root($t; $a; $b; $it))' \
+  manifest=$(ai_signature_manifest_path "$who" "$iter")
+  if [[ -s "$manifest" ]]; then
+    ai_signed_attempt_complete "$who" "$iter" "$snap" "$manifest" "$signature"
+    return
+  fi
+  # A current-version turn always supplies an expected signature and writes
+  # its manifest before the model starts. Missing state is not a legacy turn;
+  # it is an unverifiable attempt and must fail closed.
+  [[ -z "$signature" ]] || return 1
+  jq -es --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+     --arg s "$signature" --argjson it "$iter" \
+     "$AI_SUMMARY_JQ_DEF"'
+       any(.[];
+         is_summary_root($t; $a; $b; $it)
+         and ($s == "" or ((.body // "") | contains($s))))
+     ' \
      "$snap" >/dev/null
 }
 
 # Post-turn completion check with one short retry, absorbing forge
 # read-after-write lag on the comment list endpoints just after the POST.
-verify_ai_summary() {  # <codex|claude> <iter> <snapshot-file>
-  local who="$1" iter="$2" snap="$3"
-  ai_summary_posted "$who" "$iter" "$snap" && return 0
+verify_ai_summary() {  # <codex|claude> <iter> <snapshot-file> [exact signature]
+  local who="$1" iter="$2" snap="$3" signature="${4:-}"
+  ai_summary_posted "$who" "$iter" "$snap" "$signature" && return 0
   sleep 5
-  ai_summary_posted "$who" "$iter" "$snap"
+  ai_summary_posted "$who" "$iter" "$snap" "$signature"
 }
 
 # The thread snapshot the landed-probe verifies and emit_round_report
@@ -1858,7 +2785,8 @@ turn_artifact_landed() {  # <codex|claude> <iter>
   if [[ "$LOCAL_MODE" == "1" ]]; then
     local_artifact_written "$who" "$iter"
   else
-    verify_ai_summary "$who" "$iter" "$(thread_snapshot_path "$who" "$iter")"
+    verify_ai_summary "$who" "$iter" "$(thread_snapshot_path "$who" "$iter")" \
+      "${AI_COMMENT_SIGNATURE:-}"
   fi
 }
 
@@ -1878,9 +2806,35 @@ turn_artifact_landed() {  # <codex|claude> <iter>
 # Same structural predicate as ai_summary_posted — a tagged general note
 # without the summary wrapper is not a summary.
 extract_ai_summary_body() {  # <codex|claude> <iter> <thread-file>
-  local who="$1" iter="$2" thread="$3" fields marker alert banner
+  local who="$1" iter="$2" thread="$3" fields marker alert banner manifest
   fields=$(ai_marker_fields "$who") || return 1
   IFS=$'\x1f' read -r marker alert banner <<<"$fields"
+  manifest=$(ai_signature_manifest_path "$who" "$iter")
+  if [[ -s "$manifest" ]]; then
+    jq -rn --slurpfile attempt "$manifest" \
+      --arg t "$marker" --arg a "$alert" --arg b "$banner" \
+      --argjson it "$iter" \
+      "$AI_SUMMARY_JQ_DEF"'
+        def comment_key:
+          (.surface // "") + "|" + ((.id // "") | tostring);
+        def visible_lines:
+          ((.body // "") | gsub("\r"; "") | split("\n")
+           | map(sub("[[:space:]]+$"; ""))) as $lines
+          | [ $lines[1:][] | select(. != "") ];
+        def has_signature($sig):
+          visible_lines as $visible
+          | $visible[2] == ("> " + $sig);
+        ($attempt[0] // null) as $attempt
+        | [ inputs
+            | select(.tag == $t and .iter == $it)
+            | comment_key as $key
+            | select(($attempt.baseline | index($key)) == null)
+            | select(is_summary_root($t; $a; $b; $it)
+                     and has_signature($attempt.signature)) ]
+        | last // empty | .body
+      ' "$thread"
+    return
+  fi
   # The -n matters: without it jq binds the first input to `.` and
   # `inputs` collects only the rest, silently skipping the first comment.
   # `first` keeps a double-posted summary (a landed POST plus its
@@ -2305,6 +3259,15 @@ snapshot_codex_sessions() {
     | sort > "$out"
 }
 
+# Every rollout that appeared since <snapshot>, in the same order and by the
+# same rule snapshot_codex_sessions used. The two must stay identical: any
+# difference makes comm report unrelated files as new.
+_codex_rollouts_since() {  # <snapshot file>
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
+    | sort | comm -23 - "$1"
+}
+
 # Diff the current session-file list against the snapshot and extract the new
 # ROOT session's UUID from its first JSONL line (session_meta). A gpt-5.6
 # review can spawn sub-agent threads mid-run, each with its own rollout file
@@ -2318,16 +3281,20 @@ snapshot_codex_sessions() {
 # rollout without a cwd (older codex) cannot prove ownership and is skipped —
 # the loop then starts fresh each iteration rather than risk capturing a
 # concurrent loop's session.
+# A runtime metadata probe runs in this same cwd and also leaves a new rollout
+# behind. It removes its own file, and this skip keeps a removal that failed
+# from handing the review's conversation to a session with no history.
 # Prints UUID on success; returns non-zero on failure.
 discover_new_codex_session_id() {
   local before="$1" want_cwd="${2:-}"
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
   local f meta id cwd
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     meta=$(head -1 "$f" 2>/dev/null) || continue
     jq -e '.payload.source | (type == "object" and has("subagent")) | not' \
       <<<"$meta" >/dev/null 2>&1 || continue
+    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
+       == "$CODEX_METADATA_PROBE_PREFIX"* ]] && continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
       [[ "$cwd" == "$want_cwd" ]] || continue
@@ -2336,8 +3303,7 @@ discover_new_codex_session_id() {
     [[ -n "$id" ]] || continue
     printf '%s\n' "$id"
     return 0
-  done < <(find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null \
-            | sort | comm -23 - "$before")
+  done < <(_codex_rollouts_since "$before")
   return 1
 }
 
@@ -2348,14 +3314,14 @@ discover_new_codex_session_id() {
 # thousands of rollouts, and a head+jq per file over all of them costs
 # minutes). The payload.id check guards both paths, so an odd filename can't
 # return the wrong session.
-codex_rollout_meta_for_id() {
+codex_rollout_file_for_id() {
   local id="$1"
   local codex_home="${CODEX_HOME:-$HOME/.codex}"
   local f meta
   while IFS= read -r f; do
     meta=$(head -1 "$f" 2>/dev/null) || continue
     if [[ "$(jq -r '.payload.id // empty' <<<"$meta" 2>/dev/null)" == "$id" ]]; then
-      printf '%s\n' "$meta"
+      printf '%s\n' "$f"
       return 0
     fi
   done < <(
@@ -2363,6 +3329,32 @@ codex_rollout_meta_for_id() {
     find "$codex_home/sessions" -type f -name 'rollout-*.jsonl' 2>/dev/null
   )
   return 1
+}
+
+codex_rollout_meta_for_id() {
+  local f
+  f=$(codex_rollout_file_for_id "$1") || return 1
+  head -1 "$f" 2>/dev/null
+}
+
+# Latest actual turn settings recorded in a session rollout. Codex appends
+# turn_context/task_started events to the root rollout on every resume. Only the
+# tail is needed (and avoids slurping multi-megabyte review histories).
+codex_rollout_runtime_metadata() {  # <rollout file>
+  tail -n 10000 "$1" 2>/dev/null | jq -sc '
+    reduce .[] as $event
+      ({model:null, effort:null, context_window:null};
+       if $event.type == "turn_context" then
+         .model = ($event.payload.model // .model)
+         | .effort = ($event.payload.effort
+             // $event.payload.collaboration_mode.settings.reasoning_effort
+             // .effort)
+       elif ($event.type == "event_msg"
+             and $event.payload.type == "task_started") then
+         .context_window = ($event.payload.model_context_window
+             // .context_window)
+       else . end)
+  '
 }
 
 # Resolve a stored codex session id to a resumable ROOT session id:
@@ -2435,14 +3427,21 @@ claude_prepare_cli() {
   # This gives Claude its own internal memory of the whole review, on top of the
   # public PR thread it re-reads from disk each turn.
   CLAUDE_SESSION_FILE="$STATE_DIR/claude.session.uuid"
+  CLAUDE_SESSION_IS_NEW=0
   if [[ -s "$CLAUDE_SESSION_FILE" ]]; then
     CLAUDE_SESSION_UUID=$(<"$CLAUDE_SESSION_FILE")
-    CLAUDE_SESSION_ARG=(--resume "$CLAUDE_SESSION_UUID")
+    [[ "$CLAUDE_SESSION_UUID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+      || die "invalid Claude session UUID in $CLAUDE_SESSION_FILE"
+    # Use the joined form: --resume's value is optional, so a separate
+    # dash-leading value from poisoned state would otherwise become a new flag.
+    CLAUDE_SESSION_ARG=("--resume=$CLAUDE_SESSION_UUID")
     log "claude: resuming session $CLAUDE_SESSION_UUID"
   else
     CLAUDE_SESSION_UUID=$(gen_uuid)
-    printf '%s\n' "$CLAUDE_SESSION_UUID" > "$CLAUDE_SESSION_FILE"
-    CLAUDE_SESSION_ARG=(--session-id "$CLAUDE_SESSION_UUID")
+    [[ "$CLAUDE_SESSION_UUID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+      || die "UUID generator returned an invalid Claude session id"
+    CLAUDE_SESSION_IS_NEW=1
+    CLAUDE_SESSION_ARG=("--session-id=$CLAUDE_SESSION_UUID")
     log "claude: starting new session $CLAUDE_SESSION_UUID"
   fi
 
@@ -2463,13 +3462,11 @@ claude_prepare_cli() {
   #            headlessly and works on hosts where bypass is policy-disabled.
   #            Auto mode is not available on every account/provider (Pro and
   #            Bedrock/Vertex/Foundry are excluded; Team/Enterprise needs admin
-  #            enablement). Ineligible hosts SILENTLY DOWNGRADE to default mode
-  #            (rc 0, empty stderr, every headless action denied), so a
-  #            deterministic preflight probe reads the CLI-reported effective
-  #            mode first and switches to the settings safety net when auto
-  #            does not stick (cached per PR, executable, and model). A CLI
-  #            that instead hard-rejects the flag at startup is handled by a
-  #            one-shot retry (see below).
+  #            enablement). Ineligible hosts can silently downgrade to default
+  #            mode, so the control-only runtime handshake reads the effective
+  #            mode and switches to the settings safety net when auto does not
+  #            stick. A CLI that hard-rejects the flag is probed once more
+  #            without it before the real turn starts.
   #   bypass — --dangerously-skip-permissions, plus a settings safety net for
   #            hosts that silently downgrade bypass (managed no-bypass policies,
   #            nested launches from inside another Claude Code session — the
@@ -2481,66 +3478,12 @@ claude_prepare_cli() {
   CLAUDE_PERMISSIONS_NET='"permissions": {"defaultMode": "acceptEdits", "allow": ["Bash", "WebFetch", "WebSearch"]}'
   CLAUDE_PERMS_RESOLVED="${CLAUDE_PERMS:-auto}"
   CLAUDE_PERMS_ARG=()
-  CLAUDE_PERMISSIONS=''
-
-  # Print the effective permission mode the CLI grants for --permission-mode
-  # auto, or nothing when the probe is inconclusive. The stream-json init event
-  # is emitted by the CLI itself at startup — before any model or tool activity
-  # — and reports the mode actually in effect, so this detects the silent
-  # downgrade deterministically (verified on claude 2.1.211: an ineligible host
-  # reports "default" here while exiting 0 with empty stderr). Probing with the
-  # turn's own model args matters: eligibility can be per-model. The watchdog is
-  # run_with_timeout (lib/common.sh) — portable across hosts without GNU
-  # timeout, where a bare `timeout` would silently make every probe
-  # inconclusive.
-  probe_claude_effective_auto_mode() {
-    ( cd "$REPO_DIR" && run_with_timeout 60 "$CLAUDE_BIN" -p \
-        "${CLAUDE_MODEL_ARG[@]}" \
-        --permission-mode auto \
-        --output-format stream-json --verbose \
-        'Reply with exactly: OK' 2>/dev/null \
-      | head -1 | jq -r '.permissionMode // empty' 2>/dev/null )
-  }
+  CLAUDE_PERMISSION_SAFETY_NET=0
 
   case "$CLAUDE_PERMS_RESOLVED" in
-    auto)
-      # Definitive probe results are cached per PR AND per resolved model —
-      # eligibility is account/host/model state, and either --claude-bin or
-      # --claude-model can change between invocations sharing this state dir
-      # ('off' = host default model is a key of its own). A cache line is
-      # tab-delimited "<mode><tab><executable><tab><model>" so spaces in paths
-      # and model names remain exact. Older two-field cache lines do not match
-      # this format and are safely re-probed.
-      # Delete the cache file after changing auto-mode enablement to re-probe.
-      AUTOMODE_CACHE="$STATE_DIR/claude.automode.effective"
-      EFFECTIVE_AUTO=''
-      if [[ -s "$AUTOMODE_CACHE" ]]; then
-        IFS=$'\t' read -r CACHED_MODE CACHED_BIN CACHED_MODEL < "$AUTOMODE_CACHE" || true
-        if [[ "${CACHED_BIN:-}" == "$CLAUDE_BIN" \
-              && "${CACHED_MODEL:-}" == "$CLAUDE_MODEL_RESOLVED" \
-              && -n "${CACHED_MODE:-}" ]]; then
-          EFFECTIVE_AUTO="$CACHED_MODE"
-          log "claude: auto-mode probe (cached for '$CACHED_BIN', model '$CACHED_MODEL') = '$EFFECTIVE_AUTO'"
-        fi
-      fi
-      if [[ -z "$EFFECTIVE_AUTO" ]]; then
-        EFFECTIVE_AUTO=$(probe_claude_effective_auto_mode || true)
-        if [[ -n "$EFFECTIVE_AUTO" ]]; then
-          printf '%s\t%s\t%s\n' "$EFFECTIVE_AUTO" "$CLAUDE_BIN" "$CLAUDE_MODEL_RESOLVED" > "$AUTOMODE_CACHE"
-          log "claude: auto-mode probe ('$CLAUDE_BIN', model '$CLAUDE_MODEL_RESOLVED') = '$EFFECTIVE_AUTO'"
-        else
-          log "claude: auto-mode probe inconclusive — proceeding with auto (startup-rejection retry still applies)"
-        fi
-      fi
-      if [[ -z "$EFFECTIVE_AUTO" || "$EFFECTIVE_AUTO" == "auto" ]]; then
-        CLAUDE_PERMS_ARG=(--permission-mode auto)
-      else
-        log "claude: auto mode silently downgraded to '$EFFECTIVE_AUTO' on this host — using the settings safety net"
-        CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET"
-      fi
-      ;;
+    auto)   CLAUDE_PERMS_ARG=(--permission-mode auto) ;;
     bypass) CLAUDE_PERMS_ARG=(--dangerously-skip-permissions)
-            CLAUDE_PERMISSIONS="$CLAUDE_PERMISSIONS_NET" ;;
+            CLAUDE_PERMISSION_SAFETY_NET=1 ;;
     off|'') ;;
     *)      log "claude: unknown CLAUDE_PERMS='${CLAUDE_PERMS_RESOLVED}' — using CLI default" ;;
   esac
@@ -2561,9 +3504,31 @@ claude_prepare_cli() {
     *)                         log "claude: unknown CLAUDE_EFFORT='${CLAUDE_EFFORT_RESOLVED}' — using CLI default" ;;
   esac
   log "claude: effort = ${CLAUDE_EFFORT_RESOLVED}"
-  [[ -n "$CLAUDE_PERMISSIONS" ]] && SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS")
+  (( CLAUDE_PERMISSION_SAFETY_NET == 1 )) \
+    && SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
   CLAUDE_SETTINGS_ARG=()
   if (( ${#SETTINGS_PARTS[@]} > 0 )); then
+    _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
+    CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
+  fi
+
+  # This control-only handshake uses the exact session/model/effort/settings
+  # argv above. It resolves aliases and resumed-session state without sending a
+  # user message or starting a model turn, and also reports effective auto mode.
+  CLAUDE_RUNTIME_NEED_CONTEXT=1
+  [[ "${LOCAL_MODE:-0}" == "1" ]] && CLAUDE_RUNTIME_NEED_CONTEXT=0
+  resolve_claude_runtime_metadata
+  if [[ "$CLAUDE_PERMS_RESOLVED" == "auto" \
+        && -n "$CLAUDE_AUTO_MODE_EFFECTIVE" \
+        && "$CLAUDE_AUTO_MODE_EFFECTIVE" != "auto" ]]; then
+    log "claude: auto mode effective value is '$CLAUDE_AUTO_MODE_EFFECTIVE' — using the settings safety net"
+    CLAUDE_PERMS_ARG=()
+    CLAUDE_PERMISSION_SAFETY_NET=1
+    SETTINGS_PARTS=()
+    case "$CLAUDE_EFFORT_RESOLVED" in
+      ultracode) SETTINGS_PARTS+=("\"ultracode\": true") ;;
+    esac
+    SETTINGS_PARTS+=("$CLAUDE_PERMISSIONS_NET")
     _joined=$(IFS=,; printf '%s' "${SETTINGS_PARTS[*]}")
     CLAUDE_SETTINGS_ARG=(--settings "{${_joined}}")
   fi
@@ -2607,17 +3572,25 @@ claude_run_prompt() {
       CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$CLAUDE_BG_WAIT_CEILING_MS" \
       "$CLAUDE_BIN" -p \
         --disallowedTools "$CLAUDE_DISALLOWED_TOOLS" \
-        "${CLAUDE_SESSION_ARG[@]}" \
-        "${CLAUDE_MODEL_ARG[@]}" \
-        "${CLAUDE_EFFORT_ARG[@]}" \
-        "${CLAUDE_PERMS_ARG[@]}" \
-        "${CLAUDE_SETTINGS_ARG[@]}" \
+        ${CLAUDE_SESSION_ARG[@]+"${CLAUDE_SESSION_ARG[@]}"} \
+        ${CLAUDE_MODEL_ARG[@]+"${CLAUDE_MODEL_ARG[@]}"} \
+        ${CLAUDE_EFFORT_ARG[@]+"${CLAUDE_EFFORT_ARG[@]}"} \
+        ${CLAUDE_PERMS_ARG[@]+"${CLAUDE_PERMS_ARG[@]}"} \
+        ${CLAUDE_SETTINGS_ARG[@]+"${CLAUDE_SETTINGS_ARG[@]}"} \
         --add-dir "$REPO_DIR" \
         --add-dir "$STATE_DIR" \
         --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
         "$(cat "$_CLAUDE_PROMPT_FILE")" \
         > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
   }
+
+  # The metadata process uses --no-session-persistence. Do not publish a fresh
+  # UUID until the real turn is actually about to launch; otherwise a stop,
+  # probe failure, or render failure leaves a nonexistent session to resume.
+  if (( ${CLAUDE_SESSION_IS_NEW:-0} == 1 )); then
+    write_state_atomic "$CLAUDE_SESSION_FILE" "$CLAUDE_SESSION_UUID" \
+      || die "could not persist Claude session UUID"
+  fi
 
   set +e
   TURN_START=$SECONDS
