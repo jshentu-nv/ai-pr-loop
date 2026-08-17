@@ -5,3 +5,12 @@ state/
 
 # Managed local clones of target repos. Created on demand by run.sh.
 checkouts/
+
+# Operator scratch space: hand-run suite logs, worktrees, shims, notes. These
+# hold reviewed-PR content too, and they grow large enough that leaving them
+# untracked but unignored makes ordinary git operations slow (a `git stash -u`
+# here tries to copy every checkout).
+scratch/
+logs/
+staging/
+deps/
