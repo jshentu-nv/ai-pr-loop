@@ -847,12 +847,19 @@ CODEX_METADATA_PROBE_PREFIX='ai_pr_loop_metadata_probe_'
 # The rollout that appeared since <snapshot> and records exactly this probe's
 # provider and cwd. The caller deletes what it gets.
 _codex_metadata_probe_rollout() {  # <session snapshot> <provider> <cwd>
-  local before="$1" provider="$2" want_cwd="$3" f meta
+  local before="$1" provider="$2" want_cwd="$3" f meta recorded
   while IFS= read -r f; do
     meta=$(head -1 "$f" 2>/dev/null) || continue
-    jq -e --arg provider "$provider" --arg cwd "$want_cwd" '
-      .payload.model_provider == $provider and .payload.cwd == $cwd
-    ' <<<"$meta" >/dev/null 2>&1 || continue
+    # Read both fields out and compare in the shell, the way
+    # discover_new_codex_session_id does. Passing the cwd in with `jq --arg`
+    # fails twice on Git Bash: MSYS rewrites a POSIX-looking argument before
+    # native jq.exe sees it (`/checkout` arrives as `C:/Program Files/Git/
+    # checkout`), and a literal `==` cannot match a native Codex `D:\path`
+    # against the same checkout spelled `/d/path`.
+    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
+       == "$provider" ]] || continue
+    recorded=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || recorded=''
+    codex_cwd_matches "$recorded" "$want_cwd" || continue
     printf '%s\n' "$f"
     return 0
   done < <(_codex_rollouts_since "$before")
