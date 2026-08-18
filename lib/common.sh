@@ -1881,11 +1881,18 @@ force_clean_to_commit() {
   # come from the just-checked-out .gitmodules (update=merge/rebase would
   # create commits instead of detaching). (Both are no-ops when there are no
   # submodules.)
-  git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
-    || die "could not reset initialized submodules in $d"
-  git_safe -C "$d" submodule --quiet foreach --recursive \
-      git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
-    || die "could not clean initialized submodules in $d"
+  # Skip both when the superproject declares no submodules. `git submodule` is
+  # a shell helper git spawns, so even a no-op call costs about a second under
+  # MSYS — measured at 1.9s of a 6.5s turn, the single largest item in it. A
+  # gitlink is only an initializable submodule when .gitmodules names it, so
+  # without that file these two have nothing to act on.
+  if [[ -e "$d/.gitmodules" ]]; then
+    git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
+      || die "could not reset initialized submodules in $d"
+    git_safe -C "$d" submodule --quiet foreach --recursive \
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
+      || die "could not clean initialized submodules in $d"
+  fi
   # Fail closed on anything the cleanup above did not cover.
   # --ignore-submodules=dirty is config-independent where it matters: it
   # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
