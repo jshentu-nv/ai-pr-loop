@@ -2933,6 +2933,13 @@ latest_ai_comment_iter() {
       [ .[] | select(is_summary_root($t; $a; $b; .iter)) | .iter ]
       | unique | sort | reverse | .[]
     ' <"$snap" 2>/dev/null) || candidates=''
+  # Native Windows jq ends every line with CRLF. Command substitution strips
+  # the final newline and nothing else, so each line but the last keeps a
+  # trailing CR and fails the numeric test below. The walk then rejected every
+  # real candidate and accepted only the lowest — resume detection reported
+  # iteration 1 on a thread that had reached 6, so the loop re-ran and
+  # re-posted rounds it had already completed.
+  candidates=${candidates//$'\r'/}
   while IFS= read -r candidate; do
     [[ "$candidate" =~ ^[0-9]+$ ]] || continue
     manifest=$(ai_signature_manifest_path "$tag" "$candidate")
