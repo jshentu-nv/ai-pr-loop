@@ -109,7 +109,8 @@ Optional flags worth surfacing if the user mentions a constraint:
   one commit", "no bot comments", "squash the review into a single
   commit". Details:
   - No comments are posted. Reviews and responses are files under
-    `state/<repo-ident>/<target>/iter-NN/`.
+    `$STATE_ROOT/<repo-ident>/<target>/iter-NN/` (step 1 pins `$STATE_ROOT`
+    and `$RUN_SH`; every path and command below uses them).
   - Rounds are committed locally and pushed only once, on agreement
     (`approved` / `converged_no_major`). The commit's message carries the
     review's findings, fixes, and decisions. A review that changes nothing
@@ -503,8 +504,8 @@ background task's output is unchanged. If the task is reaped
 restarts from the PR's high-water mark — the background task ends, but
 the review does not. Watch for `auto-resume:` lines to see restarts, and
 read the final state from the PR thread or
-`state/<ident>/pr-<N>/supervisor.log` when the task file stops growing. To
-end such a run, call `run.sh <pr> --repo <slug> --stop`.
+`$STATE_ROOT/<ident>/pr-<N>/supervisor.log` when the task file stops growing.
+To end such a run, call `"$RUN_SH" <pr> --repo <slug> --stop`.
 
 **Check the launch output for `auto-resume: disabled`.** On a host without
 `setsid -f` (util-linux) or `perl` (no detached, reparented session), or
@@ -576,7 +577,8 @@ review, it says so rather than claiming it stopped one.
 
 **Exit 4 means that did not work**: the guard is gone, the review survived
 both the stop and the signals, and nothing is enforcing the lease. Stop it by
-hand with `run.sh <pr> --repo <slug> --stop`, tell the user, and stop polling.
+hand with `"$RUN_SH" <pr> --repo <slug> --stop`, tell the user, and stop
+polling.
 
 **Relay each round's report as it lands.** Every turn ends by logging its
 own summary — the reviewer's findings, the implementer's responses — and
@@ -617,7 +619,7 @@ When the background `run.sh` completes, summarize:
 
 Artifacts for each iteration live at
 `$STATE_ROOT/<owner>__<name>/pr-<N>/iter-NN/`
-(GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
+(GitLab repos: `$STATE_ROOT/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
 stdout/stderr, fetched thread, codex verdict file, and each turn's
 `codex-report.md` / `claude-report.md`).
 
@@ -629,7 +631,7 @@ orchestrator inspects the PR's existing AI comments (with `--local`: the
 review files under the state dir) and continues from the high-water mark.
 A `--local` re-run also restores the earlier rounds' commits, which exist
 only in the checkout — so re-run with the **same** `--dir`. Per-PR session ids for both agents are persisted in
-`state/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`, so
+`$STATE_ROOT/<owner>__<name>/pr-<N>/{claude.session.uuid,codex.session.id}`, so
 agents keep their internal memory across re-runs too.
 
 The auto-resume supervisor does that re-run for you (budget 10 by

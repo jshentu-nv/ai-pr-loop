@@ -1071,6 +1071,7 @@ if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 
   # lands within the window, refuse otherwise.
   SUP_RAN=0
   SUP_CONFLICT=0
+  SUP_WORKER_LIVE=0
   for (( SUP_WAIT = 0; SUP_WAIT < 100; SUP_WAIT++ )); do
     if [[ -s "$SUP_PID_FILE" ]]; then
       read_pid_record "$SUP_PID_FILE"
@@ -1089,8 +1090,17 @@ if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 
     if grep -q 'auto-resume: another supervisor for this PR' <<<"$SUP_LOG_TAIL"; then
       SUP_CONFLICT=1
     fi
+    # A different refusal with a different remedy: the lock is free but a
+    # worker outlived its supervisor. Without this the front-end reports the
+    # supervisor as failing to launch and never names the process to stop.
+    if grep -q "auto-resume: this PR's worker" <<<"$SUP_LOG_TAIL"; then
+      SUP_WORKER_LIVE=1
+    fi
     sleep 0.1
   done
+  if (( SUP_RAN == 0 && SUP_WORKER_LIVE == 1 )); then
+    die "this PR's worker is still running without a supervisor — stop it with --stop before starting again (details in $SUP_LOG)"
+  fi
   if (( SUP_RAN == 0 && SUP_CONFLICT == 1 )); then
     die "this PR's supervisor.lock is still held — a supervisor is running (stop it with --stop), or a just-ended run's children are still winding down (retry shortly); --no-auto-resume runs the loop in this process"
   fi
