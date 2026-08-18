@@ -199,8 +199,7 @@
 #                 offline context metadata and its source (after adaptive
 #                 defaults; catalog-only Codex values are estimates),
 #                 then exit without contacting GitHub; the PR number is
-#                 optional in this mode. Used by tests/run_tests.sh to observe
-#                 the resolution.
+#                 optional in this mode.
 #   --preflight-only
 #                 Run the full authenticated preflight — authority
 #                 validation, credential resolution (env-isolated,
@@ -263,6 +262,11 @@
 set -euo pipefail
 
 LOOP_HOME="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+# Every review's state lives under here. AI_PR_LOOP_STATE_ROOT relocates it —
+# a controller reading reports must derive the same root the same way, so the
+# skill's polling recipe repeats this line verbatim.
+STATE_ROOT="${AI_PR_LOOP_STATE_ROOT:-$LOOP_HOME/state}"
+export STATE_ROOT
 # shellcheck source=lib/common.sh
 . "$LOOP_HOME/lib/common.sh"
 
@@ -508,7 +512,7 @@ if [[ "$LOCAL_SCOPE" != "branch" ]]; then
   if [[ "$FORGE" == "gitlab" ]]; then
     FLAT_SLUG="${REPO_SLUG//\//__}"
     NEW_IDENT="${CANON_HOST}__${FLAT_SLUG}"
-    for LEGACY_DIR in "$LOOP_HOME/state"/*"__${FLAT_SLUG}"; do
+    for LEGACY_DIR in "$STATE_ROOT"/*"__${FLAT_SLUG}"; do
       [[ -d "$LEGACY_DIR" ]] || continue
       LEGACY_AUTH="${LEGACY_DIR##*/}"; LEGACY_AUTH="${LEGACY_AUTH%__${FLAT_SLUG}}"
       [[ "$LEGACY_AUTH" == "$CANON_HOST" ]] && continue
@@ -517,7 +521,7 @@ if [[ "$LOCAL_SCOPE" != "branch" ]]; then
            -e "gitlab ${FORGE_SCHEME}://${LEGACY_AUTH} ${REPO_SLUG}" \
            -e "gitlab ${LEGACY_AUTH} ${REPO_SLUG}" \
            "$LEGACY_DIR"/pr-*/.repo-slug; then
-        die "state keyed by the pre-canonicalization spelling '${LEGACY_AUTH}' exists under $LEGACY_DIR; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$LOOP_HOME/state/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any matching legacy checkouts dir) — or simply remove the legacy dirs to start fresh"
+        die "state keyed by the pre-canonicalization spelling '${LEGACY_AUTH}' exists under $LEGACY_DIR; the canonical identity is '$CANON_HOST'. Migrate per PR: mkdir -p \"$STATE_ROOT/$NEW_IDENT\", move each pr-<N> from the legacy dir into it (skip any pr-<N> already present there), update each moved pr-*/.repo-slug to 'gitlab ${FORGE_SCHEME}://${CANON_HOST} ${REPO_SLUG}', then remove the emptied legacy state dir (and any matching legacy checkouts dir) — or simply remove the legacy dirs to start fresh"
       fi
     done
   fi
@@ -603,10 +607,21 @@ resolve_agent_bin() {  # <flag> <value>
   case "$value" in
     *$'\n'*|*$'\r'*|*$'\t'*) die "$flag executable must not contain tabs or newlines" ;;
   esac
-  resolved=$(type -P -- "$value" 2>/dev/null) \
+  # resolve_command_path, not type -P: on a Git Bash noacl mount a .cmd/.bat
+  # wrapper is mode 0644, which fails both the PATH lookup for an explicit
+  # path and the -x test, yet the Windows loader runs it. It also probes
+  # PATHEXT so a bare `codex-hub` reaches `codex-hub.cmd`.
+  resolved=$(resolve_command_path "$value") \
     || die "missing required command: $value"
-  [[ -f "$resolved" && -x "$resolved" ]] \
+  is_executable_file "$resolved" \
     || die "missing required command: $value"
+  # A Windows-spelled path (C:\tools\agent.cmd) has no '/' to split on, so the
+  # directory/base split below would treat the whole value as a bare name.
+  # Only Git Bash gets this rewrite: on a real POSIX host a backslash is an
+  # ordinary character in a filename.
+  if is_windows_bash; then
+    resolved="${resolved//\\//}"
+  fi
   base="${resolved##*/}"
   case "$resolved" in
     /*)  dir="${resolved%/*}"; [[ -n "$dir" ]] || dir=/ ;;
@@ -724,9 +739,13 @@ fi
 #                             files below.
 #
 # Status protocol, all under the per-PR state dir:
-#   supervisor.lock  flock'd by the supervisor for its lifetime (and by the
-#                    worker tree, which inherits the fd); one supervisor per
-#                    PR, enforced by the kernel rather than a check window
+#   supervisor.lock  flock'd by the supervisor alone, for its lifetime; the
+#                    worker is started with the fd closed so no descendant it
+#                    leaves behind can hold the lock after the run. One
+#                    supervisor per PR, enforced by the kernel rather than a
+#                    check window. The lock therefore says nothing about a
+#                    worker that outlived its supervisor — worker.pid does,
+#                    and a start is refused while that record is live
 #   supervisor.pid   the supervisor's pid + its start-time token; removed
 #                    when it exits. Signalling target only — the token pins
 #                    the incarnation, so a recycled pid is never signalled
@@ -753,7 +772,7 @@ fi
 # The state path is the one ensure_state_dir computes; the front-end and the
 # supervisor need it before the run is authenticated, so they derive it from
 # the resolved forge identity alone.
-PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
+PR_STATE_DIR="$STATE_ROOT/$(repo_ident_name)/pr-${PR_NUMBER}"
 
 # TERM the supervisor and everything it started. A detached supervisor leads
 # its own process group, so the signal reaches its worker and the agents too;
@@ -761,7 +780,7 @@ PR_STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/pr-${PR_NUMBER}"
 # unrelated processes, so signal the pid alone and let its own trap forward.
 signal_supervisor() {
   local pid="$1" pgid
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || pgid=''
+  pgid=$(proc_pgid "$pid") || pgid=''
   if [[ "$pgid" == "$pid" ]]; then
     kill -TERM -- "-$pid" 2>/dev/null || true
   else
@@ -769,19 +788,9 @@ signal_supervisor() {
   fi
 }
 
-# Start-time token for pid $1, whitespace-squeezed; empty when unknown.
-# Written next to the pid in supervisor.pid and compared on every read: two
-# processes can share a recycled pid, but not a pid AND a start time.
-# TZ/LC_ALL are pinned because ps renders lstart in the caller's timezone
-# and locale — a --stop run from another environment must still match the
-# token the supervisor wrote.
-proc_start_token() {
-  local t
-  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || t=''
-  # shellcheck disable=SC2086
-  set -- $t
-  printf '%s\n' "$*"
-}
+# proc_start_token lives in lib/common.sh. agent_guard.sh writes those tokens
+# into its own pid records and agent_status.sh compares them, so one spelling
+# has to serve all three or the two ends drift apart.
 
 # True when pid $1 is a live process of this loop whose argv carries $3 and
 # whose start-time token matches $2. A process killed with SIGKILL leaves
@@ -793,8 +802,12 @@ recorded_pid_is_live() {
   local pid="${1:-}" token="${2:-}" argmark="$3"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -o args= -p "$pid" 2>/dev/null | grep -q -- "$argmark" || return 1
-  [[ "$(proc_start_token "$pid")" == "$token" ]]
+  proc_argv "$pid" 2>/dev/null | grep -q -- "$argmark" || return 1
+  # An empty recorded token means the run that wrote it had no way to read a
+  # start time. Git Bash was in that position until this release, so records
+  # written by a still-running older supervisor carry one; rejecting them
+  # would leave that review unstoppable. The argv check above still applies.
+  [[ -z "$token" ]] || [[ "$(proc_start_token "$pid")" == "$token" ]]
 }
 
 supervisor_is_live() { recorded_pid_is_live "${1:-}" "${2:-}" '--_supervise'; }
@@ -845,9 +858,10 @@ spawn_detached() {
 }
 
 # Take a non-blocking exclusive flock on fd $1. flock(1) is util-linux;
-# perl covers hosts without it (macOS). The lock rides the open file
-# description, so it survives the perl helper's exit and is inherited by
-# every child sharing the fd. Fails closed with neither tool — an unlocked
+# perl covers hosts without it. The lock rides the open file description, so
+# it survives the perl helper's exit — and would ride into any child sharing
+# the fd, which is why the worker is spawned with it closed. Fails closed
+# with neither tool — an unlocked
 # supervisor would let simultaneous starts all win, so the front-end gates
 # supervision on have_lock_primitive and never reaches that arm.
 acquire_lock_fd() {
@@ -940,8 +954,8 @@ if (( STOP_ONLY == 1 )); then
     # never our own group.
     read_pid_record "$PR_STATE_DIR/worker.pid"
     if worker_is_live "$REC_PID" "$REC_TOKEN"; then
-      W_PGID=$(ps -o pgid= -p "$REC_PID" 2>/dev/null | tr -d ' ') || W_PGID=''
-      MY_PGID=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || MY_PGID=''
+      W_PGID=$(proc_pgid "$REC_PID") || W_PGID=''
+      MY_PGID=$(proc_pgid "$$") || MY_PGID=''
       if [[ -n "$W_PGID" && "$W_PGID" != "$MY_PGID" ]]; then
         kill -TERM -- "-$W_PGID" 2>/dev/null || true
         log "stop: no live supervisor — signalled the orphaned worker group $W_PGID (worker pid $REC_PID)"
@@ -1057,6 +1071,7 @@ if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 
   # lands within the window, refuse otherwise.
   SUP_RAN=0
   SUP_CONFLICT=0
+  SUP_WORKER_LIVE=0
   for (( SUP_WAIT = 0; SUP_WAIT < 100; SUP_WAIT++ )); do
     if [[ -s "$SUP_PID_FILE" ]]; then
       read_pid_record "$SUP_PID_FILE"
@@ -1075,8 +1090,17 @@ if [[ "$ROLE" == "frontend" ]] && (( AUTO_RESUME > 0 )) && (( PREFLIGHT_ONLY == 
     if grep -q 'auto-resume: another supervisor for this PR' <<<"$SUP_LOG_TAIL"; then
       SUP_CONFLICT=1
     fi
+    # A different refusal with a different remedy: the lock is free but a
+    # worker outlived its supervisor. Without this the front-end reports the
+    # supervisor as failing to launch and never names the process to stop.
+    if grep -q "auto-resume: this PR's worker" <<<"$SUP_LOG_TAIL"; then
+      SUP_WORKER_LIVE=1
+    fi
     sleep 0.1
   done
+  if (( SUP_RAN == 0 && SUP_WORKER_LIVE == 1 )); then
+    die "this PR's worker is still running without a supervisor — stop it with --stop before starting again (details in $SUP_LOG)"
+  fi
   if (( SUP_RAN == 0 && SUP_CONFLICT == 1 )); then
     die "this PR's supervisor.lock is still held — a supervisor is running (stop it with --stop), or a just-ended run's children are still winding down (retry shortly); --no-auto-resume runs the loop in this process"
   fi
@@ -1117,11 +1141,12 @@ if [[ "$ROLE" == "supervise" ]]; then
   mkdir -p "$PR_STATE_DIR"
   claim_state_marker "$PR_STATE_DIR"
   # One supervisor per PR, enforced by the kernel: the lock is taken before
-  # anything else, held for this process's lifetime, and inherited by the
-  # worker tree below (the fd rides into every child), so simultaneous
-  # starts race the flock — exactly one wins — and a SIGKILLed supervisor's
-  # surviving worker still holds it until that whole tree is gone. The
-  # front-end reads the log lines below and reports the refusal. No lock
+  # anything else and held for this process's lifetime, so simultaneous
+  # starts race the flock and exactly one wins. It is deliberately NOT
+  # inherited by the worker tree — a descendant that outlived the run would
+  # hold it forever — so a live worker under a dead supervisor is caught by
+  # its own pid record below instead. The front-end reads the log lines and
+  # reports the refusal. No lock
   # tool means no exclusion guarantee: refuse to supervise rather than run
   # unlocked (the front-end gates on this too; a direct --_supervise
   # invocation gets the same answer).
@@ -1131,7 +1156,61 @@ if [[ "$ROLE" == "supervise" ]]; then
   fi
   exec 9>>"$PR_STATE_DIR/supervisor.lock"
   if ! acquire_lock_fd 9; then
-    log "auto-resume: another supervisor for this PR is already running (supervisor.lock is held) — exiting"
+    # Held, but by what? A stray descendant of a finished run inherits the fd
+    # and keeps the lock with nothing left to stop — the loop then refuses to
+    # start this PR again, and --stop has no pid to reach. Believe the pid
+    # records, not the lock: with no live supervisor and no live worker there
+    # is no review, so replace the file and take a lock on the new one. The
+    # old open file description keeps its lock on a path nothing reads again.
+    # Simultaneous starts all reach this point: the winner has the lock but
+    # has not written its pid yet, so an immediate check would find nothing
+    # live and every loser would "recover" the lock the winner is holding.
+    # Give the winner time to publish before believing the records.
+    LOCK_OWNER_LIVE=0
+    for (( LOCK_WAIT = 0; LOCK_WAIT < 50; LOCK_WAIT++ )); do
+      read_pid_record "$PR_STATE_DIR/supervisor.pid"
+      if supervisor_is_live "$REC_PID" "$REC_TOKEN"; then LOCK_OWNER_LIVE=1; break; fi
+      read_pid_record "$PR_STATE_DIR/worker.pid"
+      if worker_is_live "$REC_PID" "$REC_TOKEN"; then LOCK_OWNER_LIVE=1; break; fi
+      sleep 0.1
+    done
+    if (( LOCK_OWNER_LIVE == 1 )); then
+      log "auto-resume: another supervisor for this PR is already running (supervisor.lock is held) — exiting"
+      exit 75
+    fi
+    # One recoverer at a time. The exclusive create is on a FIXED name, so a
+    # second recoverer loses it, waits for the winner to install the new lock
+    # file, and then competes for that lock like any other start.
+    LOCK_MARK="$PR_STATE_DIR/supervisor.lock.recovering"
+    if ( set -o noclobber; : > "$LOCK_MARK" ) 2>/dev/null; then
+      log "auto-resume: supervisor.lock is held but no supervisor or worker is live — recovering the stale lock"
+      exec 9>&-
+      LOCK_NEW="$LOCK_MARK.file"
+      : > "$LOCK_NEW"
+      mv -f "$LOCK_NEW" "$PR_STATE_DIR/supervisor.lock"
+      rm -f "$LOCK_MARK"
+    else
+      log "auto-resume: another start is recovering this PR's stale lock — waiting for it"
+      exec 9>&-
+      for (( LOCK_WAIT = 0; LOCK_WAIT < 50; LOCK_WAIT++ )); do
+        [[ -e "$LOCK_MARK" ]] || break
+        sleep 0.1
+      done
+    fi
+    exec 9>>"$PR_STATE_DIR/supervisor.lock"
+    if ! acquire_lock_fd 9; then
+      log "auto-resume: another supervisor for this PR is already running (supervisor.lock is held) — exiting"
+      exit 75
+    fi
+  fi
+  # The lock alone no longer proves no review is running: the worker does not
+  # hold it (it must not, or a stray descendant of the worker keeps it
+  # forever), so a SIGKILLed supervisor frees the lock while its worker is
+  # still mid-turn. Starting here would put a second agent on the same
+  # checkout and the same PR.
+  read_pid_record "$PR_STATE_DIR/worker.pid"
+  if worker_is_live "$REC_PID" "$REC_TOKEN"; then
+    log "auto-resume: this PR's worker (pid $REC_PID) is still running without a supervisor — stop it with --stop before starting again"
     exit 75
   fi
   printf '%s\n%s\n' "$$" "$(proc_start_token "$$")" > "$PR_STATE_DIR/supervisor.pid"
@@ -1144,7 +1223,7 @@ if [[ "$ROLE" == "supervise" ]]; then
   # the signal alone there.
   kill_worker_tree() {
     local pgid
-    pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ') || pgid=''
+    pgid=$(proc_pgid "$$") || pgid=''
     if [[ "$pgid" == "$$" ]]; then
       trap '' TERM
       kill -TERM -- "-$$" 2>/dev/null || true
@@ -1199,10 +1278,15 @@ if [[ "$ROLE" == "supervise" ]]; then
     fi
     rm -f "$PR_STATE_DIR/worker.status" "$PR_STATE_DIR/worker.started"
     WORKER_AT=$(date +%s)
+    # 9>&- closes the supervisor lock in the worker and everything below it.
+    # The lock rides the open file description, so an inherited fd 9 holds it
+    # for as long as ANY descendant lives — and an agent turn can leave a
+    # detached tree behind that no signal reaches. That tree then keeps the
+    # lock after this supervisor is gone, and the next run refuses to start.
     if (( ATTEMPT == 0 )) || [[ ! -e "$PR_STATE_DIR/context.applied" ]]; then
-      bash "$0" --_worker ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} &
+      bash "$0" --_worker ${WORKER_ARGV[@]+"${WORKER_ARGV[@]}"} 9>&- &
     else
-      bash "$0" --_worker ${RETRY_ARGV[@]+"${RETRY_ARGV[@]}"} &
+      bash "$0" --_worker ${RETRY_ARGV[@]+"${RETRY_ARGV[@]}"} 9>&- &
     fi
     WORKER_PID=$!
     # Recorded with its start token so --stop can still reach the worker

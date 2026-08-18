@@ -343,34 +343,49 @@ _runtime_rpc_guardian() {
     return 1
   fi
 
+  # An MSYS FIFO is emulated, so only MSYS-aware readers can use it. The agent
+  # CLIs are native Windows processes: a `.cmd` wrapper, or node behind one.
+  # Giving such a child the FIFO as stdin makes every request vanish — it reads
+  # "Bad file descriptor" and answers nothing, so the probe times out and the
+  # turn dies for want of a model. An ordinary shell pipe is a real Windows
+  # pipe, which the child can read, so relay the FIFO into one with `cat`. The
+  # relay stays in the launcher's session, so process-tree containment and the
+  # exit status are unchanged, and EOF still propagates on owner disconnect.
+  local rpc_relay=0
+  is_windows_bash && rpc_relay=1
   # Put redirections on the child subshell itself so it opens the FIFO before
   # `cd`; a missing/raced cwd can fail after the owner connects instead of
   # leaving the owner's writer-open blocked forever.
   ( CDPATH= cd -- "$cwd" || exit
     case "$launcher" in
       setsid) exec setsid "${BASH:-bash}" -c '
-                ready=$1; status=$2; shift 2
+                ready=$1; status=$2; relay=$3; shift 3
                 printf "ready\n" > "$ready" || exit 1
                 set +e
-                "$@"
+                if [ "$relay" = 1 ]; then cat | "$@"; else "$@"; fi
                 rc=$?
                 printf "%s\n" "$rc" > "$status.tmp" \
                   && mv -f "$status.tmp" "$status"
                 exit "$rc"
-              ' ai-pr-loop-runtime "$runtime_ready" "$status_file" "$@" ;;
+              ' ai-pr-loop-runtime "$runtime_ready" "$status_file" \
+                "$rpc_relay" "$@" ;;
       perl)   exec perl -MPOSIX -e \
                 'my $ready = shift @ARGV; my $status = shift @ARGV;
+                 my $relay = shift @ARGV;
                  POSIX::setsid() >= 0 or die "setsid: $!";
                  open(my $fh, ">", $ready) or die "ready: $!";
                  print {$fh} "ready\n"; close($fh);
-                 my $raw = system @ARGV;
+                 my $raw = $relay
+                   ? system("/bin/sh", "-c", q{exec cat | "$@"},
+                            "ai-pr-loop-runtime-relay", @ARGV)
+                   : system @ARGV;
                  my $rc = $raw == -1 ? 127
                    : (($raw & 127) ? 128 + ($raw & 127) : ($raw >> 8));
                  open(my $sfh, ">", "$status.tmp") or die "status: $!";
                  print {$sfh} "$rc\n"; close($sfh);
                  rename("$status.tmp", $status) or die "status rename: $!";
                  exit $rc' \
-                "$runtime_ready" "$status_file" "$@" ;;
+                "$runtime_ready" "$status_file" "$rpc_relay" "$@" ;;
     esac ) < "$in_file" > "$out_file" 2> "$err_file" &
   rpc_pid=$!
   printf '%s\n' "$rpc_pid" > "$pid_file.tmp" \
@@ -846,13 +861,27 @@ CODEX_METADATA_PROBE_PREFIX='ai_pr_loop_metadata_probe_'
 
 # The rollout that appeared since <snapshot> and records exactly this probe's
 # provider and cwd. The caller deletes what it gets.
+# jq for arguments that must reach it verbatim. Git Bash rewrites a
+# POSIX-looking argument into a Windows path before native jq.exe sees it, so
+# `--arg cwd /tmp/x` arrives as `C:/Users/.../Temp/x`. Values that are compared
+# or handed to Codex have to survive as written, so turn that conversion off.
+# Harmless off Windows: both variables are unset there.
+jq_literal() { MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1 jq "$@"; }
+
 _codex_metadata_probe_rollout() {  # <session snapshot> <provider> <cwd>
-  local before="$1" provider="$2" want_cwd="$3" f meta
+  local before="$1" provider="$2" want_cwd="$3" f meta recorded
   while IFS= read -r f; do
     meta=$(head -1 "$f" 2>/dev/null) || continue
-    jq -e --arg provider "$provider" --arg cwd "$want_cwd" '
-      .payload.model_provider == $provider and .payload.cwd == $cwd
-    ' <<<"$meta" >/dev/null 2>&1 || continue
+    # Read both fields out and compare in the shell, the way
+    # discover_new_codex_session_id does. Passing the cwd in with `jq --arg`
+    # fails twice on Git Bash: MSYS rewrites a POSIX-looking argument before
+    # native jq.exe sees it (`/checkout` arrives as `C:/Program Files/Git/
+    # checkout`), and a literal `==` cannot match a native Codex `D:\path`
+    # against the same checkout spelled `/d/path`.
+    [[ "$(jq -r '.payload.model_provider // empty' <<<"$meta" 2>/dev/null)" \
+       == "$provider" ]] || continue
+    recorded=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || recorded=''
+    codex_cwd_matches "$recorded" "$want_cwd" || continue
     printf '%s\n' "$f"
     return 0
   done < <(_codex_rollouts_since "$before")
@@ -933,7 +962,7 @@ resolve_codex_runtime_metadata() {
     fi
     if (( app_server_ready == 1 )) \
        && _runtime_rpc_send '{"method":"initialized","params":{}}' \
-       && _runtime_rpc_send "$(jq -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
+       && _runtime_rpc_send "$(jq_literal -cn --arg cwd "$runtime_cwd" '{method:"config/read",id:"codex-config",params:{cwd:$cwd,includeLayers:false}}')" \
        && _runtime_rpc_send \
           '{"method":"model/list","id":"codex-models","params":{"limit":100,"includeHidden":true}}' \
        && config_response=$(_runtime_rpc_wait codex-config 20) \
@@ -965,7 +994,7 @@ resolve_codex_runtime_metadata() {
         # config model/provider/cwd into thread/resume. A bare resume restores
         # persisted model/effort and would therefore sign stale metadata when
         # host configuration changed since the previous turn.
-        resume_request=$(jq -cn \
+        resume_request=$(jq_literal -cn \
           --arg id "$CODEX_SESSION_ID" --arg cwd "$runtime_cwd" \
           --arg model "$selected" --arg provider "$provider" '
           {method:"thread/resume", id:"codex-resume",
@@ -1095,10 +1124,176 @@ write_state_atomic() {  # <path> <content>
     && mv -f "$1.tmp" "$1"
 }
 
+# --- Executable resolution -----------------------------------------------------
+#
+# Git Bash / MSYS mounts NTFS with `noacl`, so a .cmd or .bat wrapper reports
+# mode 0644 even though the Windows loader runs it, and `chmod +x` cannot
+# change that mode. Bash's own tests follow the mode: `[[ -x ]]` and
+# `command -v -- <explicit path>` both reject a working wrapper. Bash's PATH
+# search is kinder — it accepts a .cmd found on PATH — but it does no
+# PATHEXT probing, so a bare `codex-hub` never reaches `codex-hub.cmd`.
+# These helpers restore both halves. They stay inert off Windows, where a
+# .cmd file is genuinely not executable.
+
+is_windows_bash() {
+  case "${OSTYPE:-}" in msys*|cygwin*|win32*) return 0 ;; *) return 1 ;; esac
+}
+
+# The PATHEXT entries the Windows loader can run straight from bash, in the
+# operator's own order. PATHEXT also lists script types (.vbs, .js) that need
+# an interpreter bash never invokes, so those are dropped.
+windows_exec_exts() {
+  local raw ext found=0 parts
+  IFS=';' read -r -a parts <<<"${PATHEXT:-.COM;.EXE;.BAT;.CMD}"
+  for raw in ${parts[@]+"${parts[@]}"}; do
+    # tr, not ${raw,,}: bash 3.2 (stock macOS) has no case-conversion
+    # expansion, as the authority helper below also notes.
+    ext=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    ext="${ext#"${ext%%[![:space:]]*}"}"
+    ext="${ext%"${ext##*[![:space:]]}"}"
+    case "$ext" in
+      .com|.exe|.bat|.cmd) printf '%s\n' "$ext"; found=1 ;;
+    esac
+  done
+  (( found == 1 )) || printf '%s\n' .com .exe .bat .cmd
+}
+
+# True when this path names something we can run: a regular file that either
+# carries the execute bit or is a Windows wrapper the loader will run.
+is_executable_file() {  # <path>
+  local p="$1" lower
+  [[ -f "$p" ]] || return 1
+  [[ -x "$p" ]] && return 0
+  is_windows_bash || return 1
+  [[ -r "$p" ]] || return 1
+  lower=$(printf '%s' "$p" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in *.com|*.exe|*.bat|*.cmd) return 0 ;; esac
+  return 1
+}
+
+# `type -P` with the two Windows gaps closed. Prints the resolved path.
+resolve_command_path() {  # <value>
+  local value="$1" resolved ext
+  [[ -n "$value" ]] || return 1
+  if [[ "$value" == */* || "$value" == *\\* ]]; then
+    # An explicit path. `type -P` applies the execute-bit test a noacl
+    # wrapper fails, so test the path directly instead.
+    if is_executable_file "$value"; then printf '%s\n' "$value"; return 0; fi
+    if is_windows_bash; then
+      while IFS= read -r ext; do
+        if is_executable_file "$value$ext"; then
+          printf '%s\n' "$value$ext"; return 0
+        fi
+      done < <(windows_exec_exts)
+    fi
+    return 1
+  fi
+  if resolved=$(type -P -- "$value" 2>/dev/null) && [[ -n "$resolved" ]]; then
+    printf '%s\n' "$resolved"; return 0
+  fi
+  is_windows_bash || return 1
+  # Directory-major, like the Windows loader: the first PATH entry holding any
+  # accepted extension wins, and PATHEXT only orders the candidates within it.
+  # type -P is not enough on its own — Git Bash's PATH search accepts a
+  # mode-0644 .cmd today, but its execute-bit test rejects the same file.
+  local dir exts
+  exts=$(windows_exec_exts)
+  while IFS= read -r dir; do
+    [[ -n "$dir" ]] || dir=.
+    while IFS= read -r ext; do
+      if is_executable_file "$dir/$value$ext"; then
+        printf '%s\n' "$dir/$value$ext"; return 0
+      fi
+    done <<<"$exts"
+  done < <(printf '%s\n' "${PATH//:/$'\n'}")
+  return 1
+}
+
+# --- Process introspection -----------------------------------------------------
+#
+# `ps -o` is POSIX, but MSYS/Git Bash rejects every -o probe. There the pid
+# identity checks silently answered "not live", so --stop could neither
+# recognise nor signal its own supervisor and the review survived every stop.
+#
+# ps stays the first source on every host. Its output is what the recorded
+# start-time tokens have always been derived from, and a token written by an
+# earlier run must still compare equal. /proc is the fallback, and Git Bash
+# provides the three files these helpers need.
+
+# Process group id of $1.
+proc_pgid() {  # <pid>
+  local pid="$1" v=''
+  v=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || v=''
+  if [[ -z "$v" && -r "/proc/$pid/pgid" ]]; then
+    read -r v < "/proc/$pid/pgid" || v=''
+    v="${v//[[:space:]]/}"
+  fi
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$v"
+}
+
+# Command line of $1 on one line, arguments separated by spaces.
+proc_argv() {  # <pid>
+  local pid="$1" v=''
+  v=$(ps -o args= -p "$pid" 2>/dev/null) || v=''
+  # Same emptiness test as the return below: ps printing only whitespace must
+  # reach /proc, not be judged a live argv here and rejected there.
+  if [[ -z "${v//[[:space:]]/}" && -r "/proc/$pid/cmdline" ]]; then
+    v=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || v=''
+  fi
+  [[ -n "${v//[[:space:]]/}" ]] || return 1
+  printf '%s\n' "$v"
+}
+
+# Start-time token for pid $1, whitespace-squeezed; empty when unknown.
+# Written next to the pid in every pid record this repository keeps, and
+# compared on every read: two processes can share a recycled pid, but not a
+# pid AND a start time. TZ/LC_ALL are pinned because ps renders lstart in the
+# caller's timezone and locale — a --stop run from another environment must
+# still match the token the supervisor wrote. Where ps has no -o support the
+# token comes from /proc instead, which is a different spelling of the same
+# fact; both ends of a comparison run this same function on the same host.
+proc_start_token() {  # <pid>
+  local t
+  t=$(TZ=UTC LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null) || t=''
+  [[ -n "${t//[[:space:]]/}" ]] || t=$(proc_stat_starttime "$1") || t=''
+  # shellcheck disable=SC2086
+  set -- $t
+  printf '%s\n' "$*"
+}
+
+# Kernel start time of $1, in clock ticks since boot.
+proc_stat_starttime() {  # <pid>
+  local pid="$1" line rest
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  read -r line < "/proc/$pid/stat" || return 1
+  # Field 22 is the start time. The comm field holds the executable name in
+  # parentheses and may itself contain spaces and parentheses, so cut at the
+  # LAST ') ' — every field after it is numeric.
+  rest="${line##*) }"
+  [[ "$rest" != "$line" ]] || return 1
+  # shellcheck disable=SC2086
+  set -- $rest              # $1 is field 3, so field 22 is $20
+  [[ "${20:-}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${20}"
+}
+
 # --- Pre-flight ---------------------------------------------------------------
 
 require_cmd() {
   command -v -- "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+# The agent executables only. They are pinned by resolve_agent_bin to a full
+# path carrying its extension, so a Windows wrapper is invoked correctly even
+# though bash's own lookup rejects its 0644 mode. require_cmd must stay strict
+# for the plain tool names (git, jq, gh, glab, curl): those are invoked bare,
+# and Git Bash's exec appends only `.exe` — accepting a `jq.cmd` here would
+# pass preflight and then fail with 127 in the middle of a review.
+require_agent_cmd() {
+  command -v -- "$1" >/dev/null 2>&1 && return 0
+  resolve_command_path "$1" >/dev/null 2>&1 && return 0
+  die "missing required command: $1"
 }
 
 # Read a host-scoped glab config value with glab's environment overrides
@@ -1173,8 +1368,8 @@ glab_config_host_keys() {
 }
 
 preflight() {
-  require_cmd "$CODEX_BIN"
-  require_cmd "$CLAUDE_BIN"
+  require_agent_cmd "$CODEX_BIN"
+  require_agent_cmd "$CLAUDE_BIN"
   require_cmd git
   require_cmd jq
   # Local branch scope never speaks to a forge: no CLI, no token, no
@@ -1188,7 +1383,33 @@ preflight() {
   case "$FORGE" in
     github)
       require_cmd gh
-      [[ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]] || die "GH_TOKEN/GITHUB_TOKEN not set"
+      # Both agent prompts tell the turns that GH_TOKEN is in their
+      # environment, so this block's job is to make that true.
+      #
+      # The recommended `gh auth login` stores its token in the OS keyring and
+      # exports nothing, so requiring a token variable rejects a correctly
+      # configured host. Ask the CLI for that session's token instead. The
+      # hostname is explicit: `gh auth token` alone answers for gh's default
+      # host, which may be an enterprise instance, and only github.com reaches
+      # this code.
+      # Pin the host for every gh call, this one and the agents'. An ambient
+      # GH_HOST (normal for someone whose default is an enterprise instance)
+      # would otherwise send a github.com credential to that other host, and
+      # only github.com reaches this code at all.
+      export GH_HOST=github.com
+      if [[ -n "${GH_TOKEN:-}" ]]; then
+        export GH_TOKEN
+      elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        export GH_TOKEN="$GITHUB_TOKEN"
+      else
+        local gh_keyring_token
+        gh_keyring_token=$(gh auth token --hostname github.com 2>/dev/null \
+          | tr -d '\r\n') || gh_keyring_token=''
+        [[ -n "$gh_keyring_token" ]] \
+          || die "GH_TOKEN/GITHUB_TOKEN not set and 'gh auth token' returned nothing; run 'gh auth login' or set a valid GH_TOKEN"
+        export GH_TOKEN="$gh_keyring_token"
+        log "github: using the token from the gh CLI session (no GH_TOKEN/GITHUB_TOKEN in the environment)"
+      fi
       # Resolve the authenticated user so prompts can render the banner with
       # the right @handle (instead of a hardcoded one). Also doubles as an
       # auth check.
@@ -1675,11 +1896,18 @@ force_clean_to_commit() {
   # come from the just-checked-out .gitmodules (update=merge/rebase would
   # create commits instead of detaching). (Both are no-ops when there are no
   # submodules.)
-  git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
-    || die "could not reset initialized submodules in $d"
-  git_safe -C "$d" submodule --quiet foreach --recursive \
-      git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
-    || die "could not clean initialized submodules in $d"
+  # Skip both when the superproject declares no submodules. `git submodule` is
+  # a shell helper git spawns, so even a no-op call costs about a second under
+  # MSYS — measured at 1.9s of a 6.5s turn, the single largest item in it. A
+  # gitlink is only an initializable submodule when .gitmodules names it, so
+  # without that file these two have nothing to act on.
+  if [[ -e "$d/.gitmodules" ]]; then
+    git_safe -C "$d" submodule update --quiet --checkout --recursive --force \
+      || die "could not reset initialized submodules in $d"
+    git_safe -C "$d" submodule --quiet foreach --recursive \
+        git -c core.hooksPath=/dev/null -c core.fsmonitor=false clean -qffd \
+      || die "could not clean initialized submodules in $d"
+  fi
   # Fail closed on anything the cleanup above did not cover.
   # --ignore-submodules=dirty is config-independent where it matters: it
   # overrides a submodule.<name>.ignore=all and still reports a DRIFTED
@@ -2678,7 +2906,7 @@ ai_signed_attempt_complete() {  # <codex|claude> <iter> <snapshot> <manifest> [e
       | any($new[];
             is_summary_root($t; $a; $b; $it)
             and has_signature($attempt.signature))
-    ' "$snap" >/dev/null 2>&1
+    ' <"$snap" >/dev/null 2>&1
 }
 
 # Highest iteration for which the bot's SUMMARY comment exists on the PR.
@@ -2704,7 +2932,14 @@ latest_ai_comment_iter() {
     "$AI_SUMMARY_JQ_DEF"'
       [ .[] | select(is_summary_root($t; $a; $b; .iter)) | .iter ]
       | unique | sort | reverse | .[]
-    ' "$snap" 2>/dev/null) || candidates=''
+    ' <"$snap" 2>/dev/null) || candidates=''
+  # Native Windows jq ends every line with CRLF. Command substitution strips
+  # the final newline and nothing else, so each line but the last keeps a
+  # trailing CR and fails the numeric test below. The walk then rejected every
+  # real candidate and accepted only the lowest — resume detection reported
+  # iteration 1 on a thread that had reached 6, so the loop re-ran and
+  # re-posted rounds it had already completed.
+  candidates=${candidates//$'\r'/}
   while IFS= read -r candidate; do
     [[ "$candidate" =~ ^[0-9]+$ ]] || continue
     manifest=$(ai_signature_manifest_path "$tag" "$candidate")
@@ -2755,8 +2990,7 @@ ai_summary_posted() {  # <codex|claude> <iter> <snapshot-file> [exact signature]
        any(.[];
          is_summary_root($t; $a; $b; $it)
          and ($s == "" or ((.body // "") | contains($s))))
-     ' \
-     "$snap" >/dev/null
+     ' <"$snap" >/dev/null
 }
 
 # Post-turn completion check with one short retry, absorbing forge
@@ -3219,7 +3453,7 @@ claim_state_marker() {
 }
 
 ensure_state_dir() {
-  STATE_DIR="$LOOP_HOME/state/$(repo_ident_name)/$(state_leaf_name)"
+  STATE_DIR="${STATE_ROOT:-$LOOP_HOME/state}/$(repo_ident_name)/$(state_leaf_name)"
   mkdir -p "$STATE_DIR"
   claim_state_marker "$STATE_DIR"
 }
@@ -3244,8 +3478,12 @@ gen_uuid() {
     cat /proc/sys/kernel/random/uuid
   elif command -v uuidgen >/dev/null 2>&1; then
     uuidgen
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -NonInteractive -Command \
+      '[guid]::NewGuid().ToString()' \
+      | tr -d '\r'
   else
-    die "no UUID source available (need /proc/sys/kernel/random/uuid or uuidgen)"
+    die "no UUID source available (need /proc/sys/kernel/random/uuid, uuidgen, or PowerShell)"
   fi
 }
 
@@ -3285,6 +3523,39 @@ _codex_rollouts_since() {  # <snapshot file>
 # behind. It removes its own file, and this skip keeps a removal that failed
 # from handing the review's conversation to a session with no history.
 # Prints UUID on success; returns non-zero on failure.
+normalize_codex_cwd() {
+  local p="$1" drive rest
+  # Native Windows Codex records `D:\path` while Git Bash presents the same
+  # checkout as `/d/path`. Normalize only that unambiguous drive-path shape;
+  # leave ordinary POSIX paths untouched so Unix ownership checks stay exact.
+  if [[ "$p" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
+    # tr, not ${...,,}: bash 3.2 (stock macOS) has no case-conversion
+    # expansion, and a Windows-shaped cwd can reach a macOS host through a
+    # copied CODEX_HOME.
+    drive=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')
+    rest="${BASH_REMATCH[2]//\\//}"
+    p="/${drive}/${rest}"
+  fi
+  while [[ "$p" != "/" && "$p" == */ ]]; do p="${p%/}"; done
+  printf '%s\n' "$p"
+}
+
+codex_cwd_matches() {
+  local recorded="$1" expected="$2" rn en
+  [[ -n "$recorded" && -n "$expected" ]] || return 1
+  rn=$(normalize_codex_cwd "$recorded")
+  en=$(normalize_codex_cwd "$expected")
+  [[ "$rn" == "$en" ]] && return 0
+  # A Windows-recorded cwd keeps whatever casing the caller typed, and the
+  # filesystem it names is case-insensitive, so `D:\Src\Repo` and `/d/src/repo`
+  # are the same checkout. Fold case only when the recording was Windows
+  # shaped; an ordinary POSIX path stays an exact comparison.
+  [[ "$recorded" =~ ^[A-Za-z]:[\\/] ]] || return 1
+  rn=$(printf '%s' "$rn" | tr '[:upper:]' '[:lower:]')
+  en=$(printf '%s' "$en" | tr '[:upper:]' '[:lower:]')
+  [[ "$rn" == "$en" ]]
+}
+
 discover_new_codex_session_id() {
   local before="$1" want_cwd="${2:-}"
   local f meta id cwd
@@ -3297,7 +3568,7 @@ discover_new_codex_session_id() {
        == "$CODEX_METADATA_PROBE_PREFIX"* ]] && continue
     if [[ -n "$want_cwd" ]]; then
       cwd=$(jq -r '.payload.cwd // empty' <<<"$meta" 2>/dev/null) || cwd=''
-      [[ "$cwd" == "$want_cwd" ]] || continue
+      codex_cwd_matches "$cwd" "$want_cwd" || continue
     fi
     id=$(jq -er '.payload.id // empty' <<<"$meta" 2>/dev/null) || continue
     [[ -n "$id" ]] || continue
@@ -3382,7 +3653,7 @@ resolve_codex_root_session_id() {
          <<<"$found" >/dev/null 2>&1; then
       if [[ -n "$want_cwd" ]]; then
         cwd=$(jq -r '.payload.cwd // empty' <<<"$found" 2>/dev/null) || cwd=''
-        [[ "$cwd" == "$want_cwd" ]] || return 1
+        codex_cwd_matches "$cwd" "$want_cwd" || return 1
       fi
       printf '%s\n' "$id"
       return 0
@@ -3580,7 +3851,7 @@ claude_run_prompt() {
         --add-dir "$REPO_DIR" \
         --add-dir "$STATE_DIR" \
         --append-system-prompt "You are operating as an autonomous PR implementer bot. Distinct identity for any git commits: name='${CLAUDE_GIT_NAME}', email='${CLAUDE_GIT_EMAIL}'. Never amend or force-push." \
-        "$(cat "$_CLAUDE_PROMPT_FILE")" \
+        < "$_CLAUDE_PROMPT_FILE" \
         > "$_CLAUDE_OUT" 2> "$_CLAUDE_ERR" )
   }
 

@@ -75,6 +75,29 @@ forge API identity (gh PAT on GitHub, GitLab token on GitLab) and pushing
 commits through the checkout's git credential (which may be a different
 account), and will ask you to confirm the first time it's about to post.
 
+### Controller safety for coding agents
+
+The canonical controller skill is
+`.agents/skills/ai-pr-review/SKILL.md`, so Codex discovers it from the
+repository. Claude's `.claude/skills/ai-pr-review/SKILL.md` is a pointer to
+that same procedure. Each agent also has a root entry point it loads on its
+own — `AGENTS.md` for Codex, `CLAUDE.md` for Claude Code — and both make
+reading the canonical skill mandatory before any loop action. The contract
+itself lives in `AGENTS.md`; `CLAUDE.md` routes there.
+
+A coding agent must keep its conversation turn open until the review reaches
+a terminal state and relay every completed Codex/Claude report. When its host
+does not provide a persistent monitor tool, it uses:
+
+- `agent_status.sh` to consume only new high-signal events and print complete
+  saved turn reports; and
+- `agent_guard.sh` to stop the review if the controlling conversation stops
+  renewing its monitoring heartbeat.
+
+This fail-closed path prevents a detached coding-agent turn from leaving an
+expensive review running silently. It does not affect normal direct `run.sh`
+usage by a human.
+
 ## What the agents do
 
 **Codex Reviewer**
@@ -785,24 +808,6 @@ chance; in local mode the failed round's commits are rolled back and its
 response is discarded with them, so resume reruns the round. And a report
 that cannot be captured logs a warning without failing a turn whose review
 already landed.
-
-## Testing
-
-`tests/run_tests.sh` runs the loop's regression tests — no network, no real
-`claude`/`codex`/`gh`: the turn scripts execute against PATH stubs that
-record their argv, and assertions check the recorded vectors (model /
-effort / tier mapping, `off` omission, the adaptive Codex effort default,
-explicit-level precedence, executable overrides, fresh-vs-resumed session
-flags) plus `run.sh`'s flag validation. The auto-resume cases start real
-supervisors against the same stubs; most die before an agent turn, and the
-terminal-status cases drive the Codex stub through an approved run to prove
-the supervisor stops on an end state. Local review mode is covered against real git: the
-per-round file contracts, resume high-water, squash-into-one-commit, the
-fast-forward-only push, and the single post-push title/description write.
-
-```bash
-~/ai-pr-loop/tests/run_tests.sh
-```
 
 ## Notes
 
