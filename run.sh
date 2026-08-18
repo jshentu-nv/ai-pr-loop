@@ -262,8 +262,9 @@
 set -euo pipefail
 
 LOOP_HOME="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
-# Every review's state lives under here. The test suite points it elsewhere so
-# a suite run cannot write into — or collide with — a real review's state.
+# Every review's state lives under here. AI_PR_LOOP_STATE_ROOT relocates it —
+# a controller reading reports must derive the same root the same way, so the
+# skill's polling recipe repeats this line verbatim.
 STATE_ROOT="${AI_PR_LOOP_STATE_ROOT:-$LOOP_HOME/state}"
 export STATE_ROOT
 # shellcheck source=lib/common.sh
@@ -738,9 +739,13 @@ fi
 #                             files below.
 #
 # Status protocol, all under the per-PR state dir:
-#   supervisor.lock  flock'd by the supervisor for its lifetime (and by the
-#                    worker tree, which inherits the fd); one supervisor per
-#                    PR, enforced by the kernel rather than a check window
+#   supervisor.lock  flock'd by the supervisor alone, for its lifetime; the
+#                    worker is started with the fd closed so no descendant it
+#                    leaves behind can hold the lock after the run. One
+#                    supervisor per PR, enforced by the kernel rather than a
+#                    check window. The lock therefore says nothing about a
+#                    worker that outlived its supervisor — worker.pid does,
+#                    and a start is refused while that record is live
 #   supervisor.pid   the supervisor's pid + its start-time token; removed
 #                    when it exits. Signalling target only — the token pins
 #                    the incarnation, so a recycled pid is never signalled

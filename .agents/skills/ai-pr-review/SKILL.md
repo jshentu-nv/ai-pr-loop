@@ -80,7 +80,7 @@ Optional flags worth surfacing if the user mentions a constraint:
 - `--converge N` — stop after N consecutive BLOCKER=0 MAJOR=0 codex iters.
   Default 3. Pass `0` to disable convergence-based termination.
 - `--dir DIR` — use an existing local clone. Omit to let the loop manage
-  its own at `$AI_PR_LOOP_HOME/checkouts/<owner>__<name>/` (GitLab repos:
+  its own at `$LOOP_HOME/checkouts/<owner>__<name>/` (GitLab repos:
   `checkouts/<host>__<slug with / -> __>/`).
 - `--restart` — force a new review round even if codex previously
   APPROVED. Use after new commits land past a prior approval ("pull
@@ -190,11 +190,13 @@ Optional flags worth surfacing if the user mentions a constraint:
   the user names a different implementer model; `off` leaves the CLI/settings
   default untouched.
 - `--claude-context-window TOKENS|auto` — context-window size shown in the
-  Claude implementer's forge-comment signature. `auto` (default) reports
-  `1000000` as the model default paired with `fable`; other aliases, custom
-  models, and model `off` report `unknown` unless an explicit token count is
-  supplied. Host/provider policy can override a model default. This labeled
-  metadata option does not change the Claude CLI's context allocation.
+  Claude implementer's forge-comment signature. `auto` (default) takes the
+  size from the CLI itself at the start of the turn, through Claude's
+  `get_context_usage` control request, so it reflects the session that
+  actually runs. There is no offline fallback: if that probe cannot answer,
+  the signature reads `unknown`. An explicit token count skips the probe.
+  This labeled metadata option does not change the Claude CLI's context
+  allocation.
 - `--claude-effort LEVEL` — reasoning effort for the Claude implementer's
   turns. **Default `ultracode`** (xhigh + dynamic-workflow orchestration). Set
   it if the user asks for lighter/heavier implementer reasoning or flags cost:
@@ -218,12 +220,12 @@ Optional flags worth surfacing if the user mentions a constraint:
   `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
   different reviewer model; `off` leaves the host's codex config untouched.
 - `--codex-context-window TOKENS|auto` — context-window size shown in the
-  Codex reviewer's forge-comment signature. `auto` (default) uses Codex's
-  bundled model catalog to resolve the selected model's effective context
-  window and labels it `bundled default`; host configuration can override it.
-  Unresolved/custom models and model `off` show `unknown`. Supply an explicit
-  token count to sign `configured` metadata. This option does not change
-  Codex's context allocation.
+  Codex reviewer's forge-comment signature. `auto` (default) asks the
+  selected executable for its **effective** catalog — the layered config the
+  run will use, not the bundled one — and takes the model's effective window
+  from it. Unresolved/custom models and model `off` show `unknown`. Supply an
+  explicit token count to sign `configured` metadata. This option does not
+  change Codex's context allocation.
 - `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
   applied as `-c model_reasoning_effort=LEVEL`. The default adapts to the
   model: **`ultra`** when the codex model is gpt-5.6-sol/-terra (the
@@ -254,8 +256,10 @@ after the visible AI header:
 
 `<sub>Model: <code>...</code> · Effort: <code>...</code> · Context window: <code>... tokens (source)</code></sub>`
 
-The source is `bundled default`, `model default`, or `configured`; unknown
-sizes render as `<code>unknown</code>`. Local review files are unchanged.
+The parenthesised source is `effective` when the size came from the running
+CLI, and `configured` when it came from an explicit `--*-context-window`
+value; unknown sizes render as `<code>unknown</code>` with no source. Local
+review files are unchanged.
 Summary resume detection still accepts the legacy hidden marker and
 alert/banner structure, so comments produced before runtime signatures were
 added remain valid resume points.
@@ -271,6 +275,23 @@ Resolve the run script in this order:
 
 If none exists, point the user at https://github.com/jshentu-nv/ai-pr-loop
 and ask where they want it cloned. Do not silently clone for them.
+
+Keep the answer in two shell variables and use them everywhere below.
+`AI_PR_LOOP_HOME` is unset on the second and third paths, so referring to it
+later yields `/state/...` — and every state path built from it points at a
+directory that does not exist:
+
+```bash
+RUN_SH=<the run.sh you resolved>
+LOOP_HOME=$(CDPATH= cd -- "$(dirname -- "$RUN_SH")" && pwd)
+STATE_ROOT="${AI_PR_LOOP_STATE_ROOT:-$LOOP_HOME/state}"
+```
+
+That is character for character how `run.sh` derives its own state root, so
+the two agree with where the run actually writes. Keep the plain `pwd`: with
+`pwd -P` a checkout reached through a symlink resolves to a different string
+than the one `run.sh` uses, and the poller then looks for reports in a
+directory nothing writes to.
 
 ### 2. Preflight
 
@@ -445,7 +466,7 @@ rm -f "$HEARTBEAT" "$HEARTBEAT.exit" "$HEARTBEAT.guard-pid" "$CURSOR"
   "$RUN_SH" <PR_OR_URL> <all prior flags> >"$OUT" 2>&1 &
 
 "$LOOP_HOME/agent_status.sh" \
-  "$AI_PR_LOOP_HOME/state/<repo-ident>/pr-42" \
+  "$STATE_ROOT/<repo-ident>/pr-42" \
   "$CURSOR" 55 "$HEARTBEAT" "$OUT"
 ```
 
@@ -595,7 +616,7 @@ When the background `run.sh` completes, summarize:
   and what to run next.
 
 Artifacts for each iteration live at
-`$AI_PR_LOOP_HOME/state/<owner>__<name>/pr-<N>/iter-NN/`
+`$STATE_ROOT/<owner>__<name>/pr-<N>/iter-NN/`
 (GitLab repos: `state/<host>__<slug...>/pr-<N>/iter-NN/`; prompts, agent
 stdout/stderr, fetched thread, codex verdict file, and each turn's
 `codex-report.md` / `claude-report.md`).
