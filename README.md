@@ -809,24 +809,6 @@ response is discarded with them, so resume reruns the round. And a report
 that cannot be captured logs a warning without failing a turn whose review
 already landed.
 
-## Testing
-
-`tests/run_tests.sh` runs the loop's regression tests — no network, no real
-`claude`/`codex`/`gh`: the turn scripts execute against PATH stubs that
-record their argv, and assertions check the recorded vectors (model /
-effort / tier mapping, `off` omission, the adaptive Codex effort default,
-explicit-level precedence, executable overrides, fresh-vs-resumed session
-flags) plus `run.sh`'s flag validation. The auto-resume cases start real
-supervisors against the same stubs; most die before an agent turn, and the
-terminal-status cases drive the Codex stub through an approved run to prove
-the supervisor stops on an end state. Local review mode is covered against real git: the
-per-round file contracts, resume high-water, squash-into-one-commit, the
-fast-forward-only push, and the single post-push title/description write.
-
-```bash
-~/ai-pr-loop/tests/run_tests.sh
-```
-
 ## Notes
 
 - The authenticated user's token (gh PAT on GitHub, `GITLAB_TOKEN`/glab on

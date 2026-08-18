@@ -199,8 +199,7 @@
 #                 offline context metadata and its source (after adaptive
 #                 defaults; catalog-only Codex values are estimates),
 #                 then exit without contacting GitHub; the PR number is
-#                 optional in this mode. Used by tests/run_tests.sh to observe
-#                 the resolution.
+#                 optional in this mode.
 #   --preflight-only
 #                 Run the full authenticated preflight — authority
 #                 validation, credential resolution (env-isolated,
