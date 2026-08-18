@@ -12,10 +12,10 @@ as a **single commit** carrying the review's findings and decisions; see
 Works on **GitHub pull requests** and **GitLab merge requests** (gitlab.com
 or self-hosted) — see [GitLab support](#gitlab-support).
 
-The primary interface is a **Claude Code skill** (`ai-pr-review`) shipped
-in this repo. Ask an AI agent to review a PR, the skill takes care of the
-orchestration. The underlying `run.sh` is also runnable directly for
-scripted use.
+The primary interface is an **agent skill** (`ai-pr-review`) for Claude Code
+and Codex, shipped in this repo. Ask an AI agent to review a PR, the skill
+takes care of the orchestration. The underlying `run.sh` is also runnable
+directly for scripted use.
 
 ## Install
 
@@ -23,15 +23,27 @@ scripted use.
 # 1. Clone somewhere stable.
 git clone https://github.com/jshentu-nv/ai-pr-loop.git ~/ai-pr-loop
 
-# 2. Expose the skill to Claude Code globally (so it's available from any
-#    working directory, not just inside this clone).
+# 2a. Expose the skill to Claude Code globally (so it's available from any
+#     working directory, not just inside this clone).
 mkdir -p ~/.claude/skills
 ln -s ~/ai-pr-loop/.claude/skills/ai-pr-review ~/.claude/skills/ai-pr-review
+
+# 2b. Expose the canonical skill to Codex globally.
+mkdir -p ~/.agents/skills
+ln -s ~/ai-pr-loop/.agents/skills/ai-pr-review ~/.agents/skills/ai-pr-review
 
 # 3. Make the orchestrator findable. The skill checks $AI_PR_LOOP_HOME
 #    first, then ~/ai-pr-loop. Either is fine.
 echo 'export AI_PR_LOOP_HOME=$HOME/ai-pr-loop' >> ~/.bashrc
 ```
+
+Codex already discovers `.agents/skills/ai-pr-review` automatically when
+launched anywhere inside this clone, so its global symlink is only needed to
+use the skill from other repositories. Run `/skills` to verify discovery,
+invoke it explicitly as `$ai-pr-review`, or let Codex select it from a matching
+review request. If a newly installed skill does not appear, restart Codex.
+See the [OpenAI Codex skills documentation](https://learn.chatgpt.com/docs/build-skills)
+for the supported skill locations and invocation behavior.
 
 Requirements on the host:
 
@@ -54,7 +66,7 @@ authenticated user can comment on and push to.
 
 ## Use it (the intended way)
 
-In Claude Code, just ask:
+In Claude Code or Codex, just ask:
 
 > Review https://github.com/owner/repo/pull/42
 
