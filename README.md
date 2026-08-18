@@ -23,27 +23,16 @@ directly for scripted use.
 # 1. Clone somewhere stable.
 git clone https://github.com/jshentu-nv/ai-pr-loop.git ~/ai-pr-loop
 
-# 2a. Expose the skill to Claude Code globally (so it's available from any
-#     working directory, not just inside this clone).
-mkdir -p ~/.claude/skills
+# 2. Expose the skill to Claude Code and Codex globally (so it's available
+#    from any working directory, not just inside this clone).
+mkdir -p ~/.claude/skills ~/.codex/skills
 ln -s ~/ai-pr-loop/.claude/skills/ai-pr-review ~/.claude/skills/ai-pr-review
-
-# 2b. Expose the canonical skill to Codex globally.
-mkdir -p ~/.agents/skills
-ln -s ~/ai-pr-loop/.agents/skills/ai-pr-review ~/.agents/skills/ai-pr-review
+ln -s ~/ai-pr-loop/.agents/skills/ai-pr-review ~/.codex/skills/ai-pr-review
 
 # 3. Make the orchestrator findable. The skill checks $AI_PR_LOOP_HOME
 #    first, then ~/ai-pr-loop. Either is fine.
 echo 'export AI_PR_LOOP_HOME=$HOME/ai-pr-loop' >> ~/.bashrc
 ```
-
-Codex already discovers `.agents/skills/ai-pr-review` automatically when
-launched anywhere inside this clone, so its global symlink is only needed to
-use the skill from other repositories. Run `/skills` to verify discovery,
-invoke it explicitly as `$ai-pr-review`, or let Codex select it from a matching
-review request. If a newly installed skill does not appear, restart Codex.
-See the [OpenAI Codex skills documentation](https://learn.chatgpt.com/docs/build-skills)
-for the supported skill locations and invocation behavior.
 
 Requirements on the host:
 
