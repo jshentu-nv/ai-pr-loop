@@ -343,34 +343,49 @@ _runtime_rpc_guardian() {
     return 1
   fi
 
+  # An MSYS FIFO is emulated, so only MSYS-aware readers can use it. The agent
+  # CLIs are native Windows processes: a `.cmd` wrapper, or node behind one.
+  # Giving such a child the FIFO as stdin makes every request vanish — it reads
+  # "Bad file descriptor" and answers nothing, so the probe times out and the
+  # turn dies for want of a model. An ordinary shell pipe is a real Windows
+  # pipe, which the child can read, so relay the FIFO into one with `cat`. The
+  # relay stays in the launcher's session, so process-tree containment and the
+  # exit status are unchanged, and EOF still propagates on owner disconnect.
+  local rpc_relay=0
+  is_windows_bash && rpc_relay=1
   # Put redirections on the child subshell itself so it opens the FIFO before
   # `cd`; a missing/raced cwd can fail after the owner connects instead of
   # leaving the owner's writer-open blocked forever.
   ( CDPATH= cd -- "$cwd" || exit
     case "$launcher" in
       setsid) exec setsid "${BASH:-bash}" -c '
-                ready=$1; status=$2; shift 2
+                ready=$1; status=$2; relay=$3; shift 3
                 printf "ready\n" > "$ready" || exit 1
                 set +e
-                "$@"
+                if [ "$relay" = 1 ]; then cat | "$@"; else "$@"; fi
                 rc=$?
                 printf "%s\n" "$rc" > "$status.tmp" \
                   && mv -f "$status.tmp" "$status"
                 exit "$rc"
-              ' ai-pr-loop-runtime "$runtime_ready" "$status_file" "$@" ;;
+              ' ai-pr-loop-runtime "$runtime_ready" "$status_file" \
+                "$rpc_relay" "$@" ;;
       perl)   exec perl -MPOSIX -e \
                 'my $ready = shift @ARGV; my $status = shift @ARGV;
+                 my $relay = shift @ARGV;
                  POSIX::setsid() >= 0 or die "setsid: $!";
                  open(my $fh, ">", $ready) or die "ready: $!";
                  print {$fh} "ready\n"; close($fh);
-                 my $raw = system @ARGV;
+                 my $raw = $relay
+                   ? system("/bin/sh", "-c", q{exec cat | "$@"},
+                            "ai-pr-loop-runtime-relay", @ARGV)
+                   : system @ARGV;
                  my $rc = $raw == -1 ? 127
                    : (($raw & 127) ? 128 + ($raw & 127) : ($raw >> 8));
                  open(my $sfh, ">", "$status.tmp") or die "status: $!";
                  print {$sfh} "$rc\n"; close($sfh);
                  rename("$status.tmp", $status) or die "status rename: $!";
                  exit $rc' \
-                "$runtime_ready" "$status_file" "$@" ;;
+                "$runtime_ready" "$status_file" "$rpc_relay" "$@" ;;
     esac ) < "$in_file" > "$out_file" 2> "$err_file" &
   rpc_pid=$!
   printf '%s\n' "$rpc_pid" > "$pid_file.tmp" \
