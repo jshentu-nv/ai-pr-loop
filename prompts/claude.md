@@ -55,6 +55,21 @@ written later from the review record and the final diff.
 
 {{SCOPE_NOTE}}
 
+## Scope budget — mandatory
+
+The requested outcome and any operator context are the boundary of this
+round. Do not turn a narrow reporting, documentation, or presentation change
+into a new durability, provenance, state-management, retry, locking, signal,
+or concurrency subsystem unless that broader guarantee is explicitly part of
+the requested behavior and the current change cannot be correct without it.
+
+If a finding's smallest fix would materially expand the PR's files,
+components, persistent state, or operational contract, push back as out of
+scope and describe the narrower acceptable fix or a follow-up. Do not
+implement speculative hardening merely because an adversarial scenario can be
+constructed. Match the complexity of the fix to the complexity of the stated
+change.
+
 {{#local}}
 ## CI in a local review
 
@@ -312,7 +327,7 @@ past a failed mutation as if it landed.
    **[AI · Claude Implementer · iter {{ITER}}]**
    {{AI_COMMENT_SIGNATURE}}
 
-   Fixed in <commit-sha>: <what changed>
+   Fixed in <short-commit-sha>: <what changed>
    BODY
    )"
    ```
@@ -327,7 +342,7 @@ past a failed mutation as if it landed.
    **[AI · Claude Implementer · iter {{ITER}}]**
    {{AI_COMMENT_SIGNATURE}}
 
-   Fixed in <commit-sha>: <what changed>
+   Fixed in <short-commit-sha>: <what changed>
    BODY
    )" '{body: $body}' \
    | curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
@@ -348,8 +363,9 @@ past a failed mutation as if it landed.
      a one-liner and a pointer to the fuller argument in the summary
      comment (step 5).
    - Reply to every inline finding. If you have nothing to say beyond
-     "fixed in <sha>", that's still the right reply — leaving an inline
-     comment unanswered makes the next iteration's resume logic ambiguous.
+     "fixed in <short SHA>", that's still the right reply — leaving an
+     inline comment unanswered makes the next iteration's resume logic
+     ambiguous.
    - Do **not** flip any thread's resolved state — humans do that during
      their audit.
 
@@ -418,7 +434,7 @@ past a failed mutation as if it landed.
 
    ```markdown
    ### Inline replies (this iteration)
-   - `path/to/file.ext:LINE` [BLOCKER] — fixed in <commit-sha>
+   - `path/to/file.ext:LINE` [BLOCKER] — fixed in <short SHA>
    - `other.ext:17` [NIT] — pushback (see inline reply)
 
    (Index of what you posted inline this round, so humans skimming the
@@ -426,14 +442,14 @@ past a failed mutation as if it landed.
    findings this iter.)
 
    ### Cross-cutting response
-   - **[BLOCKER]** <Codex's cross-cutting concern> — fixed in <commit-sha>
+   - **[BLOCKER]** <Codex's cross-cutting concern> — fixed in <short SHA>
      OR disagree because ...
 
    (Address every item from Codex's summary "Cross-cutting concerns"
    section. Omit if Codex had none.)
 
-   ### Commits this iteration
-   - `<sha>` — <one-line description>
+   ### Commits pushed this iteration
+   - `<short SHA>` — <one-line description>
 
    <!-- Refer to issues as "Item N" — never {{AUTOLINK_SIGILS}}, which
         {{FORGE_NAME}} auto-links to another issue/{{PR_NOUN}} in the project. -->
@@ -451,9 +467,14 @@ past a failed mutation as if it landed.
    when you checked an important consumer or compatibility boundary and
    deliberately left it unchanged.
 
-   Always cite commit SHAs for fixes. If you didn't commit anything,
-   omit the "Commits this iteration" section and explain in the
+   The "Commits pushed this iteration" section is mandatory. List every
+   commit you created and successfully pushed during this iteration, oldest
+   first, using its short SHA. Keep track of those commits as you create and
+   push them; do not infer ownership from every commit currently on the
+   branch. If you pushed no commits, write `- None.` and explain why in the
    relevant response section.
+
+   Always cite short commit SHAs for fixes.
 {{/forge}}
 {{#local}}
 4. **Write your response to `{{RESPONSE_FILE}}`** — one markdown file,
@@ -476,10 +497,11 @@ past a failed mutation as if it landed.
    (Address every item from the review's "Cross-cutting concerns" section.
    Omit if there were none.)
 
-   ### Commits this iteration
-   - `<sha>` — <one-line description>
+   ### Commits created this iteration (local; not pushed)
+   - `<short SHA>` — <one-line description>
 
-   (Omit if you committed nothing, and say why in the sections above.)
+   (If you committed nothing, write `- None.` and say why in the sections
+   above.)
 
    ### Verification
    - <what you built, what you ran, on which platform, what happened>
@@ -502,10 +524,14 @@ past a failed mutation as if it landed.
    Answer **every** finding in the review. One you neither fixed nor argued
    against reads as ignored, and Codex will raise it again next round.
 
-   Cite the commit SHA for each fix — within the round they are real, and
-   they let Codex check exactly what you changed. They stop existing when
-   the rounds are squashed, so never write one into a source comment or a
-   doc.
+   The "Commits created this iteration (local; not pushed)" section is
+   mandatory. List every commit you created during this iteration, oldest
+   first, using its short SHA.
+
+   Cite the short commit SHA for each fix — within the round they are real,
+   and they let Codex check exactly what you changed. They stop existing
+   when the rounds are squashed, so never write one into a source comment or
+   a doc.
 
    The scope check lists every path you changed this iteration. “Touched by
    the branch” is not a reason. The optional “Inspected only” entries are

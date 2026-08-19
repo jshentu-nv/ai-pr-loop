@@ -109,7 +109,8 @@ usage by a human.
 - Posts **inline review comments** at the exact `path:line` for
   line-specific findings via `POST /pulls/N/reviews` (one atomic review
   per turn).
-- Posts a **summary issue-comment** with cross-cutting concerns + verdict.
+- Posts a **summary issue-comment** with the short-SHA commit or base-to-head
+  commit range reviewed, cross-cutting concerns, and verdict.
 - Marks fully-addressed prior threads with a one-line `Resolved.` reply
   (does *not* flip GitHub's resolved-thread state — that's left to humans).
 - Emits `[CODEX_VERDICT: APPROVED|CHANGES_REQUESTED]` so the orchestrator
@@ -126,8 +127,16 @@ usage by a human.
   uncommitted diff with the `/code-review` skill and folds any valid
   findings into the same commit — catching its own bugs before they
   reach Codex.
-- Replies inline to every finding via `in_reply_to`, posts a summary
-  issue-comment, never force-pushes / amends / rebases.
+- Replies inline to every finding via `in_reply_to`, then posts a summary
+  issue-comment listing every commit pushed in that implementation round by
+  its short SHA; never force-pushes / amends / rebases.
+
+Both prompts carry a scope budget: findings and fixes stay proportional to
+the requested outcome, and hardening that would introduce a new subsystem or
+operational contract is left as a follow-up unless the change explicitly
+requires it. The controller skill also passes a PR-specific scope contract to
+both agents and stops the loop if an implementing round materially exceeds
+it.
 
 Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
 Codex `exec resume`), so internal memory persists across iterations on top
@@ -781,6 +790,10 @@ of that iteration's artifacts:
 iter-01/codex-report.md      # the review posted for iteration 1
 iter-01/claude-report.md     # the response posted for iteration 1
 ```
+
+The reviewer report identifies the short-SHA commit or base-to-head range
+reviewed. The implementer report lists only the short-SHA commits created in
+that round (and pushed in forge mode).
 
 So the round's substance reaches whoever is driving the loop through the
 stream they are already watching:
