@@ -30,6 +30,12 @@ processes. Its live-monitoring requirements are part of task completion.
   fallback in steps 4-5. Do not launch an unmonitored background review.
 - If monitoring cannot be maintained, do not leave the review running:
   stop it, preserve its state, and tell the user what happened.
+- Before every launch, pass both agents an explicit scope contract using
+  `--context`. During the loop, compare every completed implementer report
+  against that contract. If a round materially expands the files,
+  components, persistent state, or operational guarantees beyond it, stop
+  the loop before another agent continues and ask the operator whether to
+  broaden scope.
 
 ## What you're orchestrating
 
@@ -158,6 +164,29 @@ Optional flags worth surfacing if the user mentions a constraint:
   they fetch the URLs under the user's `gh` identity. Only attach links/files
   the user actually asked for — don't infer context URLs from the surrounding
   conversation.
+
+  **Default scope harness — mandatory.** Even when the user supplies no
+  reference material, create one concise `--context` note for both agents.
+  Keep it close to the user's words; do not invent product requirements or a
+  narrow file list when the expected shape is genuinely unknown. Include:
+
+  ```
+  Scope contract (authoritative):
+  - Requested outcome: <the user's concrete outcome>.
+  - Expected change shape: <the smallest plausible kind of change>.
+  - Non-goals: do not add new subsystems, protocols, persistent state,
+    journaling, locks, retry/signal/concurrency machinery, or broad refactors
+    unless the requested outcome explicitly requires them.
+  - Complexity budget: if a finding's smallest fix materially exceeds the
+    expected shape, treat it as an out-of-scope follow-up; the implementer
+    should push back instead of expanding the PR.
+  - Review standard: evaluate the stated contract and realistic affected
+    paths, not a stronger hypothetical guarantee.
+  ```
+
+  Merge this note with any user-supplied context in the same launch. Because
+  new `--context*` flags replace the stored snapshot, include the complete
+  scope contract and all still-active user context whenever updating it.
 
   **Constraints added after launch.** A running agent turn cannot see a new
   chat message. If the user adds a scope, style, compatibility, or behavior
@@ -411,6 +440,11 @@ Append any context the user supplied, e.g.
 `--context-url <url> --context "<note>" --context-file <path>` (repeatable;
 shared by both agents). On a re-run to grant more iterations, omit them —
 stored context is reused automatically.
+
+Also append the mandatory scope-contract `--context` note defined above on
+the first launch and whenever replacing stored context. Do not launch a
+review without one. A request for an uncapped or high-effort run changes the
+iteration/effort budget, not the scope budget.
 
 Append `--claude-bin <executable>` and/or `--codex-bin <executable>` whenever
 the user selected overrides. Keep them on re-runs so every resumed turn uses

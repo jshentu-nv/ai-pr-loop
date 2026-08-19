@@ -13,6 +13,21 @@ of the loop (max {{MAX_ITER}}).
 
 {{SCOPE_NOTE}}
 
+## Scope budget — mandatory
+
+Review the behavior this change actually claims, not a stronger system that
+could hypothetically be built around it. Do not turn a narrow reporting,
+documentation, or presentation change into a requirement for new durable
+state, provenance protocols, retries, locks, signal handling, or concurrency
+machinery unless the stated contract explicitly requires that guarantee and
+the current implementation cannot satisfy it more narrowly.
+
+Before filing any finding whose smallest fix would materially expand the
+PR's files, components, persistent state, or operational contract, verify
+that expansion is unavoidable for the requested outcome. Otherwise leave it
+as an out-of-scope follow-up, not a BLOCKER or MAJOR. Prefer the smallest
+in-scope correction and judge complexity in proportion to the change.
+
 {{#forge}}
 ## CI is part of the review
 
@@ -160,6 +175,19 @@ never continue past a failed mutation as if it landed.
      `git grep`. Build and test freely — the loop cleans the worktree
      between turns.
 {{/local}}
+
+   After the checkout is positioned, print the exact revision set you are
+   reviewing and retain the three output values for your summary:
+
+   ```bash
+   git rev-parse --short --verify "refs/ai-pr-loop/base^{commit}"
+   git rev-parse --short --verify "HEAD^{commit}"
+   git rev-list --count "refs/ai-pr-loop/base..HEAD"
+   ```
+
+   Your per-round summary must identify this exact cumulative revision set
+   with those short SHAs and commit count, even on later iterations where
+   only the newest commits changed since your previous review.
 
 {{#pr}}
 2. **Read the {{PR_NOUN}}'s metadata and full discussion** — not just the bot thread:
@@ -698,6 +726,12 @@ never continue past a failed mutation as if it landed.
    ### Summary
    <1-3 sentences — high-level read on the diff>
 
+   ### Commit(s) reviewed
+   - `<short head SHA>` (when the base-to-head range contains exactly one
+     commit)
+     OR
+   - `<short base SHA>..<short head SHA>` (`<n>` commits)
+
    ### Cross-cutting concerns
    - **[BLOCKER]** <concern that isn't tied to a single line — design,
      architecture, missing tests, etc.>
@@ -723,6 +757,10 @@ never continue past a failed mutation as if it landed.
    ### Verdict
    <one sentence>
    ```
+
+   The "Commit(s) reviewed" section is mandatory. Use the base SHA, head SHA,
+   and count printed after checkout. If the count is zero, say that no
+   commits differ from the base and include both short SHAs.
 {{/forge}}
 {{#local}}
 6. **Write the review to `{{REVIEW_FILE}}`** — one markdown file, written
@@ -739,6 +777,12 @@ never continue past a failed mutation as if it landed.
    ```markdown
    ### Summary
    <1-3 sentences — high-level read on the diff>
+
+   ### Commit(s) reviewed
+   - `<short head SHA>` (when the base-to-head range contains exactly one
+     commit)
+     OR
+   - `<short base SHA>..<short head SHA>` (`<n>` commits)
 
    ### Findings (this iteration)
    - **[BLOCKER]** `path/to/file.ext:42` — <the concern, the input or path
@@ -764,6 +808,10 @@ never continue past a failed mutation as if it landed.
    ### Verdict
    <one sentence>
    ```
+
+   The "Commit(s) reviewed" section is mandatory. Use the base SHA, head SHA,
+   and count printed after checkout. If the count is zero, say that no
+   commits differ from the base and include both short SHAs.
 
    Name the place in the code as `path:line` in every finding that has one,
    and keep each finding self-contained: the implementer works from this
