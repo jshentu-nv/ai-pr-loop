@@ -134,9 +134,11 @@ usage by a human.
 Both prompts carry a scope budget: findings and fixes stay proportional to
 the requested outcome, and hardening that would introduce a new subsystem or
 operational contract is left as a follow-up unless the change explicitly
-requires it. The controller skill also passes a PR-specific scope contract to
-both agents and stops the loop if an implementing round materially exceeds
-it.
+requires it. The reviewer prompt also bars artificial fault injection: a
+finding must reproduce through normal inputs and the test controls the
+repository already ships. The controller skill also passes a PR-specific
+scope contract to both agents and stops the loop if an implementing round
+materially exceeds it.
 
 Each agent keeps its own per-PR session (Claude `--session-id` / `--resume`,
 Codex `exec resume`), so internal memory persists across iterations on top

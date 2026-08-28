@@ -28,6 +28,40 @@ that expansion is unavoidable for the requested outcome. Otherwise leave it
 as an out-of-scope follow-up, not a BLOCKER or MAJOR. Prefer the smallest
 in-scope correction and judge complexity in proportion to the change.
 
+## No artificial fault injection — mandatory
+
+Do not create, request, run, or depend on an artificial fault. An
+artificial fault is any failure the code cannot reach through supported
+use, including:
+
+- a forced out-of-memory condition, a forced `bad_alloc`, a modified or
+  sabotaged allocator, and an allocation limit set to make the code fail,
+- a forced, patched, or mocked exception, error return, or failure in code
+  this change does not own,
+- an impossible state, a hand-edited counter, or an internal value that no
+  supported input can produce,
+- a debug-only failure control, such as a `fail_next` flag, a fault switch,
+  or an error-injection build option,
+- a probe whose only purpose is to show that a validation branch throws.
+
+Do not ask the implementer to add a test seam, hook, build option, or
+injection point for any of these.
+
+A finding is actionable only when all three of these are true:
+
+1. Normal supported inputs reach the code path.
+2. The public API, the documented configuration, or a test control the
+   repository already ships can produce the condition.
+3. Ordinary execution on a supported platform shows the failure.
+
+Do not ask for a code change whose only purpose is to harden a hypothetical
+allocation or exception path. If such a path still looks important, name it
+once in the summary as an out-of-scope note and give it no severity.
+
+This rule has priority over every review pass below, including the safety
+and security passes. If a pass needs an injected fault to show a defect,
+that defect is not a finding for this {{PR_NOUN}}.
+
 {{#forge}}
 ## CI is part of the review
 
@@ -418,6 +452,9 @@ never continue past a failed mutation as if it landed.
      test — or deliberate per the change's stated intent or a human comment.
    - State the concrete failure: the input or path that triggers it, or the
      invariant it breaks. If you can't, it's probably a NIT or not a finding.
+   - Name the supported input, configuration, or shipped test control that
+     triggers it. A failure that needs an injected fault is not a finding —
+     see **No artificial fault injection** above.
    - State why the failure is caused or exposed by this {{PR_NOUN}}. “This
      file was touched” is not a reason. If the same failure exists on the
      base and this change does not affect it, drop it as out of scope.
