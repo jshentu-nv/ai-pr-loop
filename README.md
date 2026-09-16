@@ -309,17 +309,17 @@ can dial each one. Every knob is passed explicitly on every turn (fresh and
 resumed), so the loop doesn't silently depend on the host's global `claude`
 settings or `~/.codex/config.toml` — with one deliberate exception: the
 codex reasoning effort is pinned only when the loop knows the model's
-ceiling (gpt-5.6-sol/-terra, or an explicit `--codex-effort`); for other
-models no level is forced, so the host codex config / model default applies.
+ceiling (gpt-6-astra, gpt-5.6-sol/-terra, or an explicit `--codex-effort`);
+for other models no level is forced, so the host codex config / model default
+applies.
 
-**Claude Implementer** — `claude -p` turns default to model **`fable`**
-(Claude Fable 5; the alias resolves to the latest model in the claude CLI)
-at effort **`ultracode`**: `xhigh` reasoning plus dynamic-workflow
+**Claude Implementer** — `claude -p` turns default to model **`claude-fable-5-1`**
+(Claude Fable 5.1) at effort **`ultracode`**: `xhigh` reasoning plus dynamic-workflow
 orchestration (passed via `--settings '{"ultracode": true}'`, the documented
 headless mechanism; it degrades to plain `xhigh` where orchestration doesn't
 apply in `-p` mode). Dial with:
 
-- `--claude-model MODEL` — passed as `--model`. Default `fable`; `off`
+- `--claude-model MODEL` — passed as `--model`. Default `claude-fable-5-1`; `off`
   leaves the CLI/settings default untouched.
 - `--claude-context-window TOKENS|auto` — context-window size reported in
   Claude's forge-comment signature. `auto` (default) runs a control-only
@@ -352,16 +352,16 @@ apply in `-p` mode). Dial with:
   per-PR state dir is mounted as a second working dir so the turn can read
   the codex review files.
 
-**Codex Reviewer** — `codex exec` turns default to model **`gpt-5.6-sol`**
-at reasoning effort **`ultra`** (the ceiling for gpt-5.6-sol/-terra; older
-gpt-5.x models top out at `xhigh`) on the **`fast`** service tier (the
+**Codex Reviewer** — `codex exec` turns default to model **`gpt-6-astra`**
+at reasoning effort **`ultra`** (supported by gpt-6-astra and gpt-5.6-sol/-terra;
+older gpt-5.x models top out at `xhigh`) on the **`fast`** service tier (the
 "Fast" speed tier: 1.5x speed, increased usage), applied as
-`-m gpt-5.6-sol -c model_reasoning_effort=ultra -c service_tier=fast` on
+`-m gpt-6-astra -c model_reasoning_effort=ultra -c service_tier=fast` on
 every turn. Turns run with `--yolo` (autorun — the alias for
 `--dangerously-bypass-approvals-and-sandbox`) so gh/git mutations proceed
 unattended. Dial with:
 
-- `--codex-model MODEL` — passed as `-m`. Default `gpt-5.6-sol`; `off`
+- `--codex-model MODEL` — passed as `-m`. Default `gpt-6-astra`; `off`
   leaves the host's codex config untouched.
 - `--codex-context-window TOKENS|auto` — context-window size reported in
   Codex's forge-comment signature. `auto` (default) asks Codex app-server for
@@ -380,7 +380,7 @@ unattended. Dial with:
   guessed signature.
 - `--codex-effort LEVEL` — one of `low`, `medium`, `high`, `xhigh`, `max`,
   `ultra`, or `off`. The default adapts to the model: `ultra` when the codex
-  model is gpt-5.6-sol/-terra (the only models that support it); for any
+  model is gpt-6-astra or gpt-5.6-sol/-terra; for any
   other `--codex-model` no level is forced (same as `off`) — the host codex
   config / the model's own default applies, since effort ceilings vary per
   model (older gpt-5.x reject `ultra`/`max`, some models top out below
@@ -761,8 +761,8 @@ The skill is just a wrapper around `run.sh`. You can drive it directly:
   --context "Must stay backward-compatible with the v1 API." \
   --context-file ./docs/spec.md
 
-# Dial models / reasoning effort (defaults: implementer fable @ ultracode,
-# reviewer gpt-5.6-sol @ ultra on the fast tier):
+# Dial models / reasoning effort (defaults: implementer claude-fable-5-1 @ ultracode,
+# reviewer gpt-6-astra @ ultra on the fast tier):
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --claude-effort xhigh --codex-effort high
 ~/ai-pr-loop/run.sh 42 --repo owner/repo --codex-model gpt-5.5 --codex-tier off
 

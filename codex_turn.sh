@@ -78,7 +78,7 @@ fi
 # These same resolved values build the CLI argv below, so the signed model and
 # effort can never drift from what the turn requested.
 CODEX_MODEL_ARG=()
-CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_MODEL_RESOLVED="${CODEX_MODEL:-gpt-6-astra}"
 case "$CODEX_MODEL_RESOLVED" in
   off|'') CODEX_MODEL_ARG=() ;;
   *)      CODEX_MODEL_ARG=(-m "$CODEX_MODEL_RESOLVED") ;;
