@@ -3687,7 +3687,7 @@ claude_resolve_model_effort() {
   # free of session/probe side effects: claude_turn needs truthful signature
   # values before it renders the comment recipes, while finalize_turn only
   # needs the CLI args.
-  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-claude-fable-5-1}"
+  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-gpt-6-astra}"
   CLAUDE_EFFORT_RESOLVED="${CLAUDE_EFFORT:-ultracode}"
 }
 
