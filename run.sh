@@ -173,8 +173,8 @@
 #                 low | medium | high | xhigh | max | ultra. Default: ultra
 #                 for gpt-6-astra and gpt-5.6-sol/-terra; for any other
 #                 --codex-model no level is forced (same as `off`) — the host
-#                 codex config / the model's
-#                 own default applies, since effort ceilings vary per model.
+#                 codex config / the model's own default applies, since effort
+#                 ceilings vary per model.
 #                 An explicit level is passed verbatim. Use `off` to leave
 #                 the host's codex config untouched.
 #   --codex-tier TIER
@@ -574,10 +574,9 @@ esac
 # Codex reasoning effort: ceilings vary per model (ultra is supported by
 # gpt-6-astra and gpt-5.6-sol/-terra; older gpt-5.x reject ultra/max, some
 # catalog models top out below xhigh), so when --codex-effort is not given
-# the default adapts:
-# ultra for astra/sol/terra, otherwise 'off' — no level is forced and the host
-# codex config / the model's own default applies. An explicit --codex-effort
-# always wins verbatim.
+# the default adapts: ultra for astra/sol/terra, otherwise 'off' — no level
+# is forced and the host codex config / the model's own default applies. An
+# explicit --codex-effort always wins verbatim.
 CODEX_EFFORT=$(resolve_codex_effort "$CODEX_MODEL" "$CODEX_EFFORT")
 case "$CODEX_EFFORT" in
   low|medium|high|xhigh|max|ultra|off) ;;
