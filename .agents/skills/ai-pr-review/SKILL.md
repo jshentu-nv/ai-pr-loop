@@ -216,9 +216,9 @@ Optional flags worth surfacing if the user mentions a constraint:
   arguments require a wrapper. A name beginning with `-` must be passed as a
   path.
 - `--claude-model MODEL` — model for the Claude implementer's turns, passed
-  as `--model MODEL`. **Default `fable`** (Claude Fable 5). Set it only if
-  the user names a different implementer model; `off` leaves the CLI/settings
-  default untouched.
+  as `--model MODEL`. **Default `claude-fable-5-1`** (Claude Fable 5.1).
+  Set it only if the user names a different implementer model; `off` leaves
+  the CLI/settings default untouched.
 - `--claude-context-window TOKENS|auto` — context-window size shown in the
   Claude implementer's forge-comment signature. `auto` (default) takes the
   size from the CLI itself at the start of the turn, through Claude's
@@ -247,7 +247,7 @@ Optional flags worth surfacing if the user mentions a constraint:
   arguments require a wrapper. A name beginning with `-` must be passed as a
   path.
 - `--codex-model MODEL` — model for the Codex reviewer's turns, passed as
-  `-m MODEL`. **Default `gpt-5.6-sol`**. Set it only if the user names a
+  `-m MODEL`. **Default `gpt-6-astra`**. Set it only if the user names a
   different reviewer model; `off` leaves the host's codex config untouched.
 - `--codex-context-window TOKENS|auto` — context-window size shown in the
   Codex reviewer's forge-comment signature. `auto` (default) asks the
@@ -258,8 +258,8 @@ Optional flags worth surfacing if the user mentions a constraint:
   change Codex's context allocation.
 - `--codex-effort LEVEL` — reasoning effort for the Codex reviewer's turns,
   applied as `-c model_reasoning_effort=LEVEL`. The default adapts to the
-  model: **`ultra`** when the codex model is gpt-5.6-sol/-terra (the
-  default); for any other `--codex-model` no level is forced — the host
+  model: **`ultra`** for gpt-6-astra (the default) and gpt-5.6-sol/-terra;
+  for any other `--codex-model` no level is forced — the host
   codex config / model default applies (ceilings vary per model). Levels:
   `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, or `off` (leave the
   host's codex config untouched). Dial down if the user flags cost/latency.

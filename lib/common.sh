@@ -2789,10 +2789,10 @@ post_ai_comment() {
   case "$who" in
     codex)
       tag="$CODEX_MARKER_TAG"; label="$CODEX_LABEL"
-      model="${CODEX_MODEL_ACTUAL:-${CODEX_MODEL:-gpt-5.6-sol}}"
+      model="${CODEX_MODEL_ACTUAL:-${CODEX_MODEL:-gpt-6-astra}}"
       effort="${CODEX_EFFORT_ACTUAL:-}"
       [[ -n "$effort" ]] \
-        || effort=$(resolve_codex_effort "${CODEX_MODEL:-gpt-5.6-sol}" "${CODEX_EFFORT:-}")
+        || effort=$(resolve_codex_effort "${CODEX_MODEL:-gpt-6-astra}" "${CODEX_EFFORT:-}")
       window="${CODEX_CONTEXT_WINDOW_RESOLVED:-}"
       [[ -n "$window" ]] \
         || window=$(resolve_codex_context_window "$model" "${CODEX_CONTEXT_WINDOW:-auto}")
@@ -2804,7 +2804,7 @@ post_ai_comment() {
       ;;
     claude)
       tag="$CLAUDE_MARKER_TAG"; label="$CLAUDE_LABEL"
-      model="${CLAUDE_MODEL_ACTUAL:-${CLAUDE_MODEL:-fable}}"
+      model="${CLAUDE_MODEL_ACTUAL:-${CLAUDE_MODEL:-claude-fable-5-1}}"
       effort="${CLAUDE_EFFORT_ACTUAL:-${CLAUDE_EFFORT:-ultracode}}"
       window="${CLAUDE_CONTEXT_WINDOW_RESOLVED:-}"
       [[ -n "$window" ]] \
@@ -3207,7 +3207,7 @@ run_with_timeout() {
 # Resolve the reviewer's reasoning effort. $1 = codex model ('off'/'' = host
 # default), $2 = explicit effort ('' = not supplied). An explicit effort always
 # wins verbatim. Otherwise the default adapts to the model: ultra for
-# gpt-5.6-sol/-terra (the only models that support it), and 'off' (no level
+# gpt-6-astra and gpt-5.6-sol/-terra, and 'off' (no level
 # forced — the host codex config / model default applies) for everything else:
 # effort ceilings vary per model (older gpt-5.x reject ultra/max, some catalog
 # models top out below xhigh), so forcing a level on an arbitrary model risks
@@ -3219,8 +3219,8 @@ resolve_codex_effort() {
     return
   fi
   case "$model" in
-    gpt-5.6-sol|gpt-5.6-terra) printf 'ultra\n' ;;
-    *)                         printf 'off\n' ;;
+    gpt-6-astra|gpt-5.6-sol|gpt-5.6-terra) printf 'ultra\n' ;;
+    *)                                   printf 'off\n' ;;
   esac
 }
 
@@ -3687,7 +3687,7 @@ claude_resolve_model_effort() {
   # free of session/probe side effects: claude_turn needs truthful signature
   # values before it renders the comment recipes, while finalize_turn only
   # needs the CLI args.
-  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-fable}"
+  CLAUDE_MODEL_RESOLVED="${CLAUDE_MODEL:-claude-fable-5-1}"
   CLAUDE_EFFORT_RESOLVED="${CLAUDE_EFFORT:-ultracode}"
 }
 
@@ -3717,8 +3717,8 @@ claude_prepare_cli() {
   fi
 
   # Model for the implementer, set by the orchestrator's --claude-model
-  # (default: fable — Claude Fable 5; the alias resolves to the latest model in
-  # the claude CLI). "off" leaves the CLI/settings default untouched.
+  # (default: claude-fable-5-1 — Claude Fable 5.1).
+  # "off" leaves the CLI/settings default untouched.
   CLAUDE_MODEL_ARG=()
   case "$CLAUDE_MODEL_RESOLVED" in
     off|'') CLAUDE_MODEL_ARG=() ;;

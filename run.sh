@@ -126,9 +126,9 @@
 #                 wrapper script when fixed extra arguments are needed.
 #   --claude-model MODEL
 #                 Model for the Claude implementer's `claude -p` turns, passed
-#                 as `--model MODEL`. Default: fable (Claude Fable 5; alias
-#                 resolved by the claude CLI). Use `off` to leave the CLI/
-#                 settings default untouched.
+#                 as `--model MODEL`. Default: claude-fable-5-1 (Claude
+#                 Fable 5.1). Use `off` to leave the CLI/settings default
+#                 untouched.
 #   --claude-effort LEVEL
 #                 Reasoning effort for the Claude implementer's `claude -p`
 #                 turns. Default: ultracode (xhigh reasoning + dynamic-workflow
@@ -165,15 +165,15 @@
 #                 wrapper script when fixed extra arguments are needed.
 #   --codex-model MODEL
 #                 Model for the Codex reviewer's `codex exec` turns, passed as
-#                 `-m MODEL` on every turn. Default: gpt-5.6-sol. Use `off` to
+#                 `-m MODEL` on every turn. Default: gpt-6-astra. Use `off` to
 #                 leave the host's codex config untouched.
 #   --codex-effort LEVEL
 #                 Reasoning effort for the Codex reviewer's `codex exec` turns,
 #                 applied as `-c model_reasoning_effort=LEVEL` on every turn:
 #                 low | medium | high | xhigh | max | ultra. Default: ultra
-#                 when the codex model is gpt-5.6-sol/-terra (the only models
-#                 that support it); for any other --codex-model no level is
-#                 forced (same as `off`) — the host codex config / the model's
+#                 for gpt-6-astra and gpt-5.6-sol/-terra; for any other
+#                 --codex-model no level is forced (same as `off`) — the host
+#                 codex config / the model's
 #                 own default applies, since effort ceilings vary per model.
 #                 An explicit level is passed verbatim. Use `off` to leave
 #                 the host's codex config untouched.
@@ -301,12 +301,12 @@ CONTEXT_FILES=()
 CLEAR_CONTEXT=0
 # CLAUDE_BIN / CODEX_BIN come from lib/common.sh: their environment values
 # win over the built-in names, and the CLI flags below win over both.
-CLAUDE_MODEL="fable"
+CLAUDE_MODEL="claude-fable-5-1"
 CLAUDE_EFFORT="ultracode"
 CLAUDE_PERMS="auto"
 CLAUDE_CONTEXT_WINDOW="auto"
-CODEX_MODEL="gpt-5.6-sol"
-CODEX_EFFORT=""           # resolved after parsing: ultra for gpt-5.6-sol/-terra, off (host/model default) otherwise
+CODEX_MODEL="gpt-6-astra"
+CODEX_EFFORT=""           # resolved after parsing: ultra for astra/sol/terra, off (host/model default) otherwise
 CODEX_TIER="fast"
 CODEX_CONTEXT_WINDOW="auto"
 AUTO_RESUME="$AUTO_RESUME_DEFAULT"
@@ -571,10 +571,11 @@ case "$CLAUDE_PERMS" in
   auto|bypass|off) ;;
   *) die "--claude-perms must be one of: auto bypass off (got: $CLAUDE_PERMS)" ;;
 esac
-# Codex reasoning effort: ceilings vary per model (ultra only exists for
-# gpt-5.6-sol/-terra; older gpt-5.x reject ultra/max, some catalog models top
-# out below xhigh), so when --codex-effort is not given the default adapts:
-# ultra for sol/terra, otherwise 'off' — no level is forced and the host
+# Codex reasoning effort: ceilings vary per model (ultra is supported by
+# gpt-6-astra and gpt-5.6-sol/-terra; older gpt-5.x reject ultra/max, some
+# catalog models top out below xhigh), so when --codex-effort is not given
+# the default adapts:
+# ultra for astra/sol/terra, otherwise 'off' — no level is forced and the host
 # codex config / the model's own default applies. An explicit --codex-effort
 # always wins verbatim.
 CODEX_EFFORT=$(resolve_codex_effort "$CODEX_MODEL" "$CODEX_EFFORT")
