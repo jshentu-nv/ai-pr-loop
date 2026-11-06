@@ -716,6 +716,12 @@ if [[ "$LOCAL_SCOPE" == "branch" ]]; then
   REPO_DIR="$REPO_DIR_CANON"
   git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not a git work tree: $REPO_DIR"
+  # The branch under review is part of the state identity (state_leaf_name,
+  # repo_ident), which the front-end and the supervisor resolve before the
+  # branch discovery below runs. A detached HEAD has no branch to commit
+  # onto or push.
+  HEAD_REF=$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD) \
+    || die "HEAD in $REPO_DIR is detached — check out the branch you want reviewed"
 else
   [[ -n "$PR_NUMBER" ]] || die "PR number is required (first positional arg)"
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "PR number must be numeric: $PR_NUMBER"
@@ -771,8 +777,9 @@ fi
 #
 # The state path is the one ensure_state_dir computes; the front-end and the
 # supervisor need it before the run is authenticated, so they derive it from
-# the resolved forge identity alone.
-PR_STATE_DIR="$STATE_ROOT/$(repo_ident_name)/pr-${PR_NUMBER}"
+# the resolved identity alone: the forge identity and the PR number, or the
+# checkout and the branch of a local branch review.
+PR_STATE_DIR="$STATE_ROOT/$(repo_ident_name)/$(state_leaf_name)"
 
 # TERM the supervisor and everything it started. A detached supervisor leads
 # its own process group, so the signal reaches its worker and the agents too;
