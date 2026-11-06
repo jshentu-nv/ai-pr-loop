@@ -1758,8 +1758,20 @@ validate_origin_url() {
   fi
 }
 
+# A caller-supplied --dir serves the loop when it is the root of a git
+# working tree: a plain clone, whose .git is a directory, or a linked git
+# worktree, whose .git is a FILE that points into the main repository's
+# .git/worktrees/<name>. Git fetches into, commits in and pushes from both
+# alike, and every git call of the loop goes through `git -C`, which resolves
+# the git directory itself. A subdirectory of a repository has no .git entry
+# of its own, so it is rejected like a directory that is no repository.
+repo_dir_is_work_tree_root() {
+  [[ -e "$REPO_DIR/.git" ]] || return 1
+  [[ "$(git -C "$REPO_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" == "true" ]]
+}
+
 ensure_repo_clone() {
-  if [[ -d "$REPO_DIR/.git" ]]; then
+  if repo_dir_is_work_tree_root; then
     local url n_urls=0
     # Validate every fetch AND push URL of origin: the loop's `git push
     # origin` honors remote.origin.pushurl (which can differ arbitrarily

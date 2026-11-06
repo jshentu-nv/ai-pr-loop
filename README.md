@@ -218,7 +218,9 @@ MR URL and everything (forge, host, project, iid) is derived from the link:
   implementer's commits elsewhere). A `--dir` clone whose origin uses a
   different name for the same instance (e.g. a search-domain short name
   like `http://gitlab/…`) is rejected — point the remote at the canonical
-  authority the MR URL uses. The scheme is part of the stored per-PR
+  authority the MR URL uses. `--dir` accepts a plain clone and a linked
+  `git worktree` alike (the worktree's `.git` is a file that points into
+  the main repository); a subdirectory of a repository is rejected. The scheme is part of the stored per-PR
   identity marker too. A glab `api_host`/`api_protocol` config
   pointing the API at a *different* host than the web UI is not supported;
   the API is always `<scheme>://<MR host>/api/v4`.
